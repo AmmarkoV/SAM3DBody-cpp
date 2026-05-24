@@ -357,3 +357,12 @@ fsb_destroy(h);
 - Use `--skip-body` unless 3D vertices are required.
 - For higher throughput, batch multiple crops in a single backbone forward pass (already done when multiple persons are detected).
 
+
+
+---
+
+The official PyTorch SAM 3D Body repository from Meta Superintelligence Labs is :
+
+https://github.com/facebookresearch/sam-3d-body
+
+
