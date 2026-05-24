@@ -357,7 +357,9 @@ int main(int argc, const char** argv) {
     std::string mesh_path = "./body_mesh.tri";
     std::string lbs_path  = "";
     std::string src       = "0";
-    std::string save_path = "";
+    std::string save_path          = "";
+    std::string save_frames_prefix = "";
+    int         save_frame_idx     = 0;
     int  cuda_device  = 0;
     bool use_trt      = false;
     bool fp16         = true;
@@ -377,7 +379,8 @@ int main(int argc, const char** argv) {
         A1("--mesh",     mesh_path, std::string)
         A1("--lbs",      lbs_path,  std::string)
         A1("--from",     src,       std::string)
-        A1("--save",     save_path, std::string)
+        A1("--save",        save_path,          std::string)
+        A1("--save-frames", save_frames_prefix, std::string)
         A1("--cuda",     cuda_device, std::stoi)
 #undef A1
         if (!strcmp(argv[i], "--render-size") && i+2 < argc)
@@ -699,6 +702,14 @@ int main(int argc, const char** argv) {
                 fprintf(stderr, "[GL] error 0x%04X after draw\n", err);
         }
         glBindVertexArray(0);
+
+        // Save this frame before buffer swap when --save-frames is active
+        if (!save_frames_prefix.empty()) {
+            char path[4096];
+            snprintf(path, sizeof(path), "%s%05d.jpg",
+                     save_frames_prefix.c_str(), ++save_frame_idx);
+            save_framebuffer(path, W, H);
+        }
 
         glx3_endRedraw();
 
