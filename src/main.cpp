@@ -1,4 +1,6 @@
 #include "fast_sam_3dbody.h"
+#include "bvh_writer.h"
+#include "outputFiltering.h"
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/videoio.hpp>
@@ -39,7 +41,29 @@ struct Config
     float       cy             = 0.f;
     bool        headless    = false;
     bool        info_only   = false;
+
+  /* On a good bw_cutoff value..
+  ┌────────────────────────┬──────────────────────┬────────────────────────────────────┐
+  │      --bw-cutoff       │      Approx lag      │               Effect               │
+  ├────────────────────────┼──────────────────────┼────────────────────────────────────┤
+  │ 1.5 Hz                 │ ~212 ms / 6.4 frames │ Heavy smoothing, very laggy        │
+  ├────────────────────────┼──────────────────────┼────────────────────────────────────┤
+  │ 3 Hz                   │ ~106 ms / 3.2 frames │ Moderate smoothing                 │
+  ├────────────────────────┼──────────────────────┼────────────────────────────────────┤
+  │ 6 Hz                   │ ~53 ms / 1.6 frames  │ Light smoothing, barely noticeable │
+  ├────────────────────────┼──────────────────────┼────────────────────────────────────┤
+  │ 10 Hz                  │ ~32 ms / ~1 frame    │ Minimal smoothing, sub-frame lag   │
+  ├────────────────────────┼──────────────────────┼────────────────────────────────────┤
+  │ 12 Hz                  │ ~27 ms / 0.8 frames  │ Almost pass-through                │
+  └────────────────────────┴──────────────────────┴────────────────────────────────────┘
+  */
+    bool        butterworth      = false;
+    float       bw_cutoff        = 6.0f;  // Hz
+    bool        filter_root_rot  = false;   // enabled by --butterworth-root-rotation
+    float       rot_clamp        = 1.0f;    // rejection threshold in degrees/frame
     std::string csv_path    = "";    // if non-empty, write 3D joints to this CSV
+    std::string bvh_path    = "";    // if non-empty, write BVH motion capture to this path
+    std::string bvh_template = "./body.bvh"; // BVH skeleton template (hierarchy source)
     int         render_w    = 0;     // GL window width  (0 = match input)
     int         render_h    = 0;     // GL window height (0 = match input)
     int         cap_w       = 0;     // capture width  (0 = driver default)
@@ -69,8 +93,14 @@ static void print_usage(const char* prog)
     printf("  --cy F            Principal point y (0 = height/2)\n");
     printf("  --render-size W H GL window width and height in pixels (default: match input)\n");
     printf("  -o / --out PATH   Write 3D keypoints to CSV (frame,skeleton_id,joint_x,y,z...)\n");
+    printf("  --bvh PATH        Write BVH motion capture output to PATH\n");
+    printf("  --bvh-template P  BVH skeleton template (default ./body.bvh)\n");
     printf("  --headless        Do not open display windows\n");
     printf("  --info            Print pipeline info and exit\n");
+    printf("  --butterworth              Apply Butterworth low-pass filter to MHR output vectors\n");
+    printf("  --bw-cutoff HZ             Butterworth cutoff frequency in Hz (default 120)\n");
+    printf("  --butterworth-root-rotation  Also apply wrap-rejection to global_rot (off by default)\n");
+    printf("  --rot-clamp DEG            Rejection threshold for root rotation in deg/frame (default 1)\n");
     printf("  --help / -h       This message\n");
 }
 
@@ -92,8 +122,12 @@ static Config parse_args(int argc, char** argv)
         ARG1("--fy",       focal_y,     std::stof)
         ARG1("--cx",       cx,          std::stof)
         ARG1("--cy",       cy,          std::stof)
-        ARG1("--out",      csv_path,    std::string)
-        ARG1("-o",         csv_path,    std::string)
+        ARG1("--out",         csv_path,     std::string)
+        ARG1("-o",            csv_path,     std::string)
+        ARG1("--bvh",         bvh_path,     std::string)
+        ARG1("--bvh-template",bvh_template, std::string)
+        ARG1("--bw-cutoff",   bw_cutoff,    std::stof)
+        ARG1("--rot-clamp",   rot_clamp,    std::stof)
 #undef ARG1
         if (!strcmp(argv[i], "--render-size") && i+2 < argc)
         {
@@ -140,6 +174,16 @@ static Config parse_args(int argc, char** argv)
         if (!strcmp(argv[i], "--info"))
         {
             c.info_only = true;
+            continue;
+        }
+        if (!strcmp(argv[i], "--butterworth"))
+        {
+            c.butterworth = true;
+            continue;
+        }
+        if (!strcmp(argv[i], "--butterworth-root-rotation"))
+        {
+            c.filter_root_rot = true;
             continue;
         }
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h"))
@@ -402,6 +446,28 @@ int main(int argc, char** argv)
         printf("[main] Writing 3D keypoints to: %s\n", c.csv_path.c_str());
     }
 
+    // -----------------------------------------------------------------------
+    // Optional BVH output
+    // -----------------------------------------------------------------------
+    BVHWriter bvh_writer;
+    if (!c.bvh_path.empty())
+    {
+        // Auto-detect body_model.lbs from the onnx directory for finger animation
+        std::string lbs_path = c.onnx_dir + "/body_model.lbs";
+
+        if (!bvh_writer.open(c.bvh_template, c.bvh_path,
+                             1.0f / 30.0f,    // default 30 fps; TODO: derive from cap_fps
+                             lbs_path))
+        {
+            fprintf(stderr, "[main] BVH writer failed to open (continuing without BVH output).\n");
+        }
+        else
+        {
+            printf("[main] Writing BVH to: %s  (template: %s)\n",
+                   c.bvh_path.c_str(), c.bvh_template.c_str());
+        }
+    }
+
     fsb::PipelineConfig pcfg;
     pcfg.onnx_dir       = c.onnx_dir;
     pcfg.gguf_path      = c.gguf_path;
@@ -482,6 +548,46 @@ int main(int argc, char** argv)
     }
 
     // -----------------------------------------------------------------------
+    // Butterworth filter state (one bank of filters per person slot)
+    // -----------------------------------------------------------------------
+    struct PersonFilters {
+        std::array<ButterWorth, 70*3> kp3d{};
+        std::array<ButterWorth, 133>  body_pose{};
+        std::array<ButterWorth, 108>  hand_pose{};
+        std::array<ButterWorth, 3>    cam_t{};
+        // global_rot uses clamped-delta instead of Butterworth to avoid Euler wrap flipping
+        std::array<float, 3>          prev_global_rot{};
+        bool                          global_rot_init = false;
+    };
+    std::vector<PersonFilters> bw_filters;
+    const float bw_fps = (c.cap_fps > 0.0) ? (float)c.cap_fps : 30.0f;
+    // Butterworth is only valid below the Nyquist frequency (fps/2).
+    // Above that, tan(π·fc/fs)→0, all IIR coefficients collapse to zero, and
+    // filter() outputs 0 after 3 frames — corrupting pred_cam_t, keypoints, etc.
+    // When the cutoff is at or above Nyquist we skip the filter (pass-through).
+    const bool use_bw = c.butterworth && (c.bw_cutoff < bw_fps * 0.5f);
+
+    auto init_person_filters = [&](PersonFilters& pf) {
+        if (!use_bw) return;
+        for (auto& f : pf.kp3d)      initButterWorth(&f, bw_fps, c.bw_cutoff);
+        for (auto& f : pf.body_pose) initButterWorth(&f, bw_fps, c.bw_cutoff);
+        for (auto& f : pf.hand_pose) initButterWorth(&f, bw_fps, c.bw_cutoff);
+        for (auto& f : pf.cam_t)     initButterWorth(&f, bw_fps, c.bw_cutoff);
+    };
+
+    if (c.butterworth)
+    {
+        if (use_bw)
+            printf("[main] Butterworth filter: %.1f Hz cutoff at %.1f Hz sample rate"
+                   "  |  root rot clamp: %.1f deg/frame\n",
+                   c.bw_cutoff, bw_fps, c.rot_clamp);
+        else
+            printf("[main] Butterworth SKIPPED (cutoff %.1f Hz >= Nyquist %.1f Hz)"
+                   "  |  root rot clamp: %.1f deg/frame\n",
+                   c.bw_cutoff, bw_fps * 0.5f, c.rot_clamp);
+    }
+
+    // -----------------------------------------------------------------------
     // Inference loop
     // -----------------------------------------------------------------------
     cv::Mat frame;
@@ -509,6 +615,68 @@ int main(int argc, char** argv)
         std::vector<fsb::MHRResult> results =
             pipeline.process_bgr(frame.data, frame.cols, frame.rows);
         double inf_ms = ms_since(t0);
+
+        // Apply Butterworth low-pass filter to each person's MHR output vectors
+        if (c.butterworth)
+        {
+            // Grow filter bank as new person slots appear
+            while (bw_filters.size() < results.size())
+            {
+                bw_filters.emplace_back();
+                init_person_filters(bw_filters.back());
+            }
+            for (int i = 0; i < (int)results.size(); ++i)
+            {
+                auto& r  = results[i];
+                auto& pf = bw_filters[i];
+
+                if (use_bw)
+                {
+                    for (int k = 0; k < (int)r.keypoints_3d.size() && k < 70*3; ++k)
+                        r.keypoints_3d[k] = filter(&pf.kp3d[k], r.keypoints_3d[k]);
+
+                    for (int k = 0; k < (int)r.body_pose.size() && k < 133; ++k)
+                        r.body_pose[k] = filter(&pf.body_pose[k], r.body_pose[k]);
+
+                    for (int k = 0; k < (int)r.hand_pose.size() && k < 108; ++k)
+                        r.hand_pose[k] = filter(&pf.hand_pose[k], r.hand_pose[k]);
+                }
+
+                // global_rot: wrap-corrected rejection to avoid Euler flip artifacts.
+                // Butterworth interpolates through the ±π discontinuity and causes flipping.
+                // Clamping the delta only delays the flip — the output still drifts there
+                // over many frames if the model keeps predicting the flipped orientation.
+                // Instead we REJECT frames where any component's wrapped delta exceeds the
+                // threshold, holding the previous value. Genuine rotation (small delta each
+                // frame) passes through unchanged; flips (large delta) are frozen out.
+                if (c.filter_root_rot && !pf.global_rot_init)
+                {
+                    pf.prev_global_rot = r.global_rot;
+                    pf.global_rot_init = true;
+                }
+                else if (c.filter_root_rot && c.rot_clamp > 0.0f)
+                {
+                    const float max_rad = c.rot_clamp * (3.14159265359f / 180.0f);
+                    bool reject = false;
+                    for (int k = 0; k < 3; ++k)
+                    {
+                        float delta = r.global_rot[k] - pf.prev_global_rot[k];
+                        // Wrap delta to [-π, π] so ±2π discontinuities don't trigger rejection
+                        while (delta >  3.14159265359f) delta -= 2.0f * 3.14159265359f;
+                        while (delta < -3.14159265359f) delta += 2.0f * 3.14159265359f;
+                        if (fabsf(delta) > max_rad) { reject = true; break; }
+                    }
+                    if (reject)
+                        r.global_rot = pf.prev_global_rot;  // hold — don't drift toward the flip
+                    else
+                        pf.prev_global_rot = r.global_rot;  // accept and advance
+                }
+
+                if (use_bw)
+                    for (int k = 0; k < 3; ++k)
+                        r.pred_cam_t[k] = filter(&pf.cam_t[k], r.pred_cam_t[k]);
+            }
+        }
         total_inf_ms += inf_ms;
         ++frame_count;
 
@@ -520,6 +688,10 @@ int main(int argc, char** argv)
         // CSV
         if (csv_out.is_open())
             write_csv_rows(csv_out, frame_count, results);
+
+        // BVH
+        if (bvh_writer.is_open())
+            bvh_writer.write_frame(results);
 
         // Visualization
         if (!c.headless)
@@ -560,6 +732,9 @@ int main(int argc, char** argv)
         printf("  Wall fps : %.1f\n", frame_count / (wall_s > 0 ? wall_s : 1));
         printf("  Inf ms   : %.2f / frame\n", total_inf_ms / frame_count);
     }
+
+    if (bvh_writer.is_open())
+        bvh_writer.close();
 
     pipeline.free();
     return 0;

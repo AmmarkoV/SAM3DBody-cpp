@@ -27,6 +27,8 @@ extern "C" {
 #include <opencv2/imgproc.hpp>
 #include <opencv2/videoio.hpp>
 
+#include "../src/bvh_writer.h"
+
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -348,6 +350,73 @@ static void save_framebuffer(const std::string& path, int w, int h) {
     printf("Saved: %s\n", path.c_str());
 }
 
+// ── 2nd-order Butterworth low-pass filter (Direct Form II transposed) ────────
+// Default coefficients: fc=2 Hz at 30 fps
+//   b = [0.02008, 0.04016, 0.02008], a = [1, -1.56102, 0.64135]
+struct BwFilter {
+    // Coefficients default to ~1.5 Hz at 30 fps; call init() to override.
+    float b0 = 0.02008f, b1 = 0.04016f, b2 = 0.02008f;
+    float a1 = -1.56102f, a2 = 0.64135f;
+    bool  active = true;   // false when fc >= fs/2 (Nyquist): filter becomes a pass-through
+    std::vector<float> s1, s2, prev_x, acc;
+    bool ready = false;
+
+    // Compute 2nd-order Butterworth coefficients for the given cutoff / sample rate.
+    // Group delay at DC ≈ 1/(π·fc) seconds — halving fc doubles the lag.
+    // fc must be < fs/2; above Nyquist the filter is disabled (pass-through).
+    void init(float fc, float fs) {
+        if (fc <= 0.f || fc >= fs * 0.5f) { active = false; return; }
+        active = true;
+        float ff  = fc / fs;
+        float ita = 1.f / tanf(3.14159265f * ff);
+        float q   = 1.41421356f;
+        b0  =  1.f / (1.f + q * ita + ita * ita);
+        b1  =  2.f * b0;
+        b2  =  b0;
+        // Stored negated to match the transposed-direct-form-II sign convention used in apply().
+        a1  = -2.f * (ita * ita - 1.f) * b0;
+        a2  =  (1.f - q * ita + ita * ita) * b0;
+    }
+
+    void apply(float* data, int n) {
+        if (!active) return;
+        if ((int)s1.size() != n) {
+            s1.assign(n, 0.f); s2.assign(n, 0.f);
+            prev_x.assign(n, 0.f); acc.assign(n, 0.f);
+            ready = false;
+        }
+        if (!ready) {
+            // Warm-start: output equals first input (no transient).
+            // Initialise the unwrapped accumulator to the first raw value.
+            for (int i = 0; i < n; ++i) {
+                float x   = data[i];
+                acc[i]    = x;
+                prev_x[i] = x;
+                s1[i] = (1.f - b0) * x;
+                s2[i] = (b2 - a2)  * x;
+            }
+            ready = true;
+            return;
+        }
+        for (int i = 0; i < n; ++i) {
+            float x     = data[i];
+            // Wrap the per-frame delta to [-π, π] before accumulating so that
+            // Euler angle discontinuities (±π boundary crossings) don't cause the
+            // filter to interpolate through the discontinuity and produce a flip.
+            // For translation channels the delta is tiny (<< π) so wrapping is a no-op.
+            float delta = x - prev_x[i];
+            while (delta >  3.14159265f) delta -= 6.28318530f;
+            while (delta < -3.14159265f) delta += 6.28318530f;
+            acc[i]    += delta;
+            prev_x[i]  = x;
+            float y  = b0 * acc[i] + s1[i];
+            s1[i]    = b1 * acc[i] - a1 * y + s2[i];
+            s2[i]    = b2 * acc[i] - a2 * y;
+            data[i]  = y;
+        }
+    }
+};
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 int main(int argc, const char** argv) {
@@ -357,9 +426,14 @@ int main(int argc, const char** argv) {
     std::string mesh_path = "./body_mesh.tri";
     std::string lbs_path  = "";
     std::string src       = "0";
-    std::string save_path          = "";
     std::string save_frames_prefix = "";
     int         save_frame_idx     = 0;
+    std::string bvh_path           = "";
+    std::string bvh_template       = "";
+    bool        use_butterworth    = false;
+    float       bw_cutoff         = 6.0f;   // Hz; higher = less lag, less smoothing
+    bool        filter_root_rot   = false;  // enabled by --butterworth-root-rotation
+    float       rot_clamp_deg     = 1.0f;   // rejection threshold in degrees/frame
     int  cuda_device  = 0;
     bool use_trt      = false;
     bool fp16         = true;
@@ -378,10 +452,12 @@ int main(int argc, const char** argv) {
         A1("--yolo",     yolo_path, std::string)
         A1("--mesh",     mesh_path, std::string)
         A1("--lbs",      lbs_path,  std::string)
-        A1("--from",     src,       std::string)
-        A1("--save",        save_path,          std::string)
+        A1("--from",        src,                std::string)
         A1("--save-frames", save_frames_prefix, std::string)
-        A1("--cuda",     cuda_device, std::stoi)
+        A1("--cuda",        cuda_device,        std::stoi)
+        A1("--bvh",          bvh_path,     std::string)
+        A1("--bvh-template", bvh_template, std::string)
+        A1("--bw-cutoff",    bw_cutoff,    std::stof)
 #undef A1
         if (!strcmp(argv[i], "--render-size") && i+2 < argc)
             { render_w = std::stoi(argv[++i]); render_h = std::stoi(argv[++i]); continue; }
@@ -389,9 +465,12 @@ int main(int argc, const char** argv) {
             { cap_w = std::stoi(argv[++i]); cap_h = std::stoi(argv[++i]); continue; }
         if (!strcmp(argv[i], "--fps") && i+1 < argc)
             { cap_fps = std::stod(argv[++i]); continue; }
-        if (!strcmp(argv[i], "--trt"))       { use_trt    = true;  continue; }
-        if (!strcmp(argv[i], "--no-fp16"))   { fp16       = false; continue; }
-        if (!strcmp(argv[i], "--dev-face"))  { zero_face  = false; continue; }
+        if (!strcmp(argv[i], "--trt"))         { use_trt        = true;  continue; }
+        if (!strcmp(argv[i], "--no-fp16"))     { fp16           = false; continue; }
+        if (!strcmp(argv[i], "--dev-face"))    { zero_face      = false; continue; }
+        if (!strcmp(argv[i], "--butterworth"))              { use_butterworth  = true; continue; }
+        if (!strcmp(argv[i], "--butterworth-root-rotation")){ filter_root_rot  = true; continue; }
+        if (!strcmp(argv[i], "--rot-clamp") && i+1 < argc) { rot_clamp_deg = std::stof(argv[++i]); continue; }
     }
 
     // ── Pipeline ─────────────────────────────────────────────────────────────
@@ -484,6 +563,37 @@ int main(int argc, const char** argv) {
     }
     std::vector<float> lbs_out(MHR_VERTEX_FLOATS, 0.f);
 
+    // ── Source FPS (used by both BVH writer and Butterworth init) ────────────
+    float video_fps = 30.f;
+    if (!is_image && cap.isOpened()) {
+        double f = cap.get(cv::CAP_PROP_FPS);
+        if (f > 1.0) video_fps = (float)f;
+    }
+
+    // ── BVH writer ────────────────────────────────────────────────────────────
+    BVHWriter bvh_writer;
+    if (!bvh_path.empty()) {
+        if (bvh_template.empty()) bvh_template = "./body.bvh";
+        if (!bvh_writer.open(bvh_template, bvh_path, 1.f / video_fps, lbs_path))
+            fprintf(stderr, "[BVH] Warning: could not open BVH writer\n");
+        else
+            printf("[BVH] Writing to %s (%.1f fps)\n", bvh_path.c_str(), video_fps);
+    }
+
+    // ── Butterworth filter state (one filter per channel group) ──────────────
+    BwFilter bw_mp;   // for mhr_model_params[204]
+    BwFilter bw_cam;  // for pred_cam_t[3]
+    if (use_butterworth) {
+        bw_mp.init(bw_cutoff, video_fps);
+        bw_cam.init(bw_cutoff, video_fps);
+        float lag_ms = 1000.f / (3.14159f * bw_cutoff);
+        printf("[BW] cutoff=%.1f Hz  sample=%.1f Hz  approx lag=%.0f ms (%.1f frames)\n",
+               bw_cutoff, video_fps, lag_ms, lag_ms * video_fps / 1000.f);
+    }
+    // global_rot rejection state (same wrap-corrected rejection as fast_sam_3dbody_run)
+    std::array<float, 3> prev_global_rot{};
+    bool global_rot_init = false;
+
     // Empty VAO for the quad (we use gl_VertexID in the vertex shader)
     GLuint quad_vao;
     glGenVertexArrays(1, &quad_vao);
@@ -519,6 +629,56 @@ int main(int argc, const char** argv) {
         long long t_infer = NS_NOW();
         auto results = pipeline.process_bgr(frame.data, frame.cols, frame.rows);
         double latency_ms = (NS_NOW() - t_infer) / 1e6;
+
+        // Patch arm/collar/head angles in mhr_model_params.
+        // The pipeline runs with skip_body_model=true so its internal lbs_data is null,
+        // meaning apply_hand_pose was a no-op inside fast_sam_3dbody.cpp — the arm joint
+        // slots [68:121] in mhr_model_params are zeroed.  Re-apply here using the
+        // renderer's own lbs, which has the hand PCA matrices loaded.  This must happen
+        // before the Butterworth filter (so the filter smooths the true arm angles) and
+        // before bvh_writer.write_frame (which reads from mhr_model_params).
+        if (!results.empty() && lbs &&
+            lbs->hand_pose_mean && lbs->hand_pose_comps &&
+            lbs->hand_joint_idxs_left && lbs->hand_joint_idxs_right &&
+            !results[0].hand_pose.empty()) {
+            fsb::apply_hand_pose(results[0].mhr_model_params.data(),
+                                  results[0].hand_pose.data(),
+                                  lbs->hand_pose_mean, lbs->hand_pose_comps,
+                                  lbs->hand_joint_idxs_left,
+                                  lbs->hand_joint_idxs_right);
+        }
+
+        // Temporal smoothing (Butterworth IIR)
+        if (use_butterworth && !results.empty()) {
+            bw_mp.apply(results[0].mhr_model_params.data(), 204);
+            bw_cam.apply(results[0].pred_cam_t.data(), 3);
+
+            // global_rot: wrap-corrected rejection — only when --butterworth-root-rotation
+            // is passed. Off by default: first-frame lock-in to a bad prediction would
+            // freeze the entire sequence at the wrong orientation.
+            if (filter_root_rot && rot_clamp_deg > 0.0f) {
+                auto& gr = results[0].global_rot;
+                if (!global_rot_init) {
+                    prev_global_rot = gr;
+                    global_rot_init = true;
+                } else {
+                    const float max_rad = rot_clamp_deg * (3.14159265359f / 180.0f);
+                    bool reject = false;
+                    for (int k = 0; k < 3; ++k) {
+                        float delta = gr[k] - prev_global_rot[k];
+                        while (delta >  3.14159265359f) delta -= 2.0f * 3.14159265359f;
+                        while (delta < -3.14159265359f) delta += 2.0f * 3.14159265359f;
+                        if (fabsf(delta) > max_rad) { reject = true; break; }
+                    }
+                    if (reject) gr = prev_global_rot;
+                    else        prev_global_rot = gr;
+                }
+            }
+        }
+
+        // BVH frame output
+        if (bvh_writer.is_open())
+            bvh_writer.write_frame(results);
 
         // Annotate frame: draw YOLO skeleton when LBS mesh is unavailable.
         cv::Mat vis = frame.clone();
@@ -724,15 +884,11 @@ int main(int argc, const char** argv) {
           fflush(stderr);
         }
 
-        // Save and exit if --save was given, or after one frame for static images
-        if (!save_path.empty()) {
-            save_framebuffer(save_path, W, H);
-            break;
-        }
         if (is_image) break;   // keep window open only for live sources
     }
 
     // ── Cleanup ───────────────────────────────────────────────────────────────
+    if (bvh_writer.is_open()) bvh_writer.close();
     mhr_lbs_free(lbs);
     tri_freeModel(tri_model);
     stop_glx3_stuff();

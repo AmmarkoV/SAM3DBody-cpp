@@ -119,7 +119,8 @@ SAM3DBody-cpp/
     ├── fast_sam_3dbody_capi.h        Plain C API (for ctypes)
     ├── fast_sam_3dbody_capi.cpp
     ├── preprocess.hpp                Crop, normalise, ray_cond, NMS, pose conversion
-    └── main.cpp                      CLI executable (--out CSV, live overlay window)
+    ├── bvh_writer.h / bvh_writer.cpp Experimental BVH motion capture exporter
+    └── main.cpp                      CLI executable (--bvh, --out CSV, live overlay window)
 ```
 
 > **Developer tools** (ONNX/GGUF export, LBS extraction, debug scripts, Python training env) live in the parent project:
@@ -201,6 +202,8 @@ Full option list:
 --yolo     PATH    YOLO pose model (.onnx)
 --from     SRC     Webcam index (0,1,..) or path to image/video
 -o / --out PATH    Write 70-joint 3D keypoints to CSV per frame
+--bvh      PATH    Write Experimental BVH motion capture file to PATH
+--bvh-template P   Experimental BVH skeleton template file (default: ./body.bvh)
 --cuda     DEVICE  CUDA device index (default 0; -1 = CPU)
 --skip-body        Skip body model (no vertices / keypoints)
 --headless         No display window
@@ -211,6 +214,9 @@ Full option list:
 --render-size W H  Override display window size
 --size W H         Webcam capture resolution
 --fps Z            Webcam capture framerate
+--butterworth      Apply Butterworth low-pass filter to MHR output vectors
+--bw-cutoff HZ     Butterworth cutoff frequency in Hz (default 6.0)
+--rot-clamp DEG    Max global_rot change per frame in degrees (default 15; 0=off)
 --info             Print pipeline info and exit
 --help             Show this message
 ```
@@ -275,6 +281,68 @@ Key options (same as lightweight frontend, plus):
 --mhr-model  PATH  Path to mhr_model.pt
 --device     STR   PyTorch device for body model: cuda or cpu (default: auto)
 ```
+ 
+
+---
+
+## Output filtering
+
+The CLI can apply a second-order [Butterworth low-pass filter](https://en.wikipedia.org/wiki/Butterworth_filter)
+to the MHR output vectors on every frame, reducing per-frame jitter without introducing ripple in the
+passband.
+
+```bash
+# Enable with the default 6 Hz cutoff
+./fast_sam_3dbody_run --from video.mp4 --butterworth
+
+# Lower cutoff for smoother (more lag) output
+./fast_sam_3dbody_run --from video.mp4 --butterworth --bw-cutoff 3.0
+
+# Higher cutoff to preserve faster motion
+./fast_sam_3dbody_run --from video.mp4 --butterworth --bw-cutoff 10.0
+```
+
+The filter is applied in-place to each detected person's result immediately after inference,
+so all downstream consumers (CSV writer, Experimental BVH writer, display overlay) receive filtered data.
+
+### Filtered vectors
+
+| Vector | Channels | Method | Description |
+|--------|----------|--------|-------------|
+| `keypoints_3d` | 210 (70 joints × 3) | Butterworth | 3-D joint positions in metres |
+| `body_pose` | 133 | Butterworth | Body joint Euler angles |
+| `hand_pose` | 108 | Butterworth | Hand joint angles (left 54 + right 54) |
+| `global_rot` | 3 | Clamped-delta | Global orientation – Euler ZYX |
+| `pred_cam_t` | 3 | Butterworth | Camera / root translation |
+
+`global_rot` uses **wrap-corrected frame rejection** rather than Butterworth because
+Euler angles wrap at ±π — a Butterworth filter interpolates through the discontinuity
+and produces a visible flip.  Clamping the delta only delays the flip; if the model
+keeps predicting the flipped orientation the output still slowly drifts there.
+
+Instead, the per-frame wrapped delta is compared to `--rot-clamp`. If any component
+exceeds the threshold the frame is **rejected** and the previous value is held.
+Genuine rotation (small delta per frame) passes through unchanged; flips and
+ambiguous orientation jumps (large delta) are frozen out entirely.
+
+### Parameters
+
+| Flag | Default | Notes |
+|------|---------|-------|
+| `--butterworth` | off | Enable the filter |
+| `--bw-cutoff HZ` | `6.0` | Cutoff frequency in Hz. Lower = smoother but more temporal lag. Human motion typically stays below 6 Hz; use 3–4 Hz for very smooth output, 8–10 Hz to preserve fast gestures. |
+| `--rot-clamp DEG` | `15.0` | Per-frame rejection threshold for `global_rot` in degrees. If any Euler component's wrapped delta exceeds this, the frame is discarded and the previous value is held. Prevents flips without drifting toward them. Set to `0` to disable. |
+
+The sampling rate is taken from `--fps` when specified, otherwise 30 Hz is assumed.
+Each person slot maintains its own independent filter bank; new person slots are
+initialised with a warm-up pass on their first frame so the filter starts from the
+measured value rather than zero.
+
+### Implementation
+
+Implemented in `src/outputFiltering.h` — a header-only, dependency-free, C-compatible
+Butterworth filter. Each channel is a `ButterWorth` struct initialised with
+`initButterWorth(sensor, fs, fc)` and stepped with `filter(sensor, value)`.
 
 ---
 
@@ -365,4 +433,30 @@ The official PyTorch SAM 3D Body repository from Meta Superintelligence Labs is 
 
 https://github.com/facebookresearch/sam-3d-body
 
+---
+
+## Citation
+
+If you use this software repository in your research or work, please cite:
+
+```bibtex
+@misc{qammaz2026sam3dbodycpp,
+  author       = {Qammaz, Ammar},
+  title        = {{SAM3DBody-cpp}: Standalone {C++} Inference Engine for {SAM-3D-Body}},
+  year         = {2026},
+  howpublished = {\url{https://github.com/AmmarkoV/SAM3DBody-cpp}},
+  note         = {Zero-dependency runtime: ONNX Runtime + ggml, with BVH export and Python ctypes frontends}
+}
+```
+
+as well as the authors of the paper that proposes the SAM 3D Body method.
+
+```bibtex
+@article{yang2026sam3dbody,
+  title={SAM 3D Body: Robust Full-Body Human Mesh Recovery},
+  author={Yang, Xitong and Kukreja, Devansh and Pinkus, Don and Sagar, Anushka and Fan, Taosha and Park, Jinhyung and Shin, Soyong and Cao, Jinkun and Liu, Jiawei and Ugrinovic, Nicolas and Feiszli, Matt and Malik, Jitendra and Dollar, Piotr and Kitani, Kris},
+  journal={arXiv preprint arXiv:2602.15989},
+  year={2026}
+}
+```
 
