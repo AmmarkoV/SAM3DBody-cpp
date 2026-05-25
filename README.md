@@ -449,7 +449,7 @@ If you use this software repository in your research or work, please cite:
 }
 ```
 
-as well as the authors of the paper that proposes the SAM 3D Body method.
+as well as the Meta AI team behind the awesome paper that proposes the SAM 3D Body method.
 
 ```bibtex
 @article{yang2026sam3dbody,
