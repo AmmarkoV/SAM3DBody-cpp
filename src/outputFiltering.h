@@ -359,7 +359,9 @@ struct ButterWorthWrap
     char  wrap_init;       /* 1 once acc/prev_in have been seeded to the first sample */
 };
 
-static void init_butterworth_wrap(struct ButterWorthWrap* w,
+/* Not `static`: `inline` so TUs that include the header but never call
+ * these helpers don't trigger -Wunused-function warnings. */
+inline void init_butterworth_wrap(struct ButterWorthWrap* w,
                                   float fsampling, float fcutoff,
                                   int wrap_input)
 {
@@ -370,7 +372,7 @@ static void init_butterworth_wrap(struct ButterWorthWrap* w,
     w->wrap_init  = 0;
 }
 
-static float filter_wrap(struct ButterWorthWrap* w, float x)
+inline float filter_wrap(struct ButterWorthWrap* w, float x)
 {
     if (!w->wrap_input) return filter(&w->bw, x);
 

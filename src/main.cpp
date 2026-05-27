@@ -1,6 +1,7 @@
 #include "fast_sam_3dbody.h"
 #include "bvh_writer.h"
 #include "outputFiltering.h"
+#include "cli_common.h"
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/videoio.hpp>
@@ -30,26 +31,31 @@ static double ms_since(Clock::time_point t0)
 
 // ---------------------------------------------------------------------------
 // CLI
+//
+// Config inherits the common subset from CommonConfig (cli_common.h):
+//   --onnx-dir --gguf --yolo --from --cuda --trt --no-fp16 --thresh --nms
+//   --bvh --bvh-template --no-bvh-*-shape-change --bvh-raw-fingers
+//   --bw-cutoff --rot-clamp
+// Runner-specific flags below.
 // ---------------------------------------------------------------------------
-struct Config
+struct Config : public CommonConfig
 {
-    std::string onnx_dir    = "./onnx";
-    std::string gguf_path   = "./onnx/pipeline.gguf";
-    std::string yolo_path   = "./onnx/yolo.onnx";
-    std::string input_src   = "0";     // webcam index or path to image/video
-    int         cuda_device = 0;
-    bool        use_trt     = false;
-    bool        fp16        = true;
+    Config() {
+        from = "0";  // runner-only default: webcam 0 when --from is omitted
+    }
+
+    // Runner-specific output
+    std::string csv_path;             // -o / --out
+
+    // Runner-specific pipeline knobs
     bool        skip_body      = false;
     bool        zero_face      = true;
-    float       person_thresh  = 0.50f;
-    float       person_nms_iou = 0.45f;
     float       focal_x        = 0.f;
     float       focal_y        = 0.f;
     float       cx             = 0.f;
     float       cy             = 0.f;
-    bool        headless    = false;
-    bool        info_only   = false;
+    bool        headless       = false;
+    bool        info_only      = false;
 
     /* On a good bw_cutoff value..
     ┌────────────────────────┬──────────────────────┬────────────────────────────────────┐
@@ -67,15 +73,9 @@ struct Config
     └────────────────────────┴──────────────────────┴────────────────────────────────────┘
     */
     bool        butterworth      = false;
-    float       bw_cutoff        = 6.0f;  // Hz
-    bool        filter_root_rot  = false;   // enabled by --butterworth-root-rotation
-    float       rot_clamp        = 1.0f;    // rejection threshold in degrees/frame
-    std::string csv_path    = "";    // if non-empty, write 3D joints to this CSV
-    std::string bvh_path    = "";    // if non-empty, write BVH motion capture to this path
-    std::string bvh_template = "./body.bvh"; // BVH skeleton template (hierarchy source)
-    bool        bvh_body_shape_change          = true;
-    bool        bvh_hand_shape_change          = true;
-    bool        bvh_compensate_finger_endsites = true;
+    bool        filter_root_rot  = false;
+
+    // Capture / display geometry — runner only.
     int         render_w    = 0;     // GL window width  (0 = match input)
     int         render_h    = 0;     // GL window height (0 = match input)
     int         cap_w       = 0;     // capture width  (0 = driver default)
@@ -124,25 +124,19 @@ static Config parse_args(int argc, char** argv)
     Config c;
     for (int i = 1; i < argc; ++i)
     {
+        // Common flags first — see src/cli_common.h.  Anything that's NOT
+        // a common flag falls through to the runner-specific handlers below.
+        if (parse_common_arg(argc, argv, i, c)) continue;
+
 #define ARG1(flag, field, conv) \
         if (!strcmp(argv[i], flag) && i+1 < argc) { c.field = conv(argv[++i]); continue; }
-        ARG1("--onnx-dir", onnx_dir,    std::string)
-        ARG1("--gguf",     gguf_path,   std::string)
-        ARG1("--yolo",     yolo_path,   std::string)
-        ARG1("--from",     input_src,   std::string)
-        ARG1("--cuda",     cuda_device, std::stoi)
-        ARG1("--thresh",   person_thresh,  std::stof)
-        ARG1("--nms",      person_nms_iou, std::stof)
+        // Runner-only: per-axis camera intrinsics + CSV path.
         ARG1("--fx",       focal_x,     std::stof)
         ARG1("--fy",       focal_y,     std::stof)
         ARG1("--cx",       cx,          std::stof)
         ARG1("--cy",       cy,          std::stof)
-        ARG1("--out",         csv_path,     std::string)
-        ARG1("-o",            csv_path,     std::string)
-        ARG1("--bvh",         bvh_path,     std::string)
-        ARG1("--bvh-template",bvh_template, std::string)
-        ARG1("--bw-cutoff",   bw_cutoff,    std::stof)
-        ARG1("--rot-clamp",   rot_clamp,    std::stof)
+        ARG1("--out",      csv_path,    std::string)
+        ARG1("-o",         csv_path,    std::string)
 #undef ARG1
         if (!strcmp(argv[i], "--render-size") && i+2 < argc)
         {
@@ -161,61 +155,12 @@ static Config parse_args(int argc, char** argv)
             c.cap_fps = std::stod(argv[++i]);
             continue;
         }
-        if (!strcmp(argv[i], "--trt"))
-        {
-            c.use_trt   = true;
-            continue;
-        }
-        if (!strcmp(argv[i], "--no-fp16"))
-        {
-            c.fp16      = false;
-            continue;
-        }
-        if (!strcmp(argv[i], "--skip-body"))
-        {
-            c.skip_body = true;
-            continue;
-        }
-        if (!strcmp(argv[i], "--dev-face"))
-        {
-            c.zero_face = false;
-            continue;
-        }
-        if (!strcmp(argv[i], "--headless"))
-        {
-            c.headless  = true;
-            continue;
-        }
-        if (!strcmp(argv[i], "--no-bvh-body-shape-change"))
-        {
-            c.bvh_body_shape_change = false;
-            continue;
-        }
-        if (!strcmp(argv[i], "--no-bvh-hand-shape-change"))
-        {
-            c.bvh_hand_shape_change = false;
-            continue;
-        }
-        if (!strcmp(argv[i], "--bvh-raw-fingers"))
-        {
-            c.bvh_compensate_finger_endsites = false;
-            continue;
-        }
-        if (!strcmp(argv[i], "--info"))
-        {
-            c.info_only = true;
-            continue;
-        }
-        if (!strcmp(argv[i], "--butterworth"))
-        {
-            c.butterworth = true;
-            continue;
-        }
-        if (!strcmp(argv[i], "--butterworth-root-rotation"))
-        {
-            c.filter_root_rot = true;
-            continue;
-        }
+        if (!strcmp(argv[i], "--skip-body"))      { c.skip_body       = true;  continue; }
+        if (!strcmp(argv[i], "--dev-face"))       { c.zero_face       = false; continue; }
+        if (!strcmp(argv[i], "--headless"))       { c.headless        = true;  continue; }
+        if (!strcmp(argv[i], "--info"))           { c.info_only       = true;  continue; }
+        if (!strcmp(argv[i], "--butterworth"))    { c.butterworth     = true;  continue; }
+        if (!strcmp(argv[i], "--butterworth-root-rotation")) { c.filter_root_rot = true; continue; }
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h"))
         {
             print_usage(argv[0]);
@@ -523,20 +468,13 @@ int main(int argc, char** argv)
     }
 
     fsb::PipelineConfig pcfg;
-    pcfg.onnx_dir       = c.onnx_dir;
-    pcfg.gguf_path      = c.gguf_path;
-    pcfg.yolo_path      = c.yolo_path;
-    pcfg.cuda_device    = c.cuda_device;
-    pcfg.use_trt_ep     = c.use_trt;
-    pcfg.use_fp16       = c.fp16;
+    apply_common_to_pipeline_cfg(c, pcfg);  // all shared pipeline fields
     pcfg.skip_body_model  = c.skip_body;
     pcfg.zero_face_params = c.zero_face;
-    pcfg.person_thresh  = c.person_thresh;
-    pcfg.person_nms_iou = c.person_nms_iou;
-    pcfg.focal_x        = c.focal_x;
-    pcfg.focal_y        = c.focal_y;
-    pcfg.principal_x    = c.cx;
-    pcfg.principal_y    = c.cy;
+    pcfg.focal_x          = c.focal_x;
+    pcfg.focal_y          = c.focal_y;
+    pcfg.principal_x      = c.cx;
+    pcfg.principal_y      = c.cy;
 
     fsb::Pipeline pipeline;
     {
@@ -562,18 +500,18 @@ int main(int argc, char** argv)
     cv::VideoCapture cap;
     bool is_image = false;
 
-    bool src_is_int = !c.input_src.empty() &&
-                      c.input_src.find_first_not_of("0123456789") == std::string::npos;
+    bool src_is_int = !c.from.empty() &&
+                      c.from.find_first_not_of("0123456789") == std::string::npos;
 
     // A webcam is an integer index OR a /dev/videoX path — not a recorded video file.
     // Only webcams need frame-sync skipping; video files have no real-time clock.
     bool is_webcam = src_is_int ||
-                     (c.input_src.size() >= 10 &&
-                      c.input_src.compare(0, 10, "/dev/video") == 0);
+                     (c.from.size() >= 10 &&
+                      c.from.compare(0, 10, "/dev/video") == 0);
 
     if (src_is_int)
     {
-        cap.open(std::stoi(c.input_src));
+        cap.open(std::stoi(c.from));
     }
     else
     {
@@ -583,14 +521,14 @@ int main(int argc, char** argv)
         {
             auto ext = img_exts[k];
             auto elen = strlen(ext);
-            if (c.input_src.size() >= elen &&
-                    c.input_src.compare(c.input_src.size()-elen, elen, ext) == 0)
+            if (c.from.size() >= elen &&
+                    c.from.compare(c.from.size()-elen, elen, ext) == 0)
             {
                 is_image = true;
                 break;
             }
         }
-        if (!is_image) cap.open(c.input_src);
+        if (!is_image) cap.open(c.from);
     }
 
     if (!is_image && cap.isOpened())
@@ -612,7 +550,7 @@ int main(int argc, char** argv)
 
     if (!is_image && !cap.isOpened())
     {
-        fprintf(stderr, "[main] Cannot open input: %s\n", c.input_src.c_str());
+        fprintf(stderr, "[main] Cannot open input: %s\n", c.from.c_str());
         pipeline.free();
         return 1;
     }
@@ -659,11 +597,11 @@ int main(int argc, char** argv)
         if (use_bw)
             printf("[main] Butterworth filter: %.1f Hz cutoff at %.1f Hz sample rate"
                    "  |  root rot clamp: %.1f deg/frame\n",
-                   c.bw_cutoff, bw_fps, c.rot_clamp);
+                   c.bw_cutoff, bw_fps, c.rot_clamp_deg);
         else
             printf("[main] Butterworth SKIPPED (cutoff %.1f Hz >= Nyquist %.1f Hz)"
                    "  |  root rot clamp: %.1f deg/frame\n",
-                   c.bw_cutoff, bw_fps * 0.5f, c.rot_clamp);
+                   c.bw_cutoff, bw_fps * 0.5f, c.rot_clamp_deg);
     }
 
     // -----------------------------------------------------------------------
@@ -679,7 +617,7 @@ int main(int argc, char** argv)
     {
         if (is_image)
         {
-            frame = cv::imread(c.input_src);
+            frame = cv::imread(c.from);
             if (frame.empty())
             {
                 fprintf(stderr, "[main] Cannot read image.\n");
@@ -763,8 +701,8 @@ int main(int argc, char** argv)
                     float in_q[4], out_q[4];
                     euler_zyx_to_quat(r.global_rot[0], r.global_rot[1],
                                       r.global_rot[2], in_q);
-                    float max_step_rad = (c.rot_clamp > 0.0f)
-                        ? c.rot_clamp * (3.14159265359f / 180.0f) : 0.0f;
+                    float max_step_rad = (c.rot_clamp_deg > 0.0f)
+                        ? c.rot_clamp_deg * (3.14159265359f / 180.0f) : 0.0f;
                     filter_quat(&pf.root_rot, in_q, max_step_rad, out_q);
                     quat_to_euler_zyx(out_q, &r.global_rot[0],
                                               &r.global_rot[1],

@@ -68,6 +68,7 @@
 #include "../src/bvh_writer.h"
 #include "../src/outputFiltering.h"
 #include "../src/preprocess.hpp"   // for fsb::apply_hand_pose
+#include "../src/cli_common.h"     // shared --onnx-dir / --bvh / … parser
 
 extern "C" {
 #include "../GraphicsEngine/ModelLoader/model_loader_transform_joints.h"
@@ -129,29 +130,27 @@ static double ms_since(Clock::time_point t0)
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
-struct Config
+// Config inherits the common subset from CommonConfig (cli_common.h):
+//   --onnx-dir --gguf --yolo --from --cuda --trt --no-fp16 --thresh --nms
+//   --bvh --bvh-template --no-bvh-*-shape-change --bvh-raw-fingers
+//   --bw-cutoff --rot-clamp
+// Offline-specific knobs (smoothing / tracking / scene / gap / jitter)
+// live in the derived part below.
+struct Config : public CommonConfig
 {
-    // Pipeline paths
-    std::string onnx_dir   = "./onnx";
-    std::string gguf_path  = "./onnx/pipeline.gguf";
-    std::string yolo_path  = "./onnx/yolo.onnx";
-    std::string lbs_path;          // auto: <onnx_dir>/body_model.lbs
-    std::string from;              // input video file (NO webcam / image)
-    std::string bvh_path;          // output BVH base name → bvh_path becomes <stem>_<id>.bvh
-    std::string bvh_template = "./body.bvh";
+    Config() {
+        // Offline-specific default: --rot-clamp's geodesic SLERP clamp is
+        // much wider here than in the live binaries because filtfilt
+        // smoothing already absorbs most jitter.  See the QuatLPF section
+        // in README "Output filtering".
+        rot_clamp_deg = 30.0f;
+    }
 
-    // Pipeline tunables
-    int   cuda_device = 0;
-    bool  use_trt     = false;
-    bool  fp16        = true;
-    float person_thresh  = 0.50f;
-    float person_nms_iou = 0.45f;
+    std::string lbs_path;          // auto: <onnx_dir>/body_model.lbs
 
     // Smoothing
     enum class Smoothing { ZeroPhase, Forward, Off };
     Smoothing smoothing      = Smoothing::ZeroPhase;
-    float     bw_cutoff      = 6.0f;     // Hz — same knob as live binaries
-    float     rot_clamp_deg  = 30.0f;    // per-frame geodesic clamp on global_rot SLERP
 
     // Tracking
     float     track_iou_thresh     = 0.10f;   // match threshold per frame
@@ -195,10 +194,8 @@ struct Config
     float     scene_success_thresh = 0.50f;
     int       scene_min_corners    = 30;
 
-    // BVH offset rewriting (mirrors live binaries)
-    bool  rewrite_body_offsets       = true;
-    bool  rewrite_hand_offsets       = true;
-    bool  compensate_finger_endsites = true;
+    // bvh_body_shape_change / bvh_hand_shape_change /
+    // bvh_compensate_finger_endsites all come from CommonConfig now.
 };
 
 static void print_usage(const char* prog)
@@ -266,27 +263,22 @@ static bool parse_args(int argc, char** argv, Config& c)
 {
     for (int i = 1; i < argc; ++i)
     {
+        // Common flags first (--onnx-dir / --gguf / --yolo / --from / --cuda /
+        // --trt / --no-fp16 / --thresh / --nms / --bvh* / --bw-cutoff /
+        // --rot-clamp).  See src/cli_common.h.  Anything that isn't a common
+        // flag falls through to the offline-specific dispatch below.
+        if (parse_common_arg(argc, argv, i, c)) continue;
+
 #define A1(flag, field, conv) \
         if (!strcmp(argv[i], flag) && i+1 < argc) { c.field = conv(argv[++i]); continue; }
-        A1("--onnx-dir",       onnx_dir,            std::string)
-        A1("--gguf",           gguf_path,           std::string)
-        A1("--yolo",           yolo_path,           std::string)
-        A1("--lbs",            lbs_path,            std::string)
-        A1("--from",           from,                std::string)
-        A1("--bvh",            bvh_path,            std::string)
-        A1("--bvh-template",   bvh_template,        std::string)
-        A1("--cuda",           cuda_device,         std::stoi)
-        A1("--thresh",         person_thresh,       std::stof)
-        A1("--nms",            person_nms_iou,      std::stof)
-        A1("--bw-cutoff",      bw_cutoff,           std::stof)
-        A1("--rot-clamp",      rot_clamp_deg,       std::stof)
-        A1("--track-merge-frames", track_merge_frames, std::stoi)
-        A1("--track-merge-cm", track_merge_cm,      std::stof)
-        A1("--min-track-frames", min_track_frames,  std::stoi)
+        A1("--lbs",                     lbs_path,            std::string)
+        A1("--track-merge-frames",      track_merge_frames,  std::stoi)
+        A1("--track-merge-cm",          track_merge_cm,      std::stof)
+        A1("--min-track-frames",        min_track_frames,    std::stoi)
         A1("--scene-success-threshold", scene_success_thresh, std::stof)
-        A1("--scene-min-corners",       scene_min_corners,    std::stoi)
-        A1("--jitter-threshold-cm", jitter_threshold_cm, std::stof)
-        A1("--gap-max-frames",      gap_max_frames,      std::stoi)
+        A1("--scene-min-corners",       scene_min_corners,   std::stoi)
+        A1("--jitter-threshold-cm",     jitter_threshold_cm, std::stof)
+        A1("--gap-max-frames",          gap_max_frames,      std::stoi)
 #undef A1
         if (!strcmp(argv[i], "--smoothing") && i+1 < argc)
         {
@@ -297,21 +289,14 @@ static bool parse_args(int argc, char** argv, Config& c)
             else { fprintf(stderr, "unknown --smoothing %s\n", v.c_str()); return false; }
             continue;
         }
-        if (!strcmp(argv[i], "--trt"))                          { c.use_trt = true; continue; }
-        if (!strcmp(argv[i], "--no-fp16"))                      { c.fp16    = false; continue; }
-        if (!strcmp(argv[i], "--interpolate-jitter"))           { c.interpolate_jitter = true; continue; }
-        if (!strcmp(argv[i], "--no-gap-interpolation"))         { c.gap_interpolation = false; continue; }
-        if (!strcmp(argv[i], "--no-bvh-body-shape-change"))     { c.rewrite_body_offsets = false; continue; }
-        if (!strcmp(argv[i], "--no-bvh-hand-shape-change"))     { c.rewrite_hand_offsets = false; continue; }
-        if (!strcmp(argv[i], "--bvh-raw-fingers"))              { c.compensate_finger_endsites = false; continue; }
-        if (!strcmp(argv[i], "--no-scene-detection"))           { c.scene_detection = false; continue; }
-        // --static-scene is the user-facing alias: "I'm asserting this clip
-        // is a single continuous shot."  Same effect as --no-scene-detection
-        // but describes intent rather than mechanism.  Useful when you know
-        // the source has no cuts (one-take dance clip, lab recording, …) —
-        // skips a small amount of per-frame OpenCV work and prevents any
-        // false-positive cuts from interrupting the smoothing.
-        if (!strcmp(argv[i], "--static-scene"))                 { c.scene_detection = false; continue; }
+        if (!strcmp(argv[i], "--interpolate-jitter"))     { c.interpolate_jitter = true; continue; }
+        if (!strcmp(argv[i], "--no-gap-interpolation"))   { c.gap_interpolation = false; continue; }
+        if (!strcmp(argv[i], "--no-scene-detection"))     { c.scene_detection = false; continue; }
+        // --static-scene is the user-facing alias for --no-scene-detection:
+        // "I'm asserting this clip is a single continuous shot."  Skips the
+        // per-frame OpenCV scene-detector work and prevents any false-
+        // positive cuts from interrupting the smoothing.
+        if (!strcmp(argv[i], "--static-scene"))           { c.scene_detection = false; continue; }
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { print_usage(argv[0]); return false; }
         fprintf(stderr, "unknown argument: %s\n", argv[i]);
         return false;
@@ -323,7 +308,7 @@ static bool parse_args(int argc, char** argv, Config& c)
         print_usage(argv[0]);
         return false;
     }
-    if (c.lbs_path.empty()) c.lbs_path = c.onnx_dir + "/body_model.lbs";
+    if (c.lbs_path.empty()) c.lbs_path = default_lbs_path(c);
 
     // Reject webcam-style sources and still images.  This binary is explicitly
     // about offline processing of finite-length video streams.
@@ -1395,8 +1380,8 @@ static void export_to_bvh(const std::vector<FrameRecord>& frames,
 {
     BVHWriter w;
     if (!w.open(cfg.bvh_template, cfg.bvh_path, 1.0f / (float)fps, cfg.lbs_path,
-                cfg.rewrite_body_offsets, cfg.rewrite_hand_offsets,
-                cfg.compensate_finger_endsites))
+                cfg.bvh_body_shape_change, cfg.bvh_hand_shape_change,
+                cfg.bvh_compensate_finger_endsites))
     {
         fprintf(stderr, "[pass6] BVHWriter::open failed — aborting export\n");
         return;
@@ -1446,15 +1431,8 @@ int main(int argc, char** argv)
     fsb::Pipeline pipeline;
     {
         fsb::PipelineConfig pcfg;
-        pcfg.onnx_dir       = cfg.onnx_dir;
-        pcfg.gguf_path      = cfg.gguf_path;
-        pcfg.yolo_path      = cfg.yolo_path;
-        pcfg.cuda_device    = cfg.cuda_device;
-        pcfg.use_trt_ep     = cfg.use_trt;
-        pcfg.use_fp16       = cfg.fp16;
+        apply_common_to_pipeline_cfg(cfg, pcfg);
         pcfg.skip_body_model = false;  // we need keypoints_3d for jitter detection
-        pcfg.person_thresh  = cfg.person_thresh;
-        pcfg.person_nms_iou = cfg.person_nms_iou;
         if (!pipeline.load(pcfg)) {
             fprintf(stderr, "Failed to load pipeline\n");
             return 1;

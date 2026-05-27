@@ -22,6 +22,7 @@ extern "C" {
 #include "../src/fast_sam_3dbody.h"
 #include "../src/preprocess.hpp"   // for fsb::apply_hand_pose
 #include "../src/outputFiltering.h" // for QuatLPF + euler_zyx_to_quat helpers
+#include "../src/cli_common.h"      // shared --onnx-dir / --bvh / … parser
 #include "mhr_pose_driver.h"
 
 #include <opencv2/imgcodecs.hpp>
@@ -498,20 +499,18 @@ int main(int argc, const char** argv) {
     int    cap_h      = 0;   // capture height (0 = driver default)
     double cap_fps    = 0.0; // capture fps    (0 = driver default)
 
+    // Common flags go through the shared parser; binary-specific flags
+    // (--mesh, --lbs, --save-frames, --render-size, --size, --fps,
+    //  --butterworth*, --dev-face, --headless) stay handled inline.
+    CommonConfig cc;
     for (int i = 1; i < argc; ++i) {
+        if (parse_common_arg(argc, argv, i, cc)) continue;
+
 #define A1(flag, field, conv) \
         if (!strcmp(argv[i], flag) && i+1<argc) { field = conv(argv[++i]); continue; }
-        A1("--onnx-dir", onnx_dir,  std::string)
-        A1("--gguf",     gguf_path, std::string)
-        A1("--yolo",     yolo_path, std::string)
-        A1("--mesh",     mesh_path, std::string)
-        A1("--lbs",      lbs_path,  std::string)
-        A1("--from",        src,                std::string)
+        A1("--mesh",        mesh_path,          std::string)
+        A1("--lbs",         lbs_path,           std::string)
         A1("--save-frames", save_frames_prefix, std::string)
-        A1("--cuda",        cuda_device,        std::stoi)
-        A1("--bvh",          bvh_path,     std::string)
-        A1("--bvh-template", bvh_template, std::string)
-        A1("--bw-cutoff",    bw_cutoff,    std::stof)
 #undef A1
         if (!strcmp(argv[i], "--render-size") && i+2 < argc)
             { render_w = std::stoi(argv[++i]); render_h = std::stoi(argv[++i]); continue; }
@@ -519,17 +518,29 @@ int main(int argc, const char** argv) {
             { cap_w = std::stoi(argv[++i]); cap_h = std::stoi(argv[++i]); continue; }
         if (!strcmp(argv[i], "--fps") && i+1 < argc)
             { cap_fps = std::stod(argv[++i]); continue; }
-        if (!strcmp(argv[i], "--trt"))         { use_trt        = true;  continue; }
-        if (!strcmp(argv[i], "--no-fp16"))     { fp16           = false; continue; }
         if (!strcmp(argv[i], "--dev-face"))    { zero_face      = false; continue; }
         if (!strcmp(argv[i], "--butterworth"))              { use_butterworth  = true; continue; }
         if (!strcmp(argv[i], "--butterworth-root-rotation")){ filter_root_rot  = true; continue; }
-        if (!strcmp(argv[i], "--rot-clamp") && i+1 < argc) { rot_clamp_deg = std::stof(argv[++i]); continue; }
-        if (!strcmp(argv[i], "--no-bvh-body-shape-change")) { bvh_body_shape_change = false; continue; }
-        if (!strcmp(argv[i], "--no-bvh-hand-shape-change")) { bvh_hand_shape_change = false; continue; }
-        if (!strcmp(argv[i], "--bvh-raw-fingers"))          { bvh_compensate_finger_endsites = false; continue; }
         if (!strcmp(argv[i], "--headless"))                 { headless = true; continue; }
     }
+    // Unpack the common parser's output into the local variables the
+    // rest of main() expects.  Keeping the locals avoids a wholesale
+    // refactor of the rendering loop's pipeline-config / BVH-writer /
+    // filter-init code paths.
+    onnx_dir                       = cc.onnx_dir;
+    gguf_path                      = cc.gguf_path;
+    yolo_path                      = cc.yolo_path;
+    src                            = cc.from;
+    cuda_device                    = cc.cuda_device;
+    use_trt                        = cc.use_trt;
+    fp16                           = cc.fp16;
+    bvh_path                       = cc.bvh_path;
+    bvh_template                   = cc.bvh_template;
+    bvh_body_shape_change          = cc.bvh_body_shape_change;
+    bvh_hand_shape_change          = cc.bvh_hand_shape_change;
+    bvh_compensate_finger_endsites = cc.bvh_compensate_finger_endsites;
+    bw_cutoff                      = cc.bw_cutoff;
+    rot_clamp_deg                  = cc.rot_clamp_deg;
 
     // ── Pipeline ─────────────────────────────────────────────────────────────
     fsb::Pipeline pipeline;
