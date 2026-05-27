@@ -844,7 +844,7 @@ build_global_tracks(std::vector<FrameRecord>& frames, const Config& cfg)
     // misclassified face in a crowd, motion-blur reflection, etc.  These
     // surface as tiny tracks that nobody wants in their BVH output.  Drop
     // anything below --min-track-frames detections.  We also have to clear
-    // the corresponding entries in FrameRecord::track_ids so PASS 5 doesn't
+    // the corresponding entries in FrameRecord::track_ids so PASS 6 doesn't
     // try to write them anyway.
     if (cfg.min_track_frames > 1) {
         int dropped = 0;
@@ -869,8 +869,175 @@ build_global_tracks(std::vector<FrameRecord>& frames, const Config& cfg)
     return tracks;
 }
 
+// ─── MHR-result interpolation helper ─────────────────────────────────────────
+//
+// Linearly interpolates every scalar field, SLERPs global_rot (since Euler
+// linear-blend across ±π wraps would flip the body), and takes bbox /
+// focal_length / pred_cam_t along linearly.  Used by both the gap-fill pass
+// below and the jitter pass further down.
+//
+// Note on `body_pose` / `hand_pose` / `mhr_model_params`: these are Euler
+// angles too, so the same ±π caveat applies.  In practice the per-frame
+// deltas are small (a few degrees) and a linear blend across a short gap
+// produces results visually indistinguishable from a per-joint quaternion
+// SLERP.  Pass 5's zero-phase smoother cleans up any small artefacts.  If
+// you see weird limb-flip artefacts on long gaps, that's a sign the gap was
+// across a moment where multiple joints crossed gimbal-lock — easiest
+// mitigation is `--gap-max-frames N` so those long gaps stay frozen.
+
+static fsb::MHRResult interp_mhr(const fsb::MHRResult& a,
+                                  const fsb::MHRResult& b,
+                                  float t)
+{
+    fsb::MHRResult out = a;                  // start from a; overwrite mutable fields
+    const float u = 1.f - t;
+
+    for (int k = 0; k < 4; ++k) out.bbox[k]       = a.bbox[k]       * u + b.bbox[k]       * t;
+    for (int k = 0; k < 3; ++k) out.pred_cam_t[k] = a.pred_cam_t[k] * u + b.pred_cam_t[k] * t;
+    out.focal_length = a.focal_length * u + b.focal_length * t;
+
+    if (a.keypoints_3d.size() == b.keypoints_3d.size() && !a.keypoints_3d.empty()) {
+        out.keypoints_3d.assign(a.keypoints_3d.size(), 0.f);
+        for (size_t k = 0; k < out.keypoints_3d.size(); ++k)
+            out.keypoints_3d[k] = a.keypoints_3d[k] * u + b.keypoints_3d[k] * t;
+    }
+    if (a.keypoints_2d.size() == b.keypoints_2d.size() && !a.keypoints_2d.empty()) {
+        out.keypoints_2d.assign(a.keypoints_2d.size(), 0.f);
+        for (size_t k = 0; k < out.keypoints_2d.size(); ++k)
+            out.keypoints_2d[k] = a.keypoints_2d[k] * u + b.keypoints_2d[k] * t;
+    }
+    if (a.body_pose.size() == b.body_pose.size() && !a.body_pose.empty()) {
+        out.body_pose.assign(a.body_pose.size(), 0.f);
+        for (size_t k = 0; k < out.body_pose.size(); ++k)
+            out.body_pose[k] = a.body_pose[k] * u + b.body_pose[k] * t;
+    }
+    if (a.hand_pose.size() == b.hand_pose.size() && !a.hand_pose.empty()) {
+        out.hand_pose.assign(a.hand_pose.size(), 0.f);
+        for (size_t k = 0; k < out.hand_pose.size(); ++k)
+            out.hand_pose[k] = a.hand_pose[k] * u + b.hand_pose[k] * t;
+    }
+    for (size_t k = 0; k < out.mhr_model_params.size(); ++k)
+        out.mhr_model_params[k] = a.mhr_model_params[k] * u + b.mhr_model_params[k] * t;
+
+    // global_rot — SLERP via the same euler↔quat helpers Pass 4 already uses.
+    float qa[4], qb[4], qc[4];
+    euler_zyx_to_quat(a.global_rot[0], a.global_rot[1], a.global_rot[2], qa);
+    euler_zyx_to_quat(b.global_rot[0], b.global_rot[1], b.global_rot[2], qb);
+    float dot = qa[0]*qb[0] + qa[1]*qb[1] + qa[2]*qb[2] + qa[3]*qb[3];
+    if (dot < 0.f) { for (int k=0;k<4;++k) qb[k] = -qb[k]; dot = -dot; }
+    float omega = std::acos(std::max(-1.f, std::min(1.f, dot)));
+    float s     = std::sin(omega);
+    float wa, wb;
+    if (s < 1e-6f) { wa = u; wb = t; }
+    else           { wa = std::sin(u * omega) / s; wb = std::sin(t * omega) / s; }
+    for (int k = 0; k < 4; ++k) qc[k] = wa*qa[k] + wb*qb[k];
+    float n = std::sqrt(qc[0]*qc[0]+qc[1]*qc[1]+qc[2]*qc[2]+qc[3]*qc[3]);
+    if (n > 1e-9f) for (int k=0;k<4;++k) qc[k] /= n;
+    quat_to_euler_zyx(qc, &out.global_rot[0], &out.global_rot[1], &out.global_rot[2]);
+
+    return out;
+}
+
 // ════════════════════════════════════════════════════════════════════════════
-//  PASS 3 — JITTER INTERPOLATION  (opt-in via --interpolate-jitter)
+//  PASS 3 — GAP INTERPOLATION  (on by default; --no-gap-interpolation to opt out)
+// ════════════════════════════════════════════════════════════════════════════
+//  For every track, the offline tracker records the frames in which the
+//  person was actually detected (track.frame_to_det).  Any frame in
+//  [first_frame, last_frame] that is NOT in that map is a hole — usually a
+//  YOLO confidence dip, brief partial occlusion, or a fast head turn that
+//  evicted the bbox momentarily.
+//
+//  Before this pass existed, write_frame_external received those holes via
+//  the `pad_ids` list, and BVHWriter::pad_continuation_frame duplicated the
+//  previous row of motion data.  In Blender that shows up as a frozen pose
+//  for the entire gap — exactly the regression that prompted this pass.
+//
+//  This pass walks each track's detected frames in order.  For any pair
+//  of consecutive detected frames (fa, fb) with at least one missing
+//  frame between them, it linearly / SLERP-interpolates a synthetic
+//  MHRResult at every intermediate frame f ∈ (fa, fb), inserts it into
+//  frames[f].detections, and registers it in track.frame_to_det.  Pass 4
+//  (smoothing) and Pass 6 (export) then see a contiguous track timeline
+//  and produce real motion in the BVH instead of a hold.
+//
+//  Two guard conditions:
+//    * Scene cuts inside the gap break interpolation — bridging from a
+//      person's pose in shot A to their pose in shot B would smear them
+//      across the cut.  Honoured via cut_between(scene_cuts, fa, fb).
+//    * `--gap-max-frames N` (0 = no limit) skips gaps longer than N frames.
+//      Useful when very long occlusions produce visibly unphysical
+//      morphing between two unrelated poses — bound the interpolation to
+//      short occlusions and let longer ones stay frozen.
+// ════════════════════════════════════════════════════════════════════════════
+
+static void gap_interpolation_pass(std::vector<FrameRecord>& frames,
+                                    std::vector<Track>& tracks,
+                                    const std::vector<int>& scene_cuts,
+                                    const Config& cfg)
+{
+    if (!cfg.gap_interpolation) {
+        printf("[pass3] gap interpolation disabled — missing frames will be padded\n");
+        return;
+    }
+    if (cfg.gap_max_frames > 0)
+        printf("[pass3] filling track gaps (max %d frames)%s …\n",
+               cfg.gap_max_frames,
+               scene_cuts.empty() ? "" : ", honouring scene cuts");
+    else
+        printf("[pass3] filling track gaps%s …\n",
+               scene_cuts.empty() ? "" : " (honouring scene cuts)");
+
+    int n_gaps = 0, n_skipped_cut = 0, n_skipped_long = 0, n_synth = 0;
+
+    for (auto& track : tracks)
+    {
+        if (track.frame_to_det.size() < 2) continue;
+
+        // Snapshot the existing detected frames in order — we'll mutate
+        // track.frame_to_det inside the loop and don't want to confuse the
+        // iterator.
+        std::vector<int> keys;
+        keys.reserve(track.frame_to_det.size());
+        for (const auto& kv : track.frame_to_det) keys.push_back(kv.first);
+
+        for (size_t i = 1; i < keys.size(); ++i)
+        {
+            int fa = keys[i-1], fb = keys[i];
+            int gap = fb - fa - 1;
+            if (gap <= 0) continue;                          // no missing frames
+            ++n_gaps;
+
+            if (cut_between(scene_cuts, fa, fb))  { ++n_skipped_cut;  continue; }
+            if (cfg.gap_max_frames > 0 && gap > cfg.gap_max_frames)
+                                                  { ++n_skipped_long; continue; }
+
+            const auto& ra = frames[fa].detections[track.frame_to_det[fa]];
+            const auto& rb = frames[fb].detections[track.frame_to_det[fb]];
+
+            for (int f = fa + 1; f < fb; ++f) {
+                float t = (float)(f - fa) / (float)(fb - fa);
+                fsb::MHRResult synth = interp_mhr(ra, rb, t);
+
+                // Append the synthetic detection.  Updating the parallel
+                // tracking arrays so jitter / smoothing / export all see
+                // a self-consistent FrameRecord.
+                int new_idx = (int)frames[f].detections.size();
+                frames[f].detections.push_back(std::move(synth));
+                frames[f].track_ids.push_back(track.id);
+                frames[f].was_interpolated.push_back(1);
+                track.frame_to_det[f] = new_idx;
+                ++n_synth;
+            }
+        }
+    }
+
+    printf("[pass3]   synthesized %d frames across %d gap(s) "
+           "(skipped %d at scene cuts, %d beyond --gap-max-frames)\n",
+           n_synth, n_gaps, n_skipped_cut, n_skipped_long);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  PASS 4 — JITTER INTERPOLATION  (opt-in via --interpolate-jitter)
 // ════════════════════════════════════════════════════════════════════════════
 //  A single bad FFN frame typically presents as a 3D root or 3D keypoint
 //  velocity an order of magnitude above the surrounding motion: 30+ cm in
@@ -895,7 +1062,7 @@ static void interpolate_jitter_pass(std::vector<FrameRecord>& frames,
                                     const Config& cfg)
 {
     if (!cfg.interpolate_jitter) return;
-    printf("[pass3] jitter detection & interpolation (threshold %.1f cm/frame)%s …\n",
+    printf("[pass4] jitter detection & interpolation (threshold %.1f cm/frame)%s …\n",
            cfg.jitter_threshold_cm,
            scene_cuts.empty() ? "" : " — honouring scene cuts");
 
@@ -1017,11 +1184,11 @@ static void interpolate_jitter_pass(std::vector<FrameRecord>& frames,
         }
     }
 
-    printf("[pass3]   flagged %d frames; interpolated %d.\n", n_flagged, n_interpolated);
+    printf("[pass4]   flagged %d frames; interpolated %d.\n", n_flagged, n_interpolated);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  PASS 4 — ZERO-PHASE SMOOTHING
+//  PASS 5 — ZERO-PHASE SMOOTHING
 // ════════════════════════════════════════════════════════════════════════════
 //  filtfilt: run the IIR forward over the whole series, reverse the result,
 //  run it again (initialised fresh), reverse back.  The phase shift of the
@@ -1176,13 +1343,13 @@ static void smoothing_pass(std::vector<FrameRecord>& frames,
                            float fs, const Config& cfg)
 {
     if (cfg.smoothing == Config::Smoothing::Off) {
-        printf("[pass4] smoothing disabled (--smoothing off)\n");
+        printf("[pass5] smoothing disabled (--smoothing off)\n");
         return;
     }
     const char* mode_name = (cfg.smoothing == Config::Smoothing::ZeroPhase)
                               ? "zero-phase (forward+backward)"
                               : "forward only";
-    printf("[pass4] smoothing per track — %s, %.1f Hz cutoff%s\n",
+    printf("[pass5] smoothing per track — %s, %.1f Hz cutoff%s\n",
            mode_name, cfg.bw_cutoff,
            scene_cuts.empty() ? "" : " (per-shot segmented)");
 
@@ -1209,11 +1376,11 @@ static void smoothing_pass(std::vector<FrameRecord>& frames,
         smooth_segment(frame_keys, seg_start, F, track, frames, fs, cfg);
         ++n_segments;
     }
-    printf("[pass4]   smoothed %d segment(s) across all tracks\n", n_segments);
+    printf("[pass5]   smoothed %d segment(s) across all tracks\n", n_segments);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  PASS 5 — BVH EXPORT
+//  PASS 6 — BVH EXPORT
 // ════════════════════════════════════════════════════════════════════════════
 //  Walk frames in chronological order.  For every frame, build the parallel
 //  vectors of (results, track_ids) for tracks that have a detection in this
@@ -1231,10 +1398,10 @@ static void export_to_bvh(const std::vector<FrameRecord>& frames,
                 cfg.rewrite_body_offsets, cfg.rewrite_hand_offsets,
                 cfg.compensate_finger_endsites))
     {
-        fprintf(stderr, "[pass5] BVHWriter::open failed — aborting export\n");
+        fprintf(stderr, "[pass6] BVHWriter::open failed — aborting export\n");
         return;
     }
-    printf("[pass5] writing BVH (%.2f fps timeline) …\n", fps);
+    printf("[pass6] writing BVH (%.2f fps timeline) …\n", fps);
 
     // Per-track scratch: for each frame, is the track present?  Lets us emit
     // pad_ids without re-scanning the full session map.
@@ -1320,13 +1487,20 @@ int main(int argc, char** argv)
     // PASS 2 — global tracking --------------------------------------------
     auto tracks = build_global_tracks(frames, cfg);
 
-    // PASS 3 — jitter interpolation (opt-in; respects scene cuts) --------
+    // PASS 3 — gap interpolation (on by default; respects scene cuts) ----
+    // Synthesise interpolated detections for any frame that's inside a
+    // track's lifespan but missing in track.frame_to_det.  Without this,
+    // the BVH writer would pad those frames with the previous pose
+    // (visible as a frozen segment) — see the function's comment block.
+    gap_interpolation_pass(frames, tracks, scene_cuts, cfg);
+
+    // PASS 4 — jitter interpolation (opt-in; respects scene cuts) -------
     interpolate_jitter_pass(frames, tracks, scene_cuts, cfg);
 
-    // PASS 4 — smoothing (per scene segment) -----------------------------
+    // PASS 5 — smoothing (per scene segment) ----------------------------
     smoothing_pass(frames, tracks, scene_cuts, (float)fps, cfg);
 
-    // PASS 5 — BVH export -------------------------------------------------
+    // PASS 6 — BVH export -----------------------------------------------
     export_to_bvh(frames, tracks, fps, cfg);
 
     printf("done.\n");
