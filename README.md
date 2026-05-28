@@ -30,10 +30,11 @@ Pre-built ONNX / GGUF / LBS model files are hosted on HuggingFace:
 
 **[https://huggingface.co/AmmarkoV/SAM3DBody-cpp-onnx-models](https://huggingface.co/AmmarkoV/SAM3DBody-cpp-onnx-models)**
 
-Download `SAM3DBody-cpp-onnx-models.zip`, extract it, and place the resulting `onnx/` directory at the root of this repository:
+### With a CUDA GPU (recommended)
+
+Download the all-in-one zip, extract it, and place the resulting `onnx/` directory at the repo root:
 
 ```bash
-# Download and extract
 wget https://huggingface.co/AmmarkoV/SAM3DBody-cpp-onnx-models/resolve/main/SAM3DBody-cpp-onnx-models.zip
 unzip SAM3DBody-cpp-onnx-models.zip
 # onnx/ is now at the repo root — ready to build
@@ -41,13 +42,48 @@ unzip SAM3DBody-cpp-onnx-models.zip
 
 | File | Size | Description |
 |------|------|-------------|
-| `onnx/backbone.onnx` + `.data` | ~4.8 GB | DINOv3-ViT-H/14+ encoder |
+| `onnx/backbone.onnx` + `.data` | ~4.8 GB | DINOv3-ViT-H/14+ encoder (BF16, CUDA EP only) |
 | `onnx/decoder.onnx` | ~93 MB | 6-layer PromptableDecoder |
 | `onnx/yolo.onnx` | ~81 MB | YOLO11m-pose person detector |
 | `onnx/pipeline.gguf` | ~5 MB | MHR + camera projection heads |
 | `onnx/body_model.lbs` | ~27 MB | Native C LBS data (joints, weights, shape) |
 | `onnx/correctives.bin` | ~33 MB | Pose corrective blend shapes |
 | `onnx/keypoint_mapping.bin` | ~8 KB | MHR-70 keypoint index map |
+
+### Without a CUDA GPU (CPU-only)
+
+The standard `backbone.onnx` is exported in BFloat16 and **requires a CUDA GPU** — it will not load on the ORT CPU execution provider.
+A float32 CPU-compatible backbone is available as a separate download from the same HuggingFace repo:
+
+**[https://huggingface.co/AmmarkoV/SAM3DBody-cpp-onnx-models/tree/main](https://huggingface.co/AmmarkoV/SAM3DBody-cpp-onnx-models/tree/main)**
+
+Download these two files and place them alongside the rest of the models in `onnx/`:
+
+| File | Size | Description |
+|------|------|-------------|
+| `backbone_fp32.onnx` | ~1 MB | Graph (references external data) |
+| `backbone_fp32.onnx.data` | ~3.2 GB | Float32 weights — no BF16, CPU EP compatible |
+
+Then run with `--backbone backbone_fp32.onnx --cuda -1`:
+
+```bash
+./build/fast_sam_3dbody_run \
+    --onnx-dir ./onnx \
+    --backbone backbone_fp32.onnx \
+    --cuda     -1 \
+    --from     your_video.mp4
+```
+
+> **Performance expectations for CPU inference:**
+> DINOv3-ViT-H has ~630 M parameters. On a modern laptop CPU, one backbone
+> forward pass takes **5–15 seconds**, making video processing impractical.
+> Single-image or low-frequency use cases are feasible. For anything
+> approaching real-time, a CUDA-capable GPU is required.
+>
+> WSL2 users: if `nvidia-smi` works inside WSL, install the
+> [CUDA toolkit for WSL2](https://developer.nvidia.com/cuda-downloads)
+> (do **not** install the full Linux driver — only the WSL2 toolkit) and use
+> the standard `backbone.onnx` instead.
 
 > **CMake will warn** at configure time if neither `onnx/` nor the zip is found.
 
