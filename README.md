@@ -58,10 +58,10 @@ A float32 CPU-compatible backbone is available as a separate download from the s
 
 Download these two files and place them alongside the rest of the models in `onnx/`:
 
-| File | Size | Description | Link |
+| File | Size | Description | Links |
 |------|------|-------------| ---- |
 | `backbone_fp32.onnx` | ~1 MB | Graph (references external data) | [Link](https://huggingface.co/AmmarkoV/SAM3DBody-cpp-onnx-models/blob/main/backbone_fp32.onnx) |
-| `backbone_fp32.onnx.data` | ~3.2 GB | Float32 weights — no BF16, CPU EP compatible | [Link](https://huggingface.co/AmmarkoV/SAM3DBody-cpp-onnx-models/blob/main/backbone_fp32.data) |
+| `backbone_fp32.onnx.data` | ~3.2 GB | Float32 weights — no BF16, CPU EP compatible | [Link](https://huggingface.co/AmmarkoV/SAM3DBody-cpp-onnx-models/blob/main/backbone_fp32.onnx.data) |
 
 Then run with `--backbone backbone_fp32.onnx --cuda -1`:
 
