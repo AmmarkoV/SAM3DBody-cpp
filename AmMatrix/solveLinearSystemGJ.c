@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdint.h>
 #include "matrix3x3Tools.h"
 #include "matrix4x4Tools.h"
 #include "solveHomography.h"
@@ -337,7 +338,7 @@ int solveLinearSystemGJ(double * result , double * coefficients , unsigned int v
       if (! createBaseOne(coefficients,i) )              { fprintf(stderr,"Error creating base one  ( %u ) \n", i ); break; }
       if (! subtractBase(coefficients,i,totalLines) )    { fprintf(stderr,"Error subtracting base  ( %u ) \n" , i ); break; }
 
-      sprintf(name,"Echeloned Step %u",i);
+      snprintf(name,sizeof(name),"Echeloned Step %u",i);
       printSystemPlain(coefficients,name,totalLines);
     }
 
@@ -372,7 +373,8 @@ int calculateFundamentalMatrix8PointMultipleView(double * result3x3Matrix , unsi
     double * pxA , * pyA , * pxB , * pyB ;
     int elements=10;
 
-    double * compiledPoints = (double * ) malloc(pointsNum * elements * sizeof(double));
+    if (pointsNum > SIZE_MAX / ((size_t)elements * sizeof(double))) { return 0; }
+    double * compiledPoints = (double *) calloc(pointsNum, (size_t)elements * sizeof(double));
     if (compiledPoints==0) { return 0; }
 
     unsigned int i=0;
@@ -430,7 +432,8 @@ int calculateFundamentalMatrix8Point(double * result3x3Matrix , unsigned int poi
     double * pxA , * pyA , * pxB , * pyB ;
     int elements=10;
 
-    double * compiledPoints = (double * ) malloc(pointsNum * elements * sizeof(double));
+    if (pointsNum > SIZE_MAX / ((size_t)elements * sizeof(double))) { return 0; }
+    double * compiledPoints = (double *) calloc(pointsNum, (size_t)elements * sizeof(double));
     if (compiledPoints==0) { return 0; }
 
     unsigned int i=0;
@@ -492,10 +495,8 @@ int calculateFundamentalMatrix8Point(double * result3x3Matrix , unsigned int poi
 void testGJSolver()
 {
   double * F3x3 = alloc3x3Matrix();    if (F3x3 ==0) { return; }
-  double * pointsA = (double *) malloc(sizeof(double) * 2 * 8);
-  memset(pointsA , 0 ,sizeof(double) * 2 * 8 );
-  double * pointsB = (double *) malloc(sizeof(double) * 2 * 8);
-  memset(pointsB , 0 ,sizeof(double) * 2 * 8 );
+  double * pointsA = (double *) calloc(16, sizeof(double));
+  double * pointsB = (double *) calloc(16, sizeof(double));
 
 
 //          SOURCE FRAME POINTS                                 TARGET FRAME POINTS
