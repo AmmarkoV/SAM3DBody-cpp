@@ -45,6 +45,7 @@
 
 // ── LBS ──────────────────────────────────────────────────────────────────────
 #include "../GraphicsEngine/ModelLoader/model_loader_transform_joints.h"
+#include "mhr_lbs_cuda.cuh"
 
 // ── STL ──────────────────────────────────────────────────────────────────────
 #include <algorithm>
@@ -334,6 +335,7 @@ struct Pipeline::Impl
 
     // Native C LBS (body_model.lbs) — loaded when body_model.onnx is unavailable
     struct MHR_LBS_Data* lbs_data = nullptr;
+    MHR_LBS_CUDACtx*    lbs_cuda = nullptr;   // GPU-accelerated path; null on CPU builds
 
     // ── load ──────────────────────────────────────────────────────────────────
     bool load(const PipelineConfig& c)
@@ -414,6 +416,10 @@ struct Pipeline::Impl
                 if (lbs_data)
                 {
                     printf("OK (%d joints, %d vertices)\n", lbs_data->n_joints, lbs_data->n_verts);
+#ifdef FSB_CUDA
+                    lbs_cuda = mhr_lbs_cuda_init(lbs_data);
+                    if (lbs_cuda) printf("[FSB] LBS CUDA accelerated (GPU shape blend + scatter)\n");
+#endif
 
                     // Load keypoint mapping even with LBS
                     std::string kp_path = opath("keypoint_mapping.bin");
@@ -862,12 +868,22 @@ struct Pipeline::Impl
                 float* joints_out = all_skel.data() + (size_t)i * 127 * 3;
 
                 static const float zero_face[72] = {};
-                mhr_lbs_compute(lbs_data,
-                                mp.data,
-                                raw_i + 266,  /* shape */
-                                cfg.zero_face_params ? zero_face : raw_i + 447,  /* face */
-                                verts_out,
-                                joints_out);
+#ifdef FSB_CUDA
+                if (lbs_cuda) {
+                    mhr_lbs_cuda_compute(lbs_cuda, lbs_data, mp.data,
+                                         raw_i + 266,
+                                         cfg.zero_face_params ? zero_face : raw_i + 447,
+                                         verts_out, joints_out);
+                } else
+#endif
+                {
+                    mhr_lbs_compute(lbs_data,
+                                    mp.data,
+                                    raw_i + 266,  /* shape */
+                                    cfg.zero_face_params ? zero_face : raw_i + 447,  /* face */
+                                    verts_out,
+                                    joints_out);
+                }
                 printf("[FSB] LBS person %d done\n", i);
             }
             printf("[FSB] LBS:      %.1f ms, verts=%zu skel=%zu\n", ms(t0), all_verts.size(), all_skel.size());
@@ -1060,6 +1076,7 @@ struct Pipeline::Impl
         sess_decoder.free();
         sess_body.free();
         sess_yolo.free();
+        if (lbs_cuda) { mhr_lbs_cuda_free(lbs_cuda); lbs_cuda = nullptr; }
         if (lbs_data)
         {
             mhr_lbs_free(lbs_data);

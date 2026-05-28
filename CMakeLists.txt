@@ -219,6 +219,7 @@ target_link_libraries(fast_sam_3dbody PUBLIC
 )
 
 if(WITH_CUDA)
+    target_sources(fast_sam_3dbody PRIVATE src/mhr_lbs_cuda.cu)
     target_compile_definitions(fast_sam_3dbody PUBLIC GGML_USE_CUDA FSB_CUDA)
     target_link_libraries(fast_sam_3dbody PUBLIC CUDA::cudart)
 endif()
