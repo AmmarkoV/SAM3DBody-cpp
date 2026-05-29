@@ -1507,7 +1507,9 @@ static void export_range(const std::vector<FrameRecord>& frames,
                 cfg.bvh_compensate_finger_endsites,
                 cfg.bvh_enforce_hand_limits,
                 cfg.bvh_zero_hand_pose,
-                cfg.bvh_sticky_hand_pose))
+                cfg.bvh_sticky_hand_pose,
+                cfg.bvh_rest_align,
+                cfg.bvh_dump_rest_dirs))
     {
         fprintf(stderr, "[pass6] BVHWriter::open failed — aborting export\n");
         return;

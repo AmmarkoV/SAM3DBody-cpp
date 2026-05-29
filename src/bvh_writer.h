@@ -36,7 +36,9 @@ public:
               bool               compensate_finger_endsites = true,
               bool               enforce_hand_limits        = false,
               bool               zero_hand_pose             = false,
-              bool               sticky_hand_pose           = false);
+              bool               sticky_hand_pose           = false,
+              bool               rest_align                 = true,
+              bool               dump_rest_dirs             = false);
 
     void write_frame(const std::vector<fsb::MHRResult>& results);
 
@@ -107,6 +109,13 @@ private:
     MHR_LBS_Data*      lbs_             = nullptr;
     std::string        out_path_;
     std::string        id_prefix_;       // inserted before <id> in filenames
+
+    // Rest-frame retarget: per-slot shortest-arc quaternion (MHR rest bone dir
+    // → body.bvh rest bone dir), applied as q_align·R·q_align⁻¹ to re-aim each
+    // joint's rotation onto the template's bone.  Fixes flexion→twist leak when
+    // the template rest pose differs from MHR's (e.g. T-pose vs A-pose arms).
+    std::vector<float> q_bone_align_;    // [slots × 4]; identity where aligned
+    bool               rest_align_ = true;
     int                total_channels_  = 0;
     float              frame_time_      = 1.0f / 30.0f;
     int                session_frames_  = 0;

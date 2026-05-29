@@ -96,6 +96,8 @@ struct CommonConfig
     bool        bvh_enforce_hand_limits        = false;  // --enforce-hand-limits
     bool        bvh_zero_hand_pose             = false;  // --zero-hand-pose
     bool        bvh_sticky_hand_pose           = false;  // --sticky-hand-pose
+    bool        bvh_rest_align                 = true;    // --no-bvh-rest-align
+    bool        bvh_dump_rest_dirs             = false;   // --dump-rest-dirs
 
     // ── Filtering knobs ─────────────────────────────────────────────────────
     // Defaults match the live binaries; the offline binary overrides
@@ -149,6 +151,8 @@ inline bool parse_common_arg(int argc, const char* const* argv, int& i,
     CLI_BOOL("--enforce-hand-limits",      bvh_enforce_hand_limits,        true)
     CLI_BOOL("--zero-hand-pose",           bvh_zero_hand_pose,             true)
     CLI_BOOL("--sticky-hand-pose",         bvh_sticky_hand_pose,           true)
+    CLI_BOOL("--no-bvh-rest-align",        bvh_rest_align,                 false)
+    CLI_BOOL("--dump-rest-dirs",           bvh_dump_rest_dirs,             true)
 
     // Filters
     CLI_FLT ("--bw-cutoff",            bw_cutoff)
@@ -214,6 +218,10 @@ inline void print_common_args_help(FILE* fp)
         "                                 (fixes wild splay when hands are not visible)\n"
         "  --zero-hand-pose               Always write neutral (straight) hand pose\n"
         "  --sticky-hand-pose             Inherit previous frame's hand pose (neutral on first frame)\n"
+        "  --no-bvh-rest-align            Disable rest-frame retarget (re-aiming joint rotations onto the\n"
+        "                                 template's bones; on by default — fixes arms under-bending when\n"
+        "                                 the template rest pose differs from MHR, e.g. T-pose vs A-pose)\n"
+        "  --dump-rest-dirs               Print the per-bone template-vs-MHR rest-direction table at open\n"
         "  --bw-cutoff HZ                 Butterworth cutoff (default 6 Hz)\n"
         "  --rot-clamp DEG                Geodesic SLERP clamp on global_rot (default 1 deg/frame;\n"
         "                                 offline binary defaults to 30)\n");

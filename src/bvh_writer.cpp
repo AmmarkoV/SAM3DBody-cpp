@@ -87,6 +87,33 @@ inline void qrot(float* o, const float* q, const float* v)
     o[1]=vy + qw*ty + (qz*tx - qx*tz);
     o[2]=vz + qw*tz + (qx*ty - qy*tx);
 }
+// Shortest-arc unit quaternion rotating direction `from` onto `to` (both need
+// not be normalised).  Used by the rest-frame retarget to re-aim MHR rotation
+// deltas onto the template's (differently-posed) bones.
+inline void shortest_arc_quat(const float* from, const float* to, float* q)
+{
+    float fn = std::sqrt(from[0]*from[0]+from[1]*from[1]+from[2]*from[2]);
+    float tn = std::sqrt(to[0]*to[0]+to[1]*to[1]+to[2]*to[2]);
+    q[0]=q[1]=q[2]=0.f; q[3]=1.f;                       // identity fallback
+    if (fn < 1e-9f || tn < 1e-9f) return;
+    float u[3]={from[0]/fn,from[1]/fn,from[2]/fn};
+    float v[3]={to[0]/tn,  to[1]/tn,  to[2]/tn};
+    float d = u[0]*v[0]+u[1]*v[1]+u[2]*v[2];
+    if (d >  0.999999f) return;                         // already aligned
+    if (d < -0.999999f) {                               // antiparallel: 180°
+        // pick any axis perpendicular to u
+        float ax[3] = {1.f,0.f,0.f};
+        if (std::fabs(u[0]) >= 0.9f) { ax[0]=0.f; ax[1]=1.f; }
+        float c[3]={u[1]*ax[2]-u[2]*ax[1], u[2]*ax[0]-u[0]*ax[2], u[0]*ax[1]-u[1]*ax[0]};
+        float cn=std::sqrt(c[0]*c[0]+c[1]*c[1]+c[2]*c[2])+1e-12f;
+        q[0]=c[0]/cn; q[1]=c[1]/cn; q[2]=c[2]/cn; q[3]=0.f;
+        return;
+    }
+    float c[3]={u[1]*v[2]-u[2]*v[1], u[2]*v[0]-u[0]*v[2], u[0]*v[1]-u[1]*v[0]};
+    q[0]=c[0]; q[1]=c[1]; q[2]=c[2]; q[3]=1.f+d;
+    float n=std::sqrt(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]);
+    q[0]/=n; q[1]/=n; q[2]/=n; q[3]/=n;
+}
 inline void euler_mhr_to_quat(float ex, float ey, float ez, float* q)
 {
     float hx=ex*0.5f, hy=ey*0.5f, hz=ez*0.5f;
@@ -429,7 +456,9 @@ bool BVHWriter::open(const std::string& template_path,
                      bool               compensate_finger_endsites,
                      bool               enforce_hand_limits,
                      bool               zero_hand_pose,
-                     bool               sticky_hand_pose)
+                     bool               sticky_hand_pose,
+                     bool               rest_align,
+                     bool               dump_rest_dirs)
 {
     out_path_                    = out_path;
     rewrite_body_offsets_        = rewrite_body_offsets;
@@ -438,6 +467,7 @@ bool BVHWriter::open(const std::string& template_path,
     enforce_hand_limits_         = enforce_hand_limits;
     zero_hand_pose_              = zero_hand_pose;
     sticky_hand_pose_            = sticky_hand_pose;
+    rest_align_                  = rest_align;
 
     mc_ = (BVH_MotionCapture*)calloc(1, sizeof(*mc_));
     if (!mc_) return false;
@@ -514,6 +544,65 @@ bool BVHWriter::open(const std::string& template_path,
                 g_t[j*3+2] = g_t[parent*3+2] + rt[2];
                 qmul(&q_global_mhr_rest_[j*4], &q_global_mhr_rest_[parent*4], p_q);
             }
+        }
+
+        // ── Rest-frame retarget alignment (+ optional diagnostic) ─────────────
+        // body.bvh's rest bone directions differ from MHR's (e.g. T-pose
+        // template vs MHR's A-pose arms), so applying MHR rotation-deltas
+        // verbatim aims each joint's flexion axis at the MHR bone, not the
+        // template bone → bend leaks into twist.  For every mapped bone we
+        // precompute the shortest-arc rotation MHR-rest-dir → body.bvh-rest-dir
+        // and conjugate the per-frame local rotation by it (q_align·R·q_align⁻¹),
+        // re-aiming the swing onto the template's bone.  Identity where the rest
+        // directions already agree (torso, head, lower legs) → no-op there.
+        // CLI flags drive this; the env vars remain as convenience overrides.
+        const bool dump = dump_rest_dirs || (getenv("FSB_DUMP_REST_DIRS") != nullptr);
+        if (getenv("FSB_NO_REST_ALIGN")) rest_align_ = false;
+        q_bone_align_.assign(slots_.size() * 4, 0.f);
+        {
+            const int N = (int)mc_->jointHierarchySize;
+            std::vector<std::array<float,3>> bvhrest(N);
+            for (int j = 0; j < N; ++j) {
+                const auto& jh = mc_->jointHierarchy[j];
+                if (jh.isRoot || (int)jh.parentJoint < 0)
+                    bvhrest[j] = { jh.offset[0], jh.offset[1], jh.offset[2] };
+                else {
+                    int par = (int)jh.parentJoint;
+                    bvhrest[j] = { bvhrest[par][0] + jh.offset[0],
+                                   bvhrest[par][1] + jh.offset[1],
+                                   bvhrest[par][2] + jh.offset[2] };
+                }
+            }
+            if (dump)
+                fprintf(stderr,
+                    "\n[rest-dir] bone                MHR-rest-dir            "
+                    "BVH-rest-dir            angle\n");
+            for (size_t i = 0; i < slots_.size(); ++i) {
+                const BvhSlot& s = slots_[i];
+                float* qa = &q_bone_align_[i*4];
+                qa[0]=qa[1]=qa[2]=0.f; qa[3]=1.f;          // identity default
+                if (s.is_root || s.mhr_idx < 0) continue;
+                if (s.ancestor_mhr_idx < 0 || s.ancestor_bvh_jid < 0) continue;
+                float md[3] = { g_t[s.mhr_idx*3+0]-g_t[s.ancestor_mhr_idx*3+0],
+                                g_t[s.mhr_idx*3+1]-g_t[s.ancestor_mhr_idx*3+1],
+                                g_t[s.mhr_idx*3+2]-g_t[s.ancestor_mhr_idx*3+2] };
+                float bd[3] = { bvhrest[s.bvh_jid][0]-bvhrest[s.ancestor_bvh_jid][0],
+                                bvhrest[s.bvh_jid][1]-bvhrest[s.ancestor_bvh_jid][1],
+                                bvhrest[s.bvh_jid][2]-bvhrest[s.ancestor_bvh_jid][2] };
+                shortest_arc_quat(md, bd, qa);             // MHR dir → BVH dir
+                if (dump) {
+                    float mn=std::sqrt(md[0]*md[0]+md[1]*md[1]+md[2]*md[2])+1e-9f;
+                    float bn=std::sqrt(bd[0]*bd[0]+bd[1]*bd[1]+bd[2]*bd[2])+1e-9f;
+                    float dt=(md[0]*bd[0]+md[1]*bd[1]+md[2]*bd[2])/(mn*bn);
+                    dt=dt<-1.f?-1.f:(dt>1.f?1.f:dt);
+                    fprintf(stderr, "[rest-dir] %-18s [%+.2f %+.2f %+.2f]  "
+                            "[%+.2f %+.2f %+.2f]  %6.1f deg\n",
+                            mc_->jointHierarchy[s.bvh_jid].jointName,
+                            md[0]/mn,md[1]/mn,md[2]/mn, bd[0]/bn,bd[1]/bn,bd[2]/bn,
+                            std::acos(dt)*57.29578f);
+                }
+            }
+            if (dump) fprintf(stderr, "\n");
         }
     }
 
@@ -644,6 +733,19 @@ void BVHWriter::append_frame_for(PerPerson& p, const fsb::MHRResult& r)
             float inv_par[4];
             qconj(inv_par, q_delta_par);
             qmul(q_local_bvh, inv_par, q_delta_self);
+        }
+
+        // Rest-frame retarget: conjugate by the precomputed shortest-arc
+        // alignment so the joint's swing is aimed at the TEMPLATE's bone, not
+        // MHR's.  No-op where rest directions already match; identity for root.
+        if (rest_align_)
+        {
+            const float* qa = &q_bone_align_[i*4];
+            float qinv[4], tq[4], rq[4];
+            qconj(qinv, qa);
+            qmul(tq, qa, q_local_bvh);
+            qmul(rq, tq, qinv);
+            memcpy(q_local_bvh, rq, 4*sizeof(float));
         }
 
         float m[9];
