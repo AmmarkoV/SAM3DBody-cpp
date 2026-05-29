@@ -374,6 +374,8 @@ The CLI can apply a second-order [Butterworth low-pass filter](https://en.wikipe
 to the MHR output vectors on every frame, reducing per-frame jitter without introducing ripple in the
 passband.
 
+> 🎬 See it in action: [smooth tracking of a female dancer](https://www.youtube.com/shorts/tQ8WP5uYVzA) (YouTube Short).
+
 ```bash
 # Enable with the default 6 Hz cutoff
 ./fast_sam_3dbody_run --from video.mp4 --butterworth
