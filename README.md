@@ -20,7 +20,7 @@ MakeHuman-rigged character from the result. See **[BVH export](#bvh-export---bvh
 # → p_0.bvh, p_1.bvh, …
 ```
 
-![SAM3DBody-cpp](doc/screen.jpg)
+[![SAM3DBody-cpp — watch a video in Youtube](doc/vid.jpg)](https://www.youtube.com/watch?v=f-tCwCQvurQ)
 
 ---
 
