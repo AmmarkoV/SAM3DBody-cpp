@@ -767,6 +767,10 @@ this is a quick way to get a "what was the input?" video alongside the
 
 ---
 
+![SAM3DBody-cpp](doc/screen.jpg)
+
+---
+
 ## C++ library API
 
 ```cpp
