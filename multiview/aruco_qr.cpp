@@ -54,10 +54,13 @@ void parse_qr_kv(const std::string& txt, QrDet& q)
         if (eq != std::string::npos)
         {
             std::string k = tok.substr(0, eq), v = tok.substr(eq + 1);
-            if      (k == "t_unix_ms") q.t_unix_ms = v;
-            else if (k == "t_perf_ms") q.t_perf_ms = v;
-            else if (k == "frame")     q.frame     = v;
-            else if (k == "hz")        q.hz        = v;
+            // Accept both payload conventions: the C tools (xQRSync/libQRSync)
+            // emit t_unix_ms / t_perf_ms / frame, while sync.html emits the
+            // short t / perf / f.  hz is common to both.
+            if      (k == "t_unix_ms" || k == "t")    q.t_unix_ms = v;
+            else if (k == "t_perf_ms" || k == "perf") q.t_perf_ms = v;
+            else if (k == "frame"     || k == "f")    q.frame     = v;
+            else if (k == "hz")                        q.hz        = v;
         }
         if (amp == std::string::npos) break;
         i = amp + 1;
@@ -185,11 +188,23 @@ void ArucoQrDetector::process(const cv::Mat& bgr, FrameDetections& out)
     }
 
     // ── QR codes (multi first, then single fallback; swallow OpenCV errors) ──
+    // We only need the decoded payload, not the QR's geometry, so detect on a
+    // downscaled gray — QRCodeDetector is the per-frame bottleneck on high-res
+    // (e.g. 5K GoPro) footage, and the smaller image is also more stable.
+    cv::Mat qr_gray = gray;
+    const int QR_MAX_SIDE = 1600;
+    int mx = std::max(gray.cols, gray.rows);
+    if (mx > QR_MAX_SIDE)
+    {
+        double s = (double)QR_MAX_SIDE / mx;
+        cv::resize(gray, qr_gray, cv::Size(), s, s, cv::INTER_AREA);
+    }
+
     bool any = false;
     try
     {
         std::vector<std::string> infos;
-        impl_->qr.detectAndDecodeMulti(gray, infos);
+        impl_->qr.detectAndDecodeMulti(qr_gray, infos);
         for (auto& s : infos)
             if (!s.empty()) { QrDet q; parse_qr_kv(s, q); out.qrs.push_back(q); any = true; }
     }
@@ -199,7 +214,7 @@ void ArucoQrDetector::process(const cv::Mat& bgr, FrameDetections& out)
     {
         try
         {
-            std::string s = impl_->qr.detectAndDecode(gray);
+            std::string s = impl_->qr.detectAndDecode(qr_gray);
             if (!s.empty()) { QrDet q; parse_qr_kv(s, q); out.qrs.push_back(q); }
         }
         catch (const cv::Exception&) { /* skip QR this frame */ }

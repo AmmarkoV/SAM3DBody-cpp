@@ -36,6 +36,8 @@ int main(int argc, char** argv)
     std::string from, calib_path, dict = "DICT_6X6_250", marker_lengths;
     double marker_len = 0.05;
     int    max_frames = 0;        // 0 = whole video
+    int    step       = 1;        // process every Nth frame (sampling/reconnaissance)
+    int    max_failures = 30;     // consecutive bad-frame reads tolerated (SD glitches)
 
     for (int i = 1; i < argc; ++i)
     {
@@ -45,6 +47,8 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[i], "--marker-length")   && i+1 < argc) marker_len     = atof(argv[++i]);
         else if (!strcmp(argv[i], "--marker-lengths")  && i+1 < argc) marker_lengths = argv[++i];
         else if (!strcmp(argv[i], "--max-frames")      && i+1 < argc) max_frames     = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--step")            && i+1 < argc) step           = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--max-failures")    && i+1 < argc) max_failures   = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h"))
         {
             printf("usage: %s --from VIDEO [--calib F.calib] [--aruco-dict NAME]\n"
@@ -87,12 +91,41 @@ int main(int argc, char** argv)
            from.c_str(), dict.c_str(), marker_len,
            det.calibrated() ? calib_path.c_str() : "approx");
 
+    if (step < 1) step = 1;
+
+    // SD cards occasionally fail to write a frame, so a decode can fail mid-clip
+    // even though there is good data after it.  Retry past such gaps (like
+    // tracker.py's max_consecutive_failures) instead of stopping at the first
+    // failure; only give up after `max_failures` consecutive bad frames.
+    int consec_fail = 0, total_bad = 0;
+    auto grab_retry = [&]() -> bool {
+        while (true) {
+            if (cap.grab()) { consec_fail = 0; return true; }
+            if (++consec_fail > max_failures) return false;
+            ++total_bad;
+        }
+    };
+    auto read_retry = [&](cv::Mat& f) -> bool {
+        while (true) {
+            if (cap.read(f) && !f.empty()) { consec_fail = 0; return true; }
+            if (++consec_fail > max_failures) return false;
+            ++total_bad;
+        }
+    };
+
     cv::Mat frame;
-    int fidx = 0, frames_with_marker = 0, frames_with_qr = 0, total_markers = 0;
+    int fidx = 0, processed = 0, frames_with_marker = 0, frames_with_qr = 0, total_markers = 0;
     mv::FrameDetections d;
-    while (cap.read(frame))
+    while (true)
     {
+        // Sampled scan: skip step-1 frames with grab() (reliable across codecs,
+        // unlike POS_FRAMES seeking which mis-behaves on some containers).
+        bool eof = false;
+        for (int s = 0; s < step - 1; ++s) if (!grab_retry()) { eof = true; break; }
+        if (eof || !read_retry(frame)) break;
+
         det.process(frame, d);
+        ++processed;
         if (!d.markers.empty()) ++frames_with_marker;
         if (!d.qrs.empty())     ++frames_with_qr;
         total_markers += (int)d.markers.size();
@@ -113,11 +146,12 @@ int main(int argc, char** argv)
                        q.hz.empty()?"-":q.hz.c_str(), q.raw.c_str());
         }
 
-        ++fidx;
-        if (max_frames > 0 && fidx >= max_frames) break;
+        fidx += step;
+        if (max_frames > 0 && processed >= max_frames) break;
     }
 
-    printf("\n[probe] processed %d frames: %d with marker(s) (%d marker detections total), %d with QR\n",
-           fidx, frames_with_marker, total_markers, frames_with_qr);
+    printf("\n[probe] processed %d frames (step %d, %d bad frames skipped): "
+           "%d with marker(s) (%d marker detections total), %d with QR\n",
+           processed, step, total_bad, frames_with_marker, total_markers, frames_with_qr);
     return 0;
 }
