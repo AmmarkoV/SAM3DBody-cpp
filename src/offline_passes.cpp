@@ -377,6 +377,7 @@ bool run_inference_pass(fsb::Pipeline& pipeline,
     while (cap.read(frame))
     {
         if (frame.empty()) break;
+        if (cfg.max_frames > 0 && idx >= cfg.max_frames) break;
 
         FrameRecord rec;
         rec.frame_idx  = idx;

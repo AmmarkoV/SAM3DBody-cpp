@@ -76,6 +76,10 @@ struct Config : public CommonConfig
 
     std::string lbs_path;          // auto: <onnx_dir>/body_model.lbs
 
+    // Stop Pass 1 after this many decoded frames (0 = whole video).  Used by
+    // the multi-view front-end to bound per-stream inference to a window.
+    int       max_frames           = 0;
+
     // Smoothing
     enum class Smoothing { ZeroPhase, Forward, Off };
     Smoothing smoothing      = Smoothing::ZeroPhase;

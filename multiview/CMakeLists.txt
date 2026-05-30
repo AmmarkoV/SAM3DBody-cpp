@@ -92,4 +92,17 @@ target_link_libraries(sam_3dbody_sync PRIVATE
     multiview_sync_io multiview_sync_time multiview_extrinsics
     multiview_aruco_qr multiview_calib ${OpenCV_LIBS})
 
+# ---------------------------------------------------------------------------
+# fusion front-end — per-stream offline inference driven by a .sync (reuses the
+# offline passes from the fast_sam_3dbody lib).  Fuser/association on top later.
+# ---------------------------------------------------------------------------
+add_library(multiview_frontend STATIC multiview_frontend.cpp)
+target_include_directories(multiview_frontend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(multiview_frontend PUBLIC
+    multiview_sync_io fast_sam_3dbody ${OpenCV_LIBS})
+
+add_executable(sam_3dbody_multiview sam_3dbody_multiview.cpp)
+target_link_libraries(sam_3dbody_multiview PRIVATE
+    multiview_frontend multiview_sync_io fast_sam_3dbody ${OpenCV_LIBS})
+
 message(STATUS "  multiview: calib + aruco_qr + extrinsics + sync_time + sync_io (libs); tests: calib/extrinsics/sync_time/sync_io; tools: aruco_qr_probe, sam_3dbody_extrinsics, sam_3dbody_synctime, sam_3dbody_sync")
