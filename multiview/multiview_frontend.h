@@ -28,6 +28,7 @@ struct StreamResult
 {
     int    width = 0, height = 0;
     double fps   = 0.0;
+    int    start_frame = 0;     // absolute index of this result's frame 0 (window seek)
 
     // Geometry / time copied from the .sync camera (for the caller's lift +
     // alignment).

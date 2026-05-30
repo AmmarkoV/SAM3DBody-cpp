@@ -725,7 +725,11 @@ static inline void set_channel(BVH_MotionCapture* mc, float* row,
 void BVHWriter::append_frame_for(PerPerson& p, const fsb::MHRResult& r)
 {
     compute_per_frame_mhr_state(r);
+    append_row_from_state(p, r);
+}
 
+void BVHWriter::append_row_from_state(PerPerson& p, const fsb::MHRResult& r)
+{
     // Append a new row of zeros, then fill it.
     p.motion.insert(p.motion.end(), total_channels_, 0.f);
     float* row = p.motion.data() + (size_t)p.frame_count * total_channels_;
@@ -1021,6 +1025,66 @@ void BVHWriter::write_frame_external(const std::vector<fsb::MHRResult>& results,
         pad_continuation_frame(it->second);
     }
 
+    ++session_frames_;
+}
+
+void BVHWriter::write_frame_fused(const std::vector<FusedPerson>& persons,
+                                  const std::vector<int>& pad_ids)
+{
+    if (!mc_ || !lbs_) return;
+
+    for (const auto& fp : persons)
+    {
+        if (fp.track_id < 0 || fp.views.empty()) continue;
+
+        std::vector<float> qsum;            // [nj*4] sign-aligned world-rotation sum
+        float root_sum[3] = {0.f,0.f,0.f};
+        int   nv = 0;
+
+        for (const auto& view : fp.views)
+        {
+            if (!view.mhr) continue;
+            compute_per_frame_mhr_state(*view.mhr);     // fills q_global_mhr_ (camera frame)
+            const size_t N = q_global_mhr_.size();
+            if (qsum.empty()) qsum.assign(N, 0.f);
+            else if (qsum.size() != N) continue;        // joint-count mismatch (shouldn't happen)
+
+            for (size_t j = 0; j < N; j += 4)
+            {
+                float qw[4];
+                qmul(qw, view.q_world_cam.data(), &q_global_mhr_[j]);   // world = q_world_cam · q_cam
+                float* acc = &qsum[j];
+                if (nv == 0) { for (int k=0;k<4;++k) acc[k]=qw[k]; }
+                else {
+                    float d = acc[0]*qw[0]+acc[1]*qw[1]+acc[2]*qw[2]+acc[3]*qw[3];
+                    float s = (d < 0.f) ? -1.f : 1.f;
+                    for (int k=0;k<4;++k) acc[k]+=s*qw[k];
+                }
+            }
+            root_sum[0]+=view.root_world[0]; root_sum[1]+=view.root_world[1]; root_sum[2]+=view.root_world[2];
+            ++nv;
+        }
+        if (nv == 0 || qsum.empty()) continue;
+
+        // Normalise the averaged quaternions back into q_global_mhr_ (world frame).
+        for (size_t j = 0; j < qsum.size(); j += 4)
+        {
+            float* a = &qsum[j];
+            float n = std::sqrt(a[0]*a[0]+a[1]*a[1]+a[2]*a[2]+a[3]*a[3]);
+            if (n < 1e-9f) n = 1.f;
+            for (int k=0;k<4;++k) q_global_mhr_[j+k] = a[k]/n;
+        }
+
+        fsb::MHRResult fr;                  // only pred_cam_t is read by append_row_from_state
+        fr.pred_cam_t = { root_sum[0]/nv, root_sum[1]/nv, root_sum[2]/nv };
+
+        PerPerson& p = people_[fp.track_id];
+        if (p.id < 0) { p.id = fp.track_id; p.frame_count = 0; p.bone_samples.assign(slots_.size(), std::vector<float>{}); }
+        append_row_from_state(p, fr);
+        if (fp.track_id >= next_track_id_) next_track_id_ = fp.track_id + 1;
+    }
+
+    for (int id : pad_ids) { auto it = people_.find(id); if (it != people_.end()) pad_continuation_frame(it->second); }
     ++session_frames_;
 }
 

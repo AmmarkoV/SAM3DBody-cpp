@@ -73,6 +73,10 @@ std::vector<CamExtrinsic> solve_extrinsics(const std::vector<CameraStaticPoses>&
                                            int reference,
                                            std::string* report = nullptr);
 
+// Small accessors on a 4×4 (used by the fusion front-end).
+std::array<double,4> mat4_rotation_quat(const Mat4& T);                       // xyzw
+std::array<double,3> mat4_transform_point(const Mat4& T, const std::array<double,3>& p);
+
 } // namespace mv
 
 #endif // MULTIVIEW_EXTRINSICS_H_INCLUDED

@@ -60,6 +60,25 @@ public:
                               const std::vector<int>& track_ids,
                               const std::vector<int>& pad_ids = {});
 
+    // ── Multi-view fused write (MULTIVIEW_PLAN.md: AverageFuser) ─────────────
+    // One view of a person: its MHRResult (in its own camera frame), the
+    // quaternion that rotates that camera frame into the shared world, and the
+    // person's root already lifted to world (metres).
+    struct FusedView {
+        const fsb::MHRResult* mhr = nullptr;
+        std::array<float,4>   q_world_cam{0,0,0,1};   // xyzw
+        std::array<float,3>   root_world{};
+    };
+    struct FusedPerson {
+        int                    track_id = -1;
+        std::vector<FusedView> views;
+    };
+    // Write one fused timeline tick: for each person, average its views' world
+    // joint rotations (the world prefix cancels for relative joints, so only the
+    // root's world orientation is set) + mean world root; pad absent tracks.
+    void write_frame_fused(const std::vector<FusedPerson>& persons,
+                           const std::vector<int>& pad_ids = {});
+
     void close();
 
     bool is_open()           const { return mc_ != nullptr; }
@@ -151,6 +170,9 @@ private:
     bool  build_slots();
     void  compute_per_frame_mhr_state(const fsb::MHRResult& r);
     void  append_frame_for(PerPerson& p, const fsb::MHRResult& r);
+    // Append a row using the CURRENT q_global_mhr_ (assumes it is already
+    // populated); only r.pred_cam_t is read.  append_frame_for = compute + this.
+    void  append_row_from_state(PerPerson& p, const fsb::MHRResult& r);
     void  pad_continuation_frame(PerPerson& p);
     void  rewrite_offsets_for(PerPerson& p);
     void  foot_contact_pass(PerPerson& p);

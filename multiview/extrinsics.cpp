@@ -228,4 +228,18 @@ std::vector<CamExtrinsic> solve_extrinsics(const std::vector<CameraStaticPoses>&
     return out;
 }
 
+std::array<double,4> mat4_rotation_quat(const Mat4& T)
+{
+    double R[9] = { T[0],T[1],T[2], T[4],T[5],T[6], T[8],T[9],T[10] };
+    double q[4]; R_to_quat(R, q);
+    return { q[0], q[1], q[2], q[3] };
+}
+
+std::array<double,3> mat4_transform_point(const Mat4& T, const std::array<double,3>& p)
+{
+    double pp[3] = { p[0], p[1], p[2] }, o[3];
+    transform_point(T, pp, o);
+    return { o[0], o[1], o[2] };
+}
+
 } // namespace mv

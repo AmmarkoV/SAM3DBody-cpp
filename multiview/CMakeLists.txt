@@ -96,7 +96,7 @@ target_link_libraries(sam_3dbody_sync PRIVATE
 # fusion front-end — per-stream offline inference driven by a .sync (reuses the
 # offline passes from the fast_sam_3dbody lib).  Fuser/association on top later.
 # ---------------------------------------------------------------------------
-add_library(multiview_frontend STATIC multiview_frontend.cpp)
+add_library(multiview_frontend STATIC multiview_frontend.cpp associate.cpp)
 target_include_directories(multiview_frontend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(multiview_frontend PUBLIC
     multiview_sync_io fast_sam_3dbody ${OpenCV_LIBS})

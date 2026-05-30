@@ -43,6 +43,7 @@ bool run_stream(const SyncCamera& cam, const offline::Config& base_cfg, StreamRe
         return false;
     out.tracks = offline::build_global_tracks(out.frames, cfg);
 
+    out.start_frame = base_cfg.start_frame;
     out.width       = cam.width  > 0 ? cam.width  : (int)cap.get(cv::CAP_PROP_FRAME_WIDTH);
     out.height      = cam.height > 0 ? cam.height : (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
     out.T_world_cam = cam.T_world_cam;

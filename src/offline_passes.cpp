@@ -371,6 +371,8 @@ bool run_inference_pass(fsb::Pipeline& pipeline,
                         cfg.scene_use_vit, cfg.scene_vit_thresh,
                         cfg.scene_vit_veto_thresh);
 
+    if (cfg.start_frame > 0) cap.set(cv::CAP_PROP_POS_FRAMES, (double)cfg.start_frame);
+
     cv::Mat frame;
     int idx = 0;
     auto t0 = Clock::now();

@@ -76,8 +76,10 @@ struct Config : public CommonConfig
 
     std::string lbs_path;          // auto: <onnx_dir>/body_model.lbs
 
-    // Stop Pass 1 after this many decoded frames (0 = whole video).  Used by
-    // the multi-view front-end to bound per-stream inference to a window.
+    // Process only a frame window: seek to start_frame, then stop after
+    // max_frames decoded (0 = whole video).  Used by the multi-view front-end
+    // to align per-stream inference to a common wall-clock window.
+    int       start_frame          = 0;
     int       max_frames           = 0;
 
     // Smoothing

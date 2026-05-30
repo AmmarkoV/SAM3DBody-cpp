@@ -1,0 +1,26 @@
+%Calibration File - EXIF-derived ESTIMATE (not a measured calibration)
+%Camera: NIKON D7500, lens 18-140mm f/3.5-5.6 G VR @ 18mm, 4K UHD
+%Note: fx from pixel pitch (23.5mm/5568) x 1.5x movie crop (3872px sensor -> 3840px out);
+%      square pixels assumed, NO distortion modelled. Replace with a Cam_calib_web.py calibration.
+%Width
+3840
+%Height
+2160
+%Intrinsics I[1,1], I[1,2], I[1,3], I[2,1], I[2,2], I[2,3], I[3,1], I[3,2] I[3,3]
+%I
+4230.0
+0.0
+1920.0
+0.0
+4230.0
+1080.0
+0.0
+0.0
+1.0
+%Distortion D[1], D[2], D[3], D[4] D[5]
+%D
+0.0
+0.0
+0.0
+0.0
+0.0
