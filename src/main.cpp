@@ -495,6 +495,7 @@ int main(int argc, char** argv)
         }
         else
         {
+            bvh_writer.set_foot_contact(c.bvh_foot_contact);
             printf("[main] Writing BVH to: %s  (template: %s)\n",
                    c.bvh_path.c_str(), c.bvh_template.c_str());
         }

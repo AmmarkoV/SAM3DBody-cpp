@@ -31,6 +31,7 @@ extern "C" {
 #include "ModelLoader/model_loader_transform_joints.h"
 #include "bvh_loader.h"
 #include "export/bvh_to_bvh.h"
+#include "calculate/bvh_transform.h"
 }
 
 #include <algorithm>
@@ -167,6 +168,47 @@ inline void mat3_to_zyx(const float m[9], float& a, float& b, float& c)
         c = 0.f;
         a = atan2f(-m[1], m[4]);
     }
+}
+
+// ─── small vec3 / mat3 helpers (foot-contact IK) ───────────────────────────
+inline void v3sub(const float* a, const float* b, float* o){ o[0]=a[0]-b[0]; o[1]=a[1]-b[1]; o[2]=a[2]-b[2]; }
+inline float v3dot(const float* a, const float* b){ return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; }
+inline float v3len(const float* a){ return std::sqrt(v3dot(a,a)); }
+inline void  v3cross(const float* a, const float* b, float* o){
+    o[0]=a[1]*b[2]-a[2]*b[1]; o[1]=a[2]*b[0]-a[0]*b[2]; o[2]=a[0]*b[1]-a[1]*b[0];
+}
+inline void v3norm(float* a){ float n=v3len(a); if(n>1e-12f){ a[0]/=n; a[1]/=n; a[2]/=n; } }
+
+// Upper-left 3×3 rotation of a row-major 4×4 (Matrix4x4OfFloats.m), in the same
+// row-major 9-float layout quat_to_mat3 / mat3_to_zxy use.
+inline void mat3_from_m4(const float* m16, float* m9){
+    m9[0]=m16[0]; m9[1]=m16[1]; m9[2]=m16[2];
+    m9[3]=m16[4]; m9[4]=m16[5]; m9[5]=m16[6];
+    m9[6]=m16[8]; m9[7]=m16[9]; m9[8]=m16[10];
+}
+// Rotation 3×3 → unit quaternion (XYZW), Shepperd's method.
+inline void mat3_to_quat(const float* m, float* q){
+    float tr = m[0]+m[4]+m[8];
+    if (tr > 0.f){
+        float s = std::sqrt(tr+1.f)*2.f;            // s = 4w
+        q[3]=0.25f*s; q[0]=(m[7]-m[5])/s; q[1]=(m[2]-m[6])/s; q[2]=(m[3]-m[1])/s;
+    } else if (m[0]>m[4] && m[0]>m[8]){
+        float s = std::sqrt(1.f+m[0]-m[4]-m[8])*2.f; // s = 4x
+        q[3]=(m[7]-m[5])/s; q[0]=0.25f*s; q[1]=(m[1]+m[3])/s; q[2]=(m[2]+m[6])/s;
+    } else if (m[4]>m[8]){
+        float s = std::sqrt(1.f+m[4]-m[0]-m[8])*2.f; // s = 4y
+        q[3]=(m[2]-m[6])/s; q[0]=(m[1]+m[3])/s; q[1]=0.25f*s; q[2]=(m[5]+m[7])/s;
+    } else {
+        float s = std::sqrt(1.f+m[8]-m[0]-m[4])*2.f; // s = 4z
+        q[3]=(m[3]-m[1])/s; q[0]=(m[2]+m[6])/s; q[1]=(m[5]+m[7])/s; q[2]=0.25f*s;
+    }
+    float n=std::sqrt(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]);
+    if(n>1e-12f){ q[0]/=n; q[1]/=n; q[2]/=n; q[3]/=n; }
+}
+inline float median_of(std::vector<float> v){
+    if (v.empty()) return 0.f;
+    std::sort(v.begin(), v.end());
+    return v[v.size()/2];
 }
 
 // ─── Explicit BVH-name → MHR-name mapping ──────────────────────────────────
@@ -1120,6 +1162,300 @@ static std::string per_person_path(const std::string& base,
     return base + "_" + prefix + std::to_string(id) + ".bvh";
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+//  Foot-contact cleanup (Phase 1: root vertical leveling + 2-bone leg IK)
+//
+//  Runs once per person at close(), AFTER rewrite_offsets_for() has set this
+//  person's final bone lengths and mc_->motionValues points at their buffer —
+//  so the MotionCaptureLoader FK (bvh_loadTransformForMotionBuffer) yields the
+//  exact world joint positions the exported file will play.  Working in the
+//  writer's own BVH space (cm) keeps everything self-consistent: no MHR /
+//  keypoints_3d frame mismatch, no body_pose editing.
+//
+//  Convention: the camera frame is +X right / +Y down / +Z forward (see the
+//  projection in fast_sam_3dbody.cpp), so the gravity axis is Y and the floor
+//  is a (near-)constant Y.  We never assume the sign of "down": leveling pins
+//  the planted ankle to a fitted constant Y, and contact detection only needs
+//  horizontal (X,Z) speed + nearness to that constant — both sign-agnostic.
+// ════════════════════════════════════════════════════════════════════════════
+void BVHWriter::foot_contact_pass(PerPerson& p)
+{
+    const int F = p.frame_count;
+    if (F < 3) return;
+    const bool dbg = (std::getenv("FSB_FOOT_DEBUG") != nullptr);
+
+    float SPEED_THR  = 2.0f;   // cm/frame below which a foot is "planted"
+    float HEIGHT_BAND= 8.0f;   // cm around the fitted ground level
+    const int MIN_RUN = 3;     // shortest accepted / bridged contact run (frames)
+    const int BLEND   = 3;     // ramp frames at each contact edge
+    if (const char* e = std::getenv("FSB_FOOT_SPEED")) SPEED_THR   = (float)atof(e);
+    if (const char* e = std::getenv("FSB_FOOT_BAND"))  HEIGHT_BAND = (float)atof(e);
+
+    auto find_jid = [&](const char* nm) -> int {
+        for (unsigned int j = 0; j < mc_->jointHierarchySize; ++j)
+            if (std::strcmp(mc_->jointHierarchy[j].jointName, nm) == 0) return (int)j;
+        return -1;
+    };
+    struct Leg { int hip, knee, ankle; };
+    Leg legs[2] = {
+        { find_jid("lThigh"), find_jid("lShin"), find_jid("lFoot") },
+        { find_jid("rThigh"), find_jid("rShin"), find_jid("rFoot") },
+    };
+    for (auto& L : legs)
+        if (L.hip < 0 || L.knee < 0 || L.ankle < 0) {
+            if (dbg) fprintf(stderr, "[foot] person %d: leg chain not in template; skip\n", p.id);
+            return;
+        }
+    if (root_bvh_jid_ < 0 || !mc_->jointHierarchy[root_bvh_jid_].hasPositionalChannels)
+        return;
+
+    // ── FK every frame, caching the world transforms the IK needs ────────────
+    struct JT  { float pos[3]; float q[4]; };
+    struct FFK { JT hip[2], knee[2], ankle[2], hippar[2]; };
+    std::vector<FFK> fk(F);
+
+    BVH_Transform xf; memset(&xf, 0, sizeof(xf));
+    if (!bvh_allocateTransform(mc_, &xf)) { if (dbg) fprintf(stderr,"[foot] alloc xf failed\n"); return; }
+
+    auto grab = [&](int jid, JT& out){
+        const BVH_TransformedJoint& tj = xf.joint[jid];
+        // chainTransformation is the world matrix (pos3D = its m[3,7,11]); its
+        // rotation part is the joint's world orientation.
+        out.pos[0]=tj.pos3D[0]; out.pos[1]=tj.pos3D[1]; out.pos[2]=tj.pos3D[2];
+        float m9[9]; mat3_from_m4(tj.chainTransformation.m, m9);
+        mat3_to_quat(m9, out.q);
+    };
+    for (int f = 0; f < F; ++f){
+        float* row = p.motion.data() + (size_t)f*total_channels_;
+        bvh_loadTransformForMotionBuffer(mc_, row, &xf, /*populateTorso=*/0);
+        for (int s = 0; s < 2; ++s){
+            grab(legs[s].hip,   fk[f].hip[s]);
+            grab(legs[s].knee,  fk[f].knee[s]);
+            grab(legs[s].ankle, fk[f].ankle[s]);
+            grab((int)mc_->jointHierarchy[legs[s].hip].parentJoint, fk[f].hippar[s]);
+        }
+    }
+    bvh_freeTransform(&xf);
+
+    // ── Per-foot contact detection (low horizontal speed + near ground Y) ────
+    auto clean_runs = [&](std::vector<char>& c){
+        // drop runs shorter than MIN_RUN, then bridge gaps shorter than MIN_RUN
+        for (int f = 0; f < F; ){
+            if (!c[f]) { ++f; continue; }
+            int g = f; while (g < F && c[g]) ++g;
+            if (g - f < MIN_RUN) for (int k=f;k<g;++k) c[k]=0;
+            f = g;
+        }
+        for (int f = 0; f < F; ){
+            if (c[f]) { ++f; continue; }
+            int g = f; while (g < F && !c[g]) ++g;
+            if (f > 0 && g < F && g - f < MIN_RUN) for (int k=f;k<g;++k) c[k]=1;
+            f = g;
+        }
+    };
+
+    std::vector<char> contact[2];
+    float groundY[2] = {0.f, 0.f};
+    bool  has_ground[2] = {false, false};
+    std::vector<float> spd[2];
+    for (int s = 0; s < 2; ++s){
+        contact[s].assign(F, 0);
+        spd[s].assign(F, 1e9f);
+        for (int f = 1; f < F; ++f){
+            float dx = fk[f].ankle[s].pos[0]-fk[f-1].ankle[s].pos[0];
+            float dz = fk[f].ankle[s].pos[2]-fk[f-1].ankle[s].pos[2];
+            spd[s][f] = std::sqrt(dx*dx+dz*dz);
+        }
+        if (F > 1) spd[s][0] = spd[s][1];
+        std::vector<float> lowY;
+        for (int f = 0; f < F; ++f) if (spd[s][f] < SPEED_THR) lowY.push_back(fk[f].ankle[s].pos[1]);
+        if ((int)lowY.size() >= MIN_RUN){
+            groundY[s] = median_of(lowY); has_ground[s] = true;
+            for (int f = 0; f < F; ++f)
+                contact[s][f] = (spd[s][f] < SPEED_THR) &&
+                                (std::fabs(fk[f].ankle[s].pos[1]-groundY[s]) < HEIGHT_BAND);
+            clean_runs(contact[s]);
+        }
+    }
+
+    // Fitted floor = median planted-ankle Y across both feet's contact frames.
+    std::vector<float> floorSamples;
+    for (int s = 0; s < 2; ++s)
+        for (int f = 0; f < F; ++f) if (contact[s][f]) floorSamples.push_back(fk[f].ankle[s].pos[1]);
+    if (floorSamples.empty()){
+        if (dbg) fprintf(stderr, "[foot] person %d: no contacts detected; pass is a no-op\n", p.id);
+        return;
+    }
+    const float floorY = median_of(floorSamples);
+
+    if (dbg){
+        int nc[2]={0,0}; for(int s=0;s<2;++s) for(int f=0;f<F;++f) nc[s]+=contact[s][f];
+        fprintf(stderr,
+            "[foot] person %d: F=%d  L:ankleY[%.1f..%.1f] ground=%.1f contacts=%d  "
+            "R:ground=%.1f contacts=%d  floorY=%.1f  (speed<%.1f band<%.1f)\n",
+            p.id, F,
+            [&]{float m= 1e9f; for(int f=0;f<F;++f) m=std::min(m,fk[f].ankle[0].pos[1]); return m;}(),
+            [&]{float m=-1e9f; for(int f=0;f<F;++f) m=std::max(m,fk[f].ankle[0].pos[1]); return m;}(),
+            has_ground[0]?groundY[0]:0.f, nc[0],
+            has_ground[1]?groundY[1]:0.f, nc[1], floorY, SPEED_THR, HEIGHT_BAND);
+    }
+
+    // ── Analytic 2-bone IK: re-aim a leg so its ankle reaches `target`. ───────
+    // Writes the hip + knee ZXY rotation channels of frame `row`.
+    auto solve_leg_ik = [&](float* row, int f, int s, const float target[3]){
+        const JT& H  = fk[f].hip[s];
+        const JT& K  = fk[f].knee[s];
+        const JT& A  = fk[f].ankle[s];
+        const JT& HP = fk[f].hippar[s];
+
+        float v1[3]; v3sub(K.pos, H.pos, v1); float L1 = v3len(v1);
+        float v2[3]; v3sub(A.pos, K.pos, v2); float L2 = v3len(v2);
+        if (L1 < 1e-4f || L2 < 1e-4f) return;
+
+        float d[3]; v3sub(target, H.pos, d); float dist = v3len(d);
+        const float eps = 1e-3f;
+        float dmin = std::fabs(L1-L2)+eps, dmax = L1+L2-eps;
+        if (dist < dmin) dist = dmin;
+        if (dist > dmax) dist = dmax;
+        if (dist < 1e-4f) return;
+        float u[3] = { d[0]/v3len(d), d[1]/v3len(d), d[2]/v3len(d) };
+        float Tc[3] = { H.pos[0]+u[0]*dist, H.pos[1]+u[1]*dist, H.pos[2]+u[2]*dist };
+
+        float t_along = (dist*dist + L1*L1 - L2*L2) / (2.f*dist);
+        float h2 = L1*L1 - t_along*t_along; float h = h2>0.f ? std::sqrt(h2) : 0.f;
+        // bend direction: current knee offset projected off the hip→target axis
+        float e[3]; { float pr = v3dot(v1,u); e[0]=v1[0]-pr*u[0]; e[1]=v1[1]-pr*u[1]; e[2]=v1[2]-pr*u[2]; }
+        if (v3len(e) < 1e-4f){                       // straight leg: pick a stable perp
+            float up[3]={0,1,0}; v3cross(u,up,e);
+            if (v3len(e) < 1e-4f){ float ax[3]={1,0,0}; v3cross(u,ax,e); }
+        }
+        v3norm(e);
+        float Knew[3] = { H.pos[0]+u[0]*t_along+e[0]*h,
+                          H.pos[1]+u[1]*t_along+e[1]*h,
+                          H.pos[2]+u[2]*t_along+e[2]*h };
+
+        float nd1[3]; v3sub(Knew, H.pos, nd1);
+        float Rdh[4]; shortest_arc_quat(v1, nd1, Rdh);
+        float Rwh_new[4]; qmul(Rwh_new, Rdh, H.q);
+
+        float v2mid[3]; qrot(v2mid, Rdh, v2);
+        float nd2[3]; v3sub(Tc, Knew, nd2);
+        float Rdk[4]; shortest_arc_quat(v2mid, nd2, Rdk);
+        float tmp[4]; qmul(tmp, Rdh, K.q);
+        float Rwk_new[4]; qmul(Rwk_new, Rdk, tmp);
+
+        float cp[4], qlh[4]; qconj(cp, HP.q);      qmul(qlh, cp, Rwh_new);
+        float ch[4], qlk[4]; qconj(ch, Rwh_new);   qmul(qlk, ch, Rwk_new);
+
+        float m[9], az, bx, cy;
+        quat_to_mat3(qlh, m); mat3_to_zxy(m, az, bx, cy);
+        set_channel(mc_, row, (BVHJointID)legs[s].hip,  BVH_ROTATION_Z, az*RAD2DEG);
+        set_channel(mc_, row, (BVHJointID)legs[s].hip,  BVH_ROTATION_X, bx*RAD2DEG);
+        set_channel(mc_, row, (BVHJointID)legs[s].hip,  BVH_ROTATION_Y, cy*RAD2DEG);
+        quat_to_mat3(qlk, m); mat3_to_zxy(m, az, bx, cy);
+        set_channel(mc_, row, (BVHJointID)legs[s].knee, BVH_ROTATION_Z, az*RAD2DEG);
+        set_channel(mc_, row, (BVHJointID)legs[s].knee, BVH_ROTATION_X, bx*RAD2DEG);
+        set_channel(mc_, row, (BVHJointID)legs[s].knee, BVH_ROTATION_Y, cy*RAD2DEG);
+    };
+
+    // ── Horizontal lock target + ramp weight per foot/frame ──────────────────
+    // For each contact run, the locked (X,Z) is the run's median; the weight
+    // ramps 0→1→0 across BLEND frames at the run edges to avoid pops.
+    std::vector<float> lockX[2], lockZ[2], lockW[2];
+    for (int s = 0; s < 2; ++s){
+        lockX[s].assign(F,0.f); lockZ[s].assign(F,0.f); lockW[s].assign(F,0.f);
+        for (int f = 0; f < F; ){
+            if (!contact[s][f]) { ++f; continue; }
+            int g = f; while (g < F && contact[s][g]) ++g;     // run [f,g)
+            std::vector<float> xs, zs;
+            for (int k=f;k<g;++k){ xs.push_back(fk[k].ankle[s].pos[0]); zs.push_back(fk[k].ankle[s].pos[2]); }
+            float mx = median_of(xs), mz = median_of(zs);
+            for (int k=f;k<g;++k){
+                int edge = std::min(k-f+1, g-k);               // 1..run/2
+                float w = std::min(1.f, (float)edge/(float)BLEND);
+                lockX[s][k]=mx; lockZ[s][k]=mz; lockW[s][k]=w;
+            }
+            f = g;
+        }
+    }
+
+    // ── Apply: per frame, IK each contacting foot, then level the root in Y ───
+    std::vector<float> dY(F, std::numeric_limits<float>::quiet_NaN());
+    for (int f = 0; f < F; ++f){
+        float* row = p.motion.data() + (size_t)f*total_channels_;
+        float lev_sum = 0.f; int lev_n = 0;
+        for (int s = 0; s < 2; ++s){
+            if (!contact[s][f]) continue;
+            const JT& A = fk[f].ankle[s];
+            float w = lockW[s][f];
+            float target[3] = {
+                A.pos[0] + (lockX[s][f]-A.pos[0])*w,
+                A.pos[1],                                   // vertical handled by leveling
+                A.pos[2] + (lockZ[s][f]-A.pos[2])*w
+            };
+            solve_leg_ik(row, f, s, target);
+            lev_sum += (floorY - A.pos[1]) * w;             // pull planted ankle to floor
+            lev_n++;
+        }
+        if (lev_n) dY[f] = lev_sum / lev_n;
+    }
+
+    // Fill the non-contact frames by linear interpolation between known dY,
+    // clamping flat past the first / last contact.
+    {
+        int prev = -1;
+        for (int f = 0; f < F; ++f){
+            if (std::isnan(dY[f])) continue;
+            if (prev < 0) for (int k=0;k<f;++k) dY[k]=dY[f];       // head
+            else { float a=dY[prev], b=dY[f]; for (int k=prev+1;k<f;++k){ float t=(float)(k-prev)/(f-prev); dY[k]=a+(b-a)*t; } }
+            prev = f;
+        }
+        if (prev < 0) return;                                     // shouldn't happen
+        for (int k=prev+1;k<F;++k) dY[k]=dY[prev];                // tail
+    }
+
+    unsigned int rootYidx = bvh_resolveFrameAndJointAndChannelToMotionID(
+                                mc_, (BVHJointID)root_bvh_jid_, 0, BVH_POSITION_Y);
+    for (int f = 0; f < F; ++f){
+        float* row = p.motion.data() + (size_t)f*total_channels_;
+        row[rootYidx] += dY[f];
+    }
+
+    if (dbg){
+        float mn=1e9f,mx=-1e9f; for(int f=0;f<F;++f){ mn=std::min(mn,dY[f]); mx=std::max(mx,dY[f]); }
+        // Re-FK the corrected buffer and measure planted-foot horizontal skate
+        // (RMS deviation from each contact run's locked centre) before vs after.
+        BVH_Transform x2; memset(&x2, 0, sizeof(x2));
+        if (bvh_allocateTransform(mc_, &x2)){
+            double se_before=0, se_after=0; long n=0;
+            std::vector<std::array<float,2>> after(F);
+            for (int s=0;s<2;++s){
+                for (int f=0; f<F; ++f){
+                    if (!contact[s][f]) continue;
+                    float* row = p.motion.data() + (size_t)f*total_channels_;
+                    bvh_loadTransformForMotionBuffer(mc_, row, &x2, 0);
+                    after[f] = { x2.joint[legs[s].ankle].pos3D[0], x2.joint[legs[s].ankle].pos3D[2] };
+                }
+                for (int f=0; f<F; ++f){
+                    if (!contact[s][f]) continue;
+                    float bx=fk[f].ankle[s].pos[0]-lockX[s][f], bz=fk[f].ankle[s].pos[2]-lockZ[s][f];
+                    float ax=after[f][0]-lockX[s][f],          az=after[f][1]-lockZ[s][f];
+                    se_before += bx*bx+bz*bz; se_after += ax*ax+az*az; ++n;
+                }
+            }
+            bvh_freeTransform(&x2);
+            fprintf(stderr,
+                "[foot] person %d: applied root ΔY=[%.1f, %.1f] cm + leg IK; planted-foot skate "
+                "RMS %.2f → %.2f cm over %ld contact-frames\n",
+                p.id, mn, mx,
+                n? std::sqrt(se_before/n):0.0, n? std::sqrt(se_after/n):0.0, n);
+        } else {
+            fprintf(stderr, "[foot] person %d: applied root ΔY=[%.1f, %.1f] cm + leg IK on contacts\n",
+                    p.id, mn, mx);
+        }
+    }
+}
+
 bool BVHWriter::dump_one_person(const PerPerson& p)
 {
     // Snapshot the template's original OFFSETs so we can restore them after
@@ -1142,6 +1478,10 @@ bool BVHWriter::dump_one_person(const PerPerson& p)
     mc_->numberOfFrames     = (unsigned int)mut.frame_count;
     mc_->numberOfFramesEncountered = mc_->numberOfFrames;
     mc_->frameTime          = frame_time_;
+
+    // Foot-contact cleanup runs here: offsets are final and mc_->motionValues
+    // points at this person's buffer, so the loader FK matches the export.
+    if (foot_contact_) foot_contact_pass(mut);
 
     std::string path = per_person_path(out_path_, id_prefix_, p.id);
     int ok = dumpBVHToBVH(path.c_str(), mc_, /*hierarchy=*/1, /*motion=*/1);

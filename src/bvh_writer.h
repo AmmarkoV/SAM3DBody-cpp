@@ -71,6 +71,12 @@ public:
     //   sets this to e.g. "scene0_person" → "<stem>_scene0_person0.bvh".
     void set_id_label_prefix(const std::string& p) { id_prefix_ = p; }
 
+    // Enable the foot-contact cleanup pass (root vertical leveling + 2-bone leg
+    // IK to pin planted feet).  Runs per person at close() over the full motion
+    // buffer, so it works for both the live and offline writers.  Off by
+    // default — opt in via --foot-contact.
+    void set_foot_contact(bool on) { foot_contact_ = on; }
+
     BVHWriter()  = default;
     ~BVHWriter() { if (is_open()) close(); }
     BVHWriter(const BVHWriter&)            = delete;
@@ -125,6 +131,7 @@ private:
     bool               enforce_hand_limits_        = false;
     bool               zero_hand_pose_             = false;
     bool               sticky_hand_pose_           = false;
+    bool               foot_contact_               = false;
 
     std::vector<BvhSlot> slots_;             // shared template
     int                  root_bvh_jid_ = -1;
@@ -146,6 +153,7 @@ private:
     void  append_frame_for(PerPerson& p, const fsb::MHRResult& r);
     void  pad_continuation_frame(PerPerson& p);
     void  rewrite_offsets_for(PerPerson& p);
+    void  foot_contact_pass(PerPerson& p);
     bool  dump_one_person(const PerPerson& p);
 
     // Tracker

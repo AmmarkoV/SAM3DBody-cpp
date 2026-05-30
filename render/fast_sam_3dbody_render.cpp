@@ -490,6 +490,7 @@ int main(int argc, const char** argv) {
     bool        bvh_sticky_hand_pose           = false;
     bool        bvh_rest_align                 = true;
     bool        bvh_dump_rest_dirs             = false;
+    bool        bvh_foot_contact               = false;
     bool        use_butterworth    = false;
     float       bw_cutoff         = 6.0f;   // Hz; higher = less lag, less smoothing
     bool        filter_root_rot   = false;  // enabled by --butterworth-root-rotation
@@ -549,6 +550,7 @@ int main(int argc, const char** argv) {
     bvh_sticky_hand_pose           = cc.bvh_sticky_hand_pose;
     bvh_rest_align                 = cc.bvh_rest_align;
     bvh_dump_rest_dirs             = cc.bvh_dump_rest_dirs;
+    bvh_foot_contact               = cc.bvh_foot_contact;
     bw_cutoff                      = cc.bw_cutoff;
     rot_clamp_deg                  = cc.rot_clamp_deg;
 
@@ -670,8 +672,10 @@ int main(int argc, const char** argv) {
                              bvh_rest_align,
                              bvh_dump_rest_dirs))
             fprintf(stderr, "[BVH] Warning: could not open BVH writer\n");
-        else
+        else {
+            bvh_writer.set_foot_contact(bvh_foot_contact);
             printf("[BVH] Writing to %s (%.1f fps)\n", bvh_path.c_str(), video_fps);
+        }
     }
 
     // ── Butterworth filter banks ──────────────────────────────────────────────
