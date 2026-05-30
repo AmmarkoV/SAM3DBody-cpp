@@ -36,6 +36,7 @@ int main(int argc, char** argv)
     cfg.scene_detection = false;   // each stream is a single continuous shot
     double window_seconds = 3.0;   // length of the common window to process (0 = full overlap)
     double match_thresh_m = 0.6;
+    int    single_view    = -1;    // >=0: fuse ONLY this camera's views (single-view baseline)
 
     for (int i = 1; i < argc; ++i)
     {
@@ -49,6 +50,7 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[i],"--match-thresh")   && i+1<argc) match_thresh_m  = atof(argv[++i]);
         else if (!strcmp(argv[i],"--bvh")            && i+1<argc) bvh_out         = argv[++i];
         else if (!strcmp(argv[i],"--bvh-template")   && i+1<argc) bvh_template    = argv[++i];
+        else if (!strcmp(argv[i],"--single-view")    && i+1<argc) single_view     = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--help")||!strcmp(argv[i],"-h")) {
             printf("usage: %s --sync session.sync --onnx-dir DIR [--gguf F] [--yolo F] [--lbs F]\n"
                    "          [--cuda N] [--window-seconds S] [--match-thresh M]\n", argv[0]);
@@ -143,6 +145,7 @@ int main(int argc, char** argv)
                 BVHWriter::FusedPerson fpn; fpn.track_id = p;
                 for (const auto& vo : pt.views)
                 {
+                    if (single_view >= 0 && vo.stream != single_view) continue;  // single-view baseline
                     const auto& sr = streams[vo.stream];
                     const fsb::MHRResult* m = &sr.frames[vo.frame_rel].detections[vo.det];
                     auto q  = mv::mat4_rotation_quat(sr.T_world_cam);
@@ -154,6 +157,7 @@ int main(int argc, char** argv)
                     fv.root_world  = { (float)rw[0],(float)rw[1],(float)rw[2] };
                     fpn.views.push_back(fv);
                 }
+                if (fpn.views.empty()) continue;   // all views filtered (e.g. --single-view) → absent
                 fused.push_back(std::move(fpn));
                 present.push_back(p);
             }
