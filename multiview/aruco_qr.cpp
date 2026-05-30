@@ -156,15 +156,21 @@ void ArucoQrDetector::process(const cv::Mat& bgr, FrameDetections& out)
 
     if (!impl_->ready) impl_->build(bgr.cols, bgr.rows);
 
-    cv::Mat frame = bgr;
+    // ArUco pose needs the undistorted image (when calibrated); QR only needs
+    // the payload, and rectification can only hurt its decoding (warps/borders
+    // a peripheral code) — so QR always runs on the RAW frame.
+    cv::Mat rect;
+    const cv::Mat* aruco_bgr = &bgr;
     if (impl_->rectify)
     {
-        cv::Mat r;
-        cv::remap(bgr, r, impl_->mapx, impl_->mapy, cv::INTER_LINEAR);
-        frame = r;
+        cv::remap(bgr, rect, impl_->mapx, impl_->mapy, cv::INTER_LINEAR);
+        aruco_bgr = &rect;
     }
     cv::Mat gray;
-    cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+    cv::cvtColor(*aruco_bgr, gray, cv::COLOR_BGR2GRAY);
+    cv::Mat raw_gray;
+    if (impl_->rectify) cv::cvtColor(bgr, raw_gray, cv::COLOR_BGR2GRAY);
+    else                raw_gray = gray;
 
     // ── ArUco markers + per-id pose ──────────────────────────────────────────
     std::vector<int>                       ids;
@@ -191,13 +197,13 @@ void ArucoQrDetector::process(const cv::Mat& bgr, FrameDetections& out)
     // We only need the decoded payload, not the QR's geometry, so detect on a
     // downscaled gray — QRCodeDetector is the per-frame bottleneck on high-res
     // (e.g. 5K GoPro) footage, and the smaller image is also more stable.
-    cv::Mat qr_gray = gray;
+    cv::Mat qr_gray = raw_gray;
     const int QR_MAX_SIDE = 1600;
-    int mx = std::max(gray.cols, gray.rows);
+    int mx = std::max(raw_gray.cols, raw_gray.rows);
     if (mx > QR_MAX_SIDE)
     {
         double s = (double)QR_MAX_SIDE / mx;
-        cv::resize(gray, qr_gray, cv::Size(), s, s, cv::INTER_AREA);
+        cv::resize(raw_gray, qr_gray, cv::Size(), s, s, cv::INTER_AREA);
     }
 
     bool any = false;

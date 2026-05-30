@@ -72,4 +72,24 @@ add_executable(sam_3dbody_synctime sam_3dbody_synctime.cpp)
 target_link_libraries(sam_3dbody_synctime PRIVATE
     multiview_sync_time multiview_aruco_qr ${OpenCV_LIBS})
 
-message(STATUS "  multiview: calib + aruco_qr + extrinsics + sync_time (libs); calib_test, extrinsics_test, sync_time_test, aruco_qr_probe, sam_3dbody_extrinsics, sam_3dbody_synctime")
+# ---------------------------------------------------------------------------
+# sync_io — read/write the session .sync file (pure C++) + round-trip test +
+# sam_3dbody_sync, which fuses extrinsics + temporal fit into one session.sync.
+# ---------------------------------------------------------------------------
+add_library(multiview_sync_io STATIC sync_io.cpp)
+target_include_directories(multiview_sync_io PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(multiview_sync_io PUBLIC multiview_extrinsics)   # mv::Mat4
+target_compile_options(multiview_sync_io PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang>:-O2 -Wall -Wextra>
+)
+
+add_executable(sync_io_test sync_io_test.cpp)
+target_link_libraries(sync_io_test PRIVATE multiview_sync_io)
+add_test(NAME sync_io_test COMMAND sync_io_test)
+
+add_executable(sam_3dbody_sync sam_3dbody_sync.cpp)
+target_link_libraries(sam_3dbody_sync PRIVATE
+    multiview_sync_io multiview_sync_time multiview_extrinsics
+    multiview_aruco_qr multiview_calib ${OpenCV_LIBS})
+
+message(STATUS "  multiview: calib + aruco_qr + extrinsics + sync_time + sync_io (libs); tests: calib/extrinsics/sync_time/sync_io; tools: aruco_qr_probe, sam_3dbody_extrinsics, sam_3dbody_synctime, sam_3dbody_sync")
