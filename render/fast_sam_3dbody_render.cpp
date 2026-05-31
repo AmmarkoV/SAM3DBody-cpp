@@ -62,31 +62,22 @@ static const char* QUAD_FRAG = R"glsl(
     void main() { fragColor = vec4(texture(uTex, vUV).rgb, 1.0); }
 )glsl";
 
-// Body mesh — simple directional light from fixed direction.
-static const char* MESH_VERT = R"glsl(
-    #version 330 core
-    layout(location=0) in vec3 aPos;
-    layout(location=1) in vec3 aNorm;
-    uniform mat4 uMVP;
-    out vec3 vNorm;
-    void main() {
-        gl_Position = uMVP * vec4(aPos, 1.0);
-        vNorm = aNorm;
-    }
-)glsl";
-
-static const char* MESH_FRAG = R"glsl(
-    #version 330 core
-    in  vec3 vNorm;
-    out vec4 fragColor;
-    void main() {
-        vec3 L = normalize(vec3(0.3, 0.8, 0.5));
-        float d = clamp(dot(normalize(vNorm), L), 0.0, 1.0) * 0.7 + 0.3;
-        fragColor = vec4(vec3(0.65, 0.75, 0.9) * d, 0.7);
-    }
-)glsl";
+// The body-mesh shaders live in render/default.vert and render/default.frag so
+// they can be edited without a rebuild; default.frag exposes a `uColor` uniform.
 
 // ── GL helpers ───────────────────────────────────────────────────────────────
+
+// Read a whole text file (a GLSL source) into a string.  Returns empty on
+// failure and logs the path — the caller treats empty as fatal.
+static std::string load_text_file(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "[shader] cannot open %s\n", path); return {}; }
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    std::string s;
+    if (n > 0) { s.resize((size_t)n); if (fread(&s[0], 1, (size_t)n, f) != (size_t)n) s.clear(); }
+    fclose(f);
+    return s;
+}
 
 static GLuint compile_shader(GLenum type, const char* src) {
     GLuint s = glCreateShader(type);
@@ -468,6 +459,10 @@ int main(int argc, const char** argv) {
     std::string gguf_path = "./onnx/pipeline.gguf";
     std::string yolo_path = "./onnx/yolo.onnx";
     std::string mesh_path = "./body_mesh.tri";
+    std::string vert_path = "render/default.vert";
+    std::string frag_path = "render/default.frag";
+    float       mesh_color[3] = {0.65f, 0.75f, 0.9f};  // same for everyone for now
+    float       shininess     = 0.0f;   // 0 = matte; --shiny turns on the chrome look
     std::string lbs_path  = "";
     std::string src       = "0";
     std::string save_frames_prefix = "";
@@ -515,9 +510,22 @@ int main(int argc, const char** argv) {
 #define A1(flag, field, conv) \
         if (!strcmp(argv[i], flag) && i+1<argc) { field = conv(argv[++i]); continue; }
         A1("--mesh",        mesh_path,          std::string)
+        A1("--vert",        vert_path,          std::string)
+        A1("--frag",        frag_path,          std::string)
         A1("--lbs",         lbs_path,           std::string)
         A1("--save-frames", save_frames_prefix, std::string)
 #undef A1
+        if (!strcmp(argv[i], "--mesh-color") && i+3 < argc)
+            { mesh_color[0]=std::stof(argv[++i]); mesh_color[1]=std::stof(argv[++i]);
+              mesh_color[2]=std::stof(argv[++i]); continue; }
+        // --shiny enables the reflective look at a default strength; an optional
+        // numeric argument (0..1) overrides it, e.g. --shiny 0.6
+        if (!strcmp(argv[i], "--shiny")) {
+            shininess = 0.85f;
+            if (i+1 < argc && (isdigit((unsigned char)argv[i+1][0]) || argv[i+1][0]=='.'))
+                shininess = std::stof(argv[++i]);
+            continue;
+        }
         if (!strcmp(argv[i], "--render-size") && i+2 < argc)
             { render_w = std::stoi(argv[++i]); render_h = std::stoi(argv[++i]); continue; }
         if (!strcmp(argv[i], "--size") && i+2 < argc)
@@ -624,8 +632,20 @@ int main(int argc, const char** argv) {
 
     // ── Shaders ───────────────────────────────────────────────────────────────
     GLuint prog_quad = link_program(QUAD_VERT, QUAD_FRAG);
-    GLuint prog_mesh = link_program(MESH_VERT, MESH_FRAG);
+
+    std::string mesh_vert_src = load_text_file(vert_path.c_str());
+    std::string mesh_frag_src = load_text_file(frag_path.c_str());
+    if (mesh_vert_src.empty() || mesh_frag_src.empty()) {
+        fprintf(stderr, "Cannot load mesh shaders (%s, %s)\n",
+                vert_path.c_str(), frag_path.c_str()); return 1;
+    }
+    GLuint prog_mesh = link_program(mesh_vert_src.c_str(), mesh_frag_src.c_str());
     GLint  mvp_loc   = glGetUniformLocation(prog_mesh, "uMVP");
+    GLint  view_loc  = glGetUniformLocation(prog_mesh, "uView");
+    GLint  color_loc = glGetUniformLocation(prog_mesh, "uColor");
+    GLint  scene_loc = glGetUniformLocation(prog_mesh, "uScene");
+    GLint  res_loc   = glGetUniformLocation(prog_mesh, "uResolution");
+    GLint  shiny_loc = glGetUniformLocation(prog_mesh, "uShiny");
     GLint  tex_loc   = glGetUniformLocation(prog_quad, "uTex");
 
     // ── Load body mesh from .tri ──────────────────────────────────────────────
@@ -834,8 +854,23 @@ int main(int argc, const char** argv) {
 
         // ── Mesh overlay for each detected person ─────────────────────────────
         glUseProgram(prog_mesh);
+
+        // Reflection uniforms (shared by every person this frame).  The scene
+        // texture is the same background image the quad drew; bind it to unit 1
+        // so the chrome shader can sample it.  uShiny=0 short-circuits the
+        // reflection in the shader, so this is a no-op when --shiny is off.
+        glUniform1f(shiny_loc, shininess);
+        glUniform2f(res_loc, (float)W, (float)H);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, bg.id);
+        glUniform1i(scene_loc, 1);
+
         for (const auto& r : results) {
             if (!lbs) continue;
+
+            // Mesh tint — uniform for the whole body.  Constant for now; this
+            // is where per-identity colouring will hook in later.
+            glUniform3fv(color_loc, 1, mesh_color);
 
             // Decode scale PCA into model_params[136:204] if available.
             // Python: scales = scale_mean + scale_params @ scale_comps  ([28]→[68])
@@ -968,6 +1003,7 @@ int main(int argc, const char** argv) {
 #endif
 
             glUniformMatrix4fv(mvp_loc, 1, GL_FALSE, mvp);
+            glUniformMatrix4fv(view_loc, 1, GL_FALSE, view);
 
             glBindVertexArray(mesh_gpu.vao);
             glDrawElements(GL_TRIANGLES, mesh_gpu.n_indices,
