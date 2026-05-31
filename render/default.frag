@@ -5,6 +5,7 @@ uniform vec3      uColor;       // mesh tint (set per-person from the renderer)
 uniform sampler2D uScene;       // the background camera image
 uniform vec2      uResolution;  // viewport size, to map gl_FragCoord -> UV
 uniform float     uShiny;       // 0 = matte (original look), 1 = full chrome
+uniform float     uAlpha;       // mesh opacity (0 = invisible, 1 = opaque)
 out vec4 fragColor;
 
 void main() {
@@ -29,5 +30,5 @@ void main() {
     float k    = uShiny * mix(0.55, 1.0, fres);
 
     vec3 col = mix(base, refl, k);
-    fragColor = vec4(col, 0.7);
+    fragColor = vec4(col, uAlpha);
 }

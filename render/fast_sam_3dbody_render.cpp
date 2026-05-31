@@ -463,6 +463,7 @@ int main(int argc, const char** argv) {
     std::string frag_path = "render/default.frag";
     float       mesh_color[3] = {0.65f, 0.75f, 0.9f};  // same for everyone for now
     float       shininess     = 0.0f;   // 0 = matte; --shiny turns on the chrome look
+    float       transparency  = 0.7f;   // mesh opacity (--transparency)
     std::string lbs_path  = "";
     std::string src       = "0";
     std::string save_frames_prefix = "";
@@ -518,6 +519,8 @@ int main(int argc, const char** argv) {
         if (!strcmp(argv[i], "--mesh-color") && i+3 < argc)
             { mesh_color[0]=std::stof(argv[++i]); mesh_color[1]=std::stof(argv[++i]);
               mesh_color[2]=std::stof(argv[++i]); continue; }
+        if (!strcmp(argv[i], "--transparency") && i+1 < argc)
+            { transparency = 1.0f - std::stof(argv[++i]); continue; }  // value is transparency; uAlpha is opacity
         // --shiny enables the reflective look at a default strength; an optional
         // numeric argument (0..1) overrides it, e.g. --shiny 0.6
         if (!strcmp(argv[i], "--shiny")) {
@@ -646,6 +649,7 @@ int main(int argc, const char** argv) {
     GLint  scene_loc = glGetUniformLocation(prog_mesh, "uScene");
     GLint  res_loc   = glGetUniformLocation(prog_mesh, "uResolution");
     GLint  shiny_loc = glGetUniformLocation(prog_mesh, "uShiny");
+    GLint  alpha_loc = glGetUniformLocation(prog_mesh, "uAlpha");
     GLint  tex_loc   = glGetUniformLocation(prog_quad, "uTex");
 
     // ── Load body mesh from .tri ──────────────────────────────────────────────
@@ -860,6 +864,7 @@ int main(int argc, const char** argv) {
         // so the chrome shader can sample it.  uShiny=0 short-circuits the
         // reflection in the shader, so this is a no-op when --shiny is off.
         glUniform1f(shiny_loc, shininess);
+        glUniform1f(alpha_loc, transparency);
         glUniform2f(res_loc, (float)W, (float)H);
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, bg.id);
