@@ -378,6 +378,29 @@ int start_glx3_stuffWindowed(int WIDTH,int HEIGHT,int argc,const char **argv)
 
 
 
+/* When the offscreen Pbuffer path is unavailable — either no FBConfig exposes
+ * GLX_PBUFFER_BIT, or glXCreatePbuffer() fails — fall back to a normal on-screen
+ * window instead of aborting via fatalErrorGLX3().
+ *
+ * This matters because scripts/video.sh --save forces --headless, which asks for
+ * a Pbuffer.  Drivers/servers that don't support Pbuffers (some Mesa configs,
+ * remote/VirtualGL setups, etc.) used to take down the whole save pipeline with
+ * "P-Buffers not supported." → 0 frames written → encode aborted.  A visible
+ * window renders the same frames, so --save still works there.
+ *
+ * Two bits of state must be corrected on the way out:
+ *   - glx3_is_pbuffer is reset to 0 so stop_glx3_stuff() uses the windowed
+ *     cleanup path (XDestroyWindow / XFreeColormap) rather than the Pbuffer one.
+ *   - the display opened by the Pbuffer path is closed, because
+ *     start_glx3_stuffWindowed() opens (and reassigns the global) its own. */
+static int glx3_pbuffer_fallback_to_window(const char *why,int WIDTH,int HEIGHT,int argc,const char **argv)
+{
+    fprintf(stderr,"Pbuffer unavailable (%s) — falling back to an on-screen window.\n",why);
+    glx3_is_pbuffer = 0;
+    if (display) { XCloseDisplay(display); display = 0; }
+    return start_glx3_stuffWindowed(WIDTH,HEIGHT,argc,argv);
+}
+
 int start_glx3_stuff(int WIDTH,int HEIGHT,int viewWindow,int argc,const char **argv)
 {
     if (viewWindow==0)
@@ -440,8 +463,7 @@ int start_glx3_stuff(int WIDTH,int HEIGHT,int viewWindow,int argc,const char **a
         GLXFBConfig* fbConfigs = glXChooseFBConfig( display, DefaultScreen(display), pbuff_visualAttribs, &numberOfFramebufferConfigurations );
         if ( (fbConfigs == NULL) || (numberOfFramebufferConfigurations <= 0) )
         {
-            fatalErrorGLX3("P-Buffers not supported.\n");
-            return 0;
+            return glx3_pbuffer_fallback_to_window("no PBUFFER FBConfig",WIDTH,HEIGHT,argc,argv);
         }
 
         printf( "Found %d matching FB configs.\n", numberOfFramebufferConfigurations );
@@ -460,8 +482,8 @@ int start_glx3_stuff(int WIDTH,int HEIGHT,int viewWindow,int argc,const char **a
         GLXPbuffer pbuffer = glXCreatePbuffer( display,fbConfigs[0], pbufferAttribs );
         if (pbuffer==0)
         {
-            fatalErrorGLX3("glXCreatePbuffer failed..\n");
-            return 0;
+            XFree(fbConfigs);
+            return glx3_pbuffer_fallback_to_window("glXCreatePbuffer failed",WIDTH,HEIGHT,argc,argv);
         }
 
 
