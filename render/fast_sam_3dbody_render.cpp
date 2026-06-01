@@ -5,6 +5,11 @@
 // Usage:
 //   fast_sam_3dbody_render --onnx-dir DIR --gguf pipeline.gguf
 //       --yolo yolo.onnx [--mesh body_mesh.tri] [--from 0|path]
+//       [--export-mesh PREFIX] [--export-mesh-stride N]
+//
+// --export-mesh writes the deformed body mesh per frame as
+//   PREFIX_p<person>_<frame>.obj in the same space/units as the --bvh output, so
+//   the .obj and .bvh overlay 1:1 in Blender (handy for verifying the armature).
 //
 // Controls: close the window to exit.
 
@@ -434,6 +439,51 @@ static void save_framebuffer(const std::string& path, int w, int h) {
     printf("Saved: %s\n", path.c_str());
 }
 
+// ── Export the deformed body mesh to a Wavefront .obj ─────────────────────────
+//
+// MHR metres → BVH centimetres.  Must match bvh_writer.cpp's POS_SCALE so a
+// plain Blender "Import OBJ" overlays 1:1 on a plain "Import BVH" of the
+// matching skeleton.
+static constexpr float MESH_EXPORT_POS_SCALE = 100.0f;
+
+// Writes `m` (the already-LBS-deformed tri_model) in the BVH writer's native
+// space: vertices scaled metres→cm and the camera translation pred_cam_t folded
+// in (the BVH root carries the same pred_cam_t in its POSITION channels), with
+// NO axis flips — the GL view matrix's Y/Z negation is a render-only convention,
+// whereas the BVH is authored in raw MHR model space, so we match the BVH.
+// This lets the mesh and the exported armature be loaded side by side in Blender
+// to verify the skeleton.  Pass cam_t=nullptr to keep the mesh at the model
+// origin instead.
+static void write_obj_mesh(const std::string& path,
+                           const struct TRI_Model* m,
+                           const float* cam_t,
+                           float scale)
+{
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) { fprintf(stderr, "[export] cannot open %s\n", path.c_str()); return; }
+
+    const float tx = cam_t ? cam_t[0] * scale : 0.f;
+    const float ty = cam_t ? cam_t[1] * scale : 0.f;
+    const float tz = cam_t ? cam_t[2] * scale : 0.f;
+
+    // numberOfVertices is a float count (3 per vertex); see the "Mesh loaded"
+    // printout above which divides it by 3.
+    const unsigned int nv = m->header.numberOfVertices;
+    for (unsigned int i = 0; i + 2 < nv; i += 3)
+        fprintf(f, "v %.6f %.6f %.6f\n",
+                m->vertices[i]   * scale + tx,
+                m->vertices[i+1] * scale + ty,
+                m->vertices[i+2] * scale + tz);
+
+    // numberOfIndices is the raw index count (3 per triangle); OBJ is 1-based.
+    const unsigned int ni = m->header.numberOfIndices;
+    for (unsigned int i = 0; i + 2 < ni; i += 3)
+        fprintf(f, "f %u %u %u\n",
+                m->indices[i] + 1, m->indices[i+1] + 1, m->indices[i+2] + 1);
+
+    fclose(f);
+}
+
 // 2nd-order Butterworth is now sourced from src/outputFiltering.h
 // (struct ButterWorth + initButterWorth/filter, plus the wrap-aware
 //  ButterWorthWrap shim that absorbs the unwrap-then-filter trick the
@@ -468,6 +518,8 @@ int main(int argc, const char** argv) {
     std::string src       = "0";
     std::string save_frames_prefix = "";
     int         save_frame_idx     = 0;
+    std::string export_mesh_prefix = "";   // --export-mesh: per-frame .obj dump
+    int         export_mesh_stride = 1;     // --export-mesh-stride: every Nth frame
     std::string bvh_path           = "";
     std::string bvh_template       = "";
     // --headless creates a GLX Pbuffer (offscreen surface) instead of a
@@ -515,7 +567,13 @@ int main(int argc, const char** argv) {
         A1("--frag",        frag_path,          std::string)
         A1("--lbs",         lbs_path,           std::string)
         A1("--save-frames", save_frames_prefix, std::string)
+        A1("--export-mesh", export_mesh_prefix, std::string)
 #undef A1
+        if (!strcmp(argv[i], "--export-mesh-stride") && i+1 < argc) {
+            export_mesh_stride = std::stoi(argv[++i]);
+            if (export_mesh_stride < 1) export_mesh_stride = 1;
+            continue;
+        }
         if (!strcmp(argv[i], "--mesh-color") && i+3 < argc)
             { mesh_color[0]=std::stof(argv[++i]); mesh_color[1]=std::stof(argv[++i]);
               mesh_color[2]=std::stof(argv[++i]); continue; }
@@ -663,6 +721,12 @@ int main(int argc, const char** argv) {
 
     MeshGPU mesh_gpu = upload_mesh_once(tri_model);
 
+    if (!export_mesh_prefix.empty())
+        printf("[export] writing deformed mesh to %s_p<person>_<frame>.obj "
+               "(every %d frame%s, cm + pred_cam_t — matches --bvh space)\n",
+               export_mesh_prefix.c_str(), export_mesh_stride,
+               export_mesh_stride == 1 ? "" : "s");
+
     // ── Load LBS data ─────────────────────────────────────────────────────────
     if (lbs_path.empty()) lbs_path = onnx_dir + "/body_model.lbs";
     struct MHR_LBS_Data* lbs = mhr_lbs_load(lbs_path.c_str());
@@ -756,6 +820,9 @@ int main(int argc, const char** argv) {
 #define NS_NOW() ({ struct timespec _t; clock_gettime(CLOCK_MONOTONIC,&_t); (long long)_t.tv_sec*1000000000LL + _t.tv_nsec; })
     long long t_last_frame = NS_NOW();
     double    fps_ema      = 0.0;
+    // 0-based processed-frame counter, kept in lockstep with the BVH writer's
+    // per-frame index so an exported PREFIX_pP_FFFFF.obj matches BVH frame F.
+    int       frame_index  = 0;
 
     cv::Mat frame;
     while (glx3_checkEvents()) 
@@ -870,7 +937,9 @@ int main(int argc, const char** argv) {
         glBindTexture(GL_TEXTURE_2D, bg.id);
         glUniform1i(scene_loc, 1);
 
+        int person_idx = -1;
         for (const auto& r : results) {
+            ++person_idx;   // counts every detection, so .obj indices are stable
             if (!lbs) continue;
 
             // Mesh tint — uniform for the whole body.  Constant for now; this
@@ -915,6 +984,18 @@ int main(int argc, const char** argv) {
                             lbs_out.data(),
                             nullptr);
             mhr_update_mesh_vertices(tri_model, lbs_out.data());
+
+            // Export the deformed mesh (Blender-importable) for offline checking
+            // of the BVH armature.  Same space/units the BVH writer uses, so the
+            // .obj and the .bvh overlay 1:1.  Frame index matches BVH frame F.
+            if (!export_mesh_prefix.empty() &&
+                (frame_index % export_mesh_stride) == 0) {
+                char opath[4096];
+                snprintf(opath, sizeof(opath), "%s_p%d_%05d.obj",
+                         export_mesh_prefix.c_str(), person_idx, frame_index);
+                write_obj_mesh(opath, tri_model, r.pred_cam_t.data(),
+                               MESH_EXPORT_POS_SCALE);
+            }
 
             // First-frame verts dump for verify_transforms.py LBS comparison
             { static int verts_dumped = 0;
@@ -1039,6 +1120,8 @@ int main(int argc, const char** argv) {
                   fps_ema, latency_ms, (int)results.size());
           fflush(stderr);
         }
+
+        ++frame_index;   // lockstep with bvh_writer's session frame counter
 
         if (is_image) break;   // keep window open only for live sources
     }
