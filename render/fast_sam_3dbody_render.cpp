@@ -8,8 +8,9 @@
 //       [--export-mesh PREFIX] [--export-mesh-stride N]
 //
 // --export-mesh writes the deformed body mesh per frame as
-//   PREFIX_p<person>_<frame>.obj in the same space/units as the --bvh output, so
-//   the .obj and .bvh overlay 1:1 in Blender (handy for verifying the armature).
+//   PREFIX_p<person>_<frame>.obj in world Y-up space with the pelvis at the BVH
+//   root position, so the .obj and .bvh overlay 1:1 in Blender for armature
+//   verification (import both with default axis settings, no rotation needed).
 //
 // Controls: close the window to exit.
 
@@ -446,34 +447,47 @@ static void save_framebuffer(const std::string& path, int w, int h) {
 // matching skeleton.
 static constexpr float MESH_EXPORT_POS_SCALE = 100.0f;
 
-// Writes `m` (the already-LBS-deformed tri_model) in the BVH writer's native
-// space: vertices scaled metres→cm and the camera translation pred_cam_t folded
-// in (the BVH root carries the same pred_cam_t in its POSITION channels), with
-// NO axis flips — the GL view matrix's Y/Z negation is a render-only convention,
-// whereas the BVH is authored in raw MHR model space, so we match the BVH.
-// This lets the mesh and the exported armature be loaded side by side in Blender
-// to verify the skeleton.  Pass cam_t=nullptr to keep the mesh at the model
-// origin instead.
+// Writes `m` (already-LBS-deformed) in the same world space as the BVH export.
+//
+// Coordinate mapping (must match bvh_writer.cpp):
+//   The MHR LBS model has a "body_world" root (joint 0) at the model origin,
+//   with the anatomical pelvis (joint 1, MHR "root") 92.4 cm above it in model
+//   Y-up space.  The BVH writer places the BVH hip at pred_cam_t, which is the
+//   world-space position of the pelvis, NOT body_world.
+//
+//   LBS vertices are in metres with Y and Z negated (camera Y-down convention).
+//   To match BVH world space (Y-up):
+//     OBJ_X =  (v.x − pelvis.x) × scale + cam_t[0] × scale
+//     OBJ_Y = −(v.y − pelvis.y) × scale + cam_t[1] × scale   ← flip Y to world-up
+//     OBJ_Z = −(v.z − pelvis.z) × scale + cam_t[2] × scale   ← flip Z same
+//
+//   Result: pelvis vertex lands exactly at pred_cam_t × scale (= BVH root).
+//   Negating Y and Z together keeps det = +1, so face winding is preserved.
+//
+// pelvis_lbs: joint[1] from mhr_lbs_compute out_joints (metres, Y/Z flipped).
+//             Pass nullptr to skip the pelvis-centering step (legacy behaviour).
 static void write_obj_mesh(const std::string& path,
                            const struct TRI_Model* m,
                            const float* cam_t,
+                           const float* pelvis_lbs,
                            float scale)
 {
     FILE* f = fopen(path.c_str(), "wb");
     if (!f) { fprintf(stderr, "[export] cannot open %s\n", path.c_str()); return; }
 
+    const float px = pelvis_lbs ? pelvis_lbs[0] : 0.f;
+    const float py = pelvis_lbs ? pelvis_lbs[1] : 0.f;
+    const float pz = pelvis_lbs ? pelvis_lbs[2] : 0.f;
     const float tx = cam_t ? cam_t[0] * scale : 0.f;
     const float ty = cam_t ? cam_t[1] * scale : 0.f;
     const float tz = cam_t ? cam_t[2] * scale : 0.f;
 
-    // numberOfVertices is a float count (3 per vertex); see the "Mesh loaded"
-    // printout above which divides it by 3.
     const unsigned int nv = m->header.numberOfVertices;
     for (unsigned int i = 0; i + 2 < nv; i += 3)
         fprintf(f, "v %.6f %.6f %.6f\n",
-                m->vertices[i]   * scale + tx,
-                m->vertices[i+1] * scale + ty,
-                m->vertices[i+2] * scale + tz);
+                 (m->vertices[i]   - px) * scale + tx,
+                -(m->vertices[i+1] - py) * scale + ty,
+                -(m->vertices[i+2] - pz) * scale + tz);
 
     // numberOfIndices is the raw index count (3 per triangle); OBJ is 1-based.
     const unsigned int ni = m->header.numberOfIndices;
@@ -723,7 +737,7 @@ int main(int argc, const char** argv) {
 
     if (!export_mesh_prefix.empty())
         printf("[export] writing deformed mesh to %s_p<person>_<frame>.obj "
-               "(every %d frame%s, cm + pred_cam_t — matches --bvh space)\n",
+               "(every %d frame%s, world Y-up cm, pelvis at BVH root — overlay 1:1 in Blender)\n",
                export_mesh_prefix.c_str(), export_mesh_stride,
                export_mesh_stride == 1 ? "" : "s");
 
@@ -739,6 +753,7 @@ int main(int argc, const char** argv) {
             printf("[LBS] correctives.bin not found — rendering without pose correctives\n");
     }
     std::vector<float> lbs_out(MHR_VERTEX_FLOATS, 0.f);
+    std::vector<float> lbs_joints;   // joint world positions from LBS FK (allocated on first use)
 
     // ── Source FPS (used by both BVH writer and Butterworth init) ────────────
     float video_fps = 30.f;
@@ -975,25 +990,33 @@ int main(int argc, const char** argv) {
                         mp[136 + i] += r.scale[k] * lbs->scale_comps[k * ns + i];
             }
 
-            // Run native C LBS forward pass, stream result to GPU
+            // Run native C LBS forward pass, stream result to GPU.
+            // Always compute joint positions (127×3 floats) — negligible overhead
+            // compared to vertex skinning, and needed for the OBJ export to place
+            // the mesh at the correct world position (pelvis-centred, matching BVH).
             static const float zero_face_buf[72] = {};
+            if (lbs_joints.empty())
+                lbs_joints.assign((size_t)lbs->n_joints * 3, 0.f);
             mhr_lbs_compute(lbs,
                             mp.data(),
                             r.shape.data(),
                             zero_face ? zero_face_buf : r.face_params.data(),
                             lbs_out.data(),
-                            nullptr);
+                            lbs_joints.data());
             mhr_update_mesh_vertices(tri_model, lbs_out.data());
 
             // Export the deformed mesh (Blender-importable) for offline checking
             // of the BVH armature.  Same space/units the BVH writer uses, so the
             // .obj and the .bvh overlay 1:1.  Frame index matches BVH frame F.
+            // Joint[1] = MHR "root" = anatomical pelvis — used to centre the OBJ
+            // on the pelvis so it matches the BVH root position exactly.
             if (!export_mesh_prefix.empty() &&
                 (frame_index % export_mesh_stride) == 0) {
                 char opath[4096];
                 snprintf(opath, sizeof(opath), "%s_p%d_%05d.obj",
                          export_mesh_prefix.c_str(), person_idx, frame_index);
                 write_obj_mesh(opath, tri_model, r.pred_cam_t.data(),
+                               lbs_joints.data() + 3,   // joint[1] = pelvis LBS position
                                MESH_EXPORT_POS_SCALE);
             }
 
