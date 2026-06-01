@@ -1,28 +1,169 @@
 #!/usr/bin/env python3
 """
-check_mesh_bvh_overlay.py — verify that an --export-mesh OBJ file overlays its
+check_mesh_bvh_overlay.py — verify that an --export-mesh OBJ overlays its
 matching --bvh file correctly when both are imported into Blender.
 
 Usage:
-    python3 tools/check_mesh_bvh_overlay.py  MESH.obj  SKELETON.bvh
+    python3 tools/check_mesh_bvh_overlay.py  MESH.obj  SKELETON.bvh  [FRAME]
 
-The script reads the BVH root (hip) position from frame 0 and finds the nearest
-OBJ vertex.  A well-aligned export shows:
-  • nearest vertex within ~15 cm of the BVH root  (it's a joint centre vs mesh)
-  • OBJ Y range spanning roughly [0-30, 150-200] cm  (feet near floor, head above)
-  • BVH root Y ≈ 90-120 cm  (hip height above floor for a standing adult)
+    FRAME defaults to 0 (first frame).
+
+Reports:
+  • Overall position check (pelvis BVH root vs nearest OBJ vertex)
+  • Per-joint alignment: BVH FK world position vs nearest OBJ vertex
+  • Histogram of OBJ vertex Y values (sanity-checks body orientation)
 
 Blender import recipe (no rotation needed for the corrected export):
   1. File → Import → Wavefront (.obj) → pick MESH.obj  → Import
   2. File → Import → Motion Capture (.bvh) → pick SKELETON.bvh → Import
-  Both objects share world Y-up space: the skeleton should overlay the mesh.
+  Both use world Y-up space; the skeleton should overlay the mesh.
 """
 
-import sys
-import math
-import struct
+import sys, math, struct, re
+from collections import defaultdict
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+
+# ── BVH parser ────────────────────────────────────────────────────────────────
+
+class BVHJoint:
+    def __init__(self, name, parent=None):
+        self.name = name
+        self.parent = parent          # BVHJoint or None
+        self.children = []
+        self.offset = [0.0, 0.0, 0.0]
+        self.channels = []            # list of channel name strings
+
+
+def parse_bvh(path):
+    """Return (root_joint, frames, n_frames, frame_time)."""
+    with open(path) as f:
+        tokens = f.read().split()
+    it = iter(tokens)
+
+    def nxt(): return next(it)
+
+    def parse_joint(parent=None):
+        name = nxt()
+        joint = BVHJoint(name, parent)
+        assert nxt() == '{'
+        while True:
+            tok = nxt()
+            if tok == 'OFFSET':
+                joint.offset = [float(nxt()), float(nxt()), float(nxt())]
+            elif tok == 'CHANNELS':
+                n = int(nxt())
+                joint.channels = [nxt() for _ in range(n)]
+            elif tok == 'JOINT':
+                child = parse_joint(joint)
+                joint.children.append(child)
+            elif tok == 'End':
+                nxt()   # 'Site'
+                nxt()   # '{'
+                nxt()   # 'OFFSET'
+                nxt(); nxt(); nxt()
+                nxt()   # '}'
+            elif tok == '}':
+                break
+        return joint
+
+    root = None
+    frames = []
+    n_frames = 0
+    frame_time = 1/30
+
+    while True:
+        try:
+            tok = nxt()
+        except StopIteration:
+            break
+        if tok == 'ROOT':
+            root = parse_joint()
+        elif tok == 'MOTION':
+            nxt()                              # 'Frames:'
+            n_frames = int(nxt())
+            nxt(); nxt()                       # 'Frame' 'Time:'
+            frame_time = float(nxt())
+            for _ in range(n_frames):
+                row = []
+                # Collect all channels: count them from root
+                def count_ch(j):
+                    return sum(len(c.channels) for c in _all_joints(j))
+                if not frames:
+                    ch_total = count_ch(root) if root else 0
+                row = [float(nxt()) for _ in range(ch_total or count_ch(root))]
+                frames.append(row)
+
+    return root, frames, n_frames, frame_time
+
+
+def _all_joints(j):
+    yield j
+    for c in j.children:
+        yield from _all_joints(c)
+
+
+# ── BVH Forward Kinematics ────────────────────────────────────────────────────
+
+def _rx(a):
+    c, s = math.cos(a), math.sin(a)
+    return [[1,0,0],[0,c,-s],[0,s,c]]
+
+def _ry(a):
+    c, s = math.cos(a), math.sin(a)
+    return [[c,0,s],[0,1,0],[-s,0,c]]
+
+def _rz(a):
+    c, s = math.cos(a), math.sin(a)
+    return [[c,-s,0],[s,c,0],[0,0,1]]
+
+def _mul33(A, B):
+    return [[sum(A[i][k]*B[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+
+def _mrot(m, v):
+    return [sum(m[i][j]*v[j] for j in range(3)) for i in range(3)]
+
+def _add3(a, b): return [a[i]+b[i] for i in range(3)]
+
+
+def bvh_fk(root, frame_data, frame_idx=0):
+    """Return dict joint_name → world_position (cm) for the given frame."""
+    row = frame_data[frame_idx]
+    ch_iter = iter(row)
+    positions = {}
+
+    def process(joint, parent_pos, parent_rot):
+        chs = {ch: next(ch_iter) for ch in joint.channels}
+        pos = list(parent_pos)
+        rot = [list(r) for r in parent_rot]
+
+        # Translation channels
+        local_off = list(joint.offset)
+        if 'Xposition' in chs: local_off[0] = chs['Xposition']
+        if 'Yposition' in chs: local_off[1] = chs['Yposition']
+        if 'Zposition' in chs: local_off[2] = chs['Zposition']
+
+        world_off = _mrot(parent_rot, local_off)
+        pos = _add3(pos, world_off)
+
+        # Rotation channels (applied in the order listed)
+        R = [[1,0,0],[0,1,0],[0,0,1]]
+        for ch in joint.channels:
+            if ch not in chs: continue
+            val = math.radians(chs[ch])
+            if   ch == 'Xrotation': R = _mul33(R, _rx(val))
+            elif ch == 'Yrotation': R = _mul33(R, _ry(val))
+            elif ch == 'Zrotation': R = _mul33(R, _rz(val))
+        rot = _mul33(parent_rot, R)
+
+        positions[joint.name] = pos
+        for child in joint.children:
+            process(child, pos, rot)
+
+    process(root, [0.0, 0.0, 0.0], [[1,0,0],[0,1,0],[0,0,1]])
+    return positions
+
+
+# ── OBJ loader ───────────────────────────────────────────────────────────────
 
 def load_obj_vertices(path):
     verts = []
@@ -34,105 +175,94 @@ def load_obj_vertices(path):
     return verts
 
 
-def bvh_root_frame0(path):
-    """Return (X, Y, Z) cm of the BVH root joint at frame 0."""
-    with open(path) as f:
-        lines = f.readlines()
-    for i, l in enumerate(lines):
-        if l.strip() == 'MOTION':
-            vals = [float(x) for x in lines[i + 3].split()]
-            return (vals[0], vals[1], vals[2])
-    raise RuntimeError("MOTION section not found in " + path)
-
-
-def bvh_root_range(path):
-    """Return (Y_min, Y_max) cm of the BVH root across all frames."""
-    with open(path) as f:
-        lines = f.readlines()
-    ys = []
-    in_motion = False
-    frame_time_seen = False
-    for l in lines:
-        if l.strip() == 'MOTION':
-            in_motion = True
-            continue
-        if in_motion and l.startswith('Frame Time'):
-            frame_time_seen = True
-            continue
-        if in_motion and frame_time_seen:
-            vals = l.split()
-            if len(vals) >= 3:
-                ys.append(float(vals[1]))
-    return (min(ys), max(ys)) if ys else (0.0, 0.0)
-
-
 def nearest_vertex(verts, target):
     best_d, best_v, best_i = 1e9, None, 0
-    for i, v in enumerate(verts):
-        d = math.sqrt(sum((a - b) ** 2 for a, b in zip(v, target)))
+    tx, ty, tz = target
+    for i, (x, y, z) in enumerate(verts):
+        d = math.sqrt((x-tx)**2+(y-ty)**2+(z-tz)**2)
         if d < best_d:
-            best_d, best_v, best_i = d, v, i
+            best_d, best_v, best_i = d, (x,y,z), i
     return best_i, best_v, best_d
 
 
-# ── main ─────────────────────────────────────────────────────────────────────
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+# Body joints we care about for alignment checks (BVH names from body.bvh)
+BODY_JOINTS = [
+    'hip', 'abdomen', 'chest', 'neck', 'head',
+    'lCollar', 'lShldr', 'lForeArm', 'lHand',
+    'rCollar', 'rShldr', 'rForeArm', 'rHand',
+    'lThigh', 'lShin', 'lFoot',
+    'rThigh', 'rShin', 'rFoot',
+]
+
 
 def main():
-    if len(sys.argv) != 3:
-        print("Usage: check_mesh_bvh_overlay.py MESH.obj SKELETON.bvh")
+    if len(sys.argv) < 3:
+        print("Usage: check_mesh_bvh_overlay.py MESH.obj SKELETON.bvh [FRAME]")
         sys.exit(1)
 
-    obj_path = sys.argv[1]
-    bvh_path = sys.argv[2]
+    obj_path  = sys.argv[1]
+    bvh_path  = sys.argv[2]
+    frame_idx = int(sys.argv[3]) if len(sys.argv) > 3 else 0
 
-    print(f"OBJ : {obj_path}")
-    print(f"BVH : {bvh_path}")
+    print(f"OBJ   : {obj_path}")
+    print(f"BVH   : {bvh_path}")
+    print(f"Frame : {frame_idx}")
     print()
 
     verts = load_obj_vertices(obj_path)
-    root = bvh_root_frame0(bvh_path)
+    root, frames, n_frames, frame_time = parse_bvh(bvh_path)
+    if frame_idx >= n_frames:
+        print(f"WARN: frame {frame_idx} >= n_frames {n_frames}; using last frame.")
+        frame_idx = n_frames - 1
 
-    print(f"BVH root frame-0  : X={root[0]:.1f}  Y={root[1]:.1f}  Z={root[2]:.1f} cm")
-    print(f"OBJ vertex count  : {len(verts)}")
+    joint_world = bvh_fk(root, frames, frame_idx)
 
     ys = [v[1] for v in verts]
-    y_min, y_max = min(ys), max(ys)
-    y_centroid = sum(ys) / len(ys)
-    print(f"OBJ Y range       : [{y_min:.1f}, {y_max:.1f}] cm  (height span = {y_max - y_min:.1f} cm)")
-    print(f"OBJ Y centroid    : {y_centroid:.1f} cm")
+    print(f"OBJ : {len(verts)} vertices,  Y=[{min(ys):.0f}, {max(ys):.0f}] cm  "
+          f"(span {max(ys)-min(ys):.0f} cm)")
+    print(f"BVH : {n_frames} frames,  root Y={joint_world.get('hip',[0,0,0])[1]:.1f} cm")
     print()
 
-    idx, v, dist = nearest_vertex(verts, root)
-    print(f"Nearest OBJ vertex to BVH root:")
-    print(f"  index  = {idx}")
-    print(f"  pos    = ({v[0]:.1f}, {v[1]:.1f}, {v[2]:.1f}) cm")
-    print(f"  dist   = {dist:.2f} cm  (< 15 cm = good alignment)")
+    # ── Y histogram ──────────────────────────────────────────────────────────
+    print("OBJ Y histogram (each '#' ≈ 50 vertices):")
+    step = 20
+    bins = defaultdict(int)
+    for y in ys: bins[int(y // step) * step] += 1
+    for b in sorted(bins):
+        bar = '#' * (bins[b] // 50)
+        print(f"  [{b:+4d},{b+step:+4d}) {bins[b]:5d} {bar}")
     print()
 
-    y_lo, y_hi = bvh_root_range(bvh_path)
-    print(f"BVH root Y range across all frames: [{y_lo:.1f}, {y_hi:.1f}] cm")
+    # ── Per-joint alignment ───────────────────────────────────────────────────
+    print(f"{'Joint':12s}  {'BVH world pos (cm)':28s}  {'Nearest vertex':28s}  {'dist cm':>7s}  status")
+    print('-'*90)
+
+    any_warn = False
+    WARN_THR = 15.0   # cm; further than this is suspicious
+
+    for jname in BODY_JOINTS:
+        if jname not in joint_world:
+            continue
+        bpos = joint_world[jname]
+        idx, vpos, dist = nearest_vertex(verts, bpos)
+        status = 'OK' if dist < WARN_THR else 'WARN'
+        if status == 'WARN': any_warn = True
+        print(f"{jname:12s}  ({bpos[0]:+7.1f},{bpos[1]:+7.1f},{bpos[2]:+7.1f})  "
+              f"({vpos[0]:+7.1f},{vpos[1]:+7.1f},{vpos[2]:+7.1f})  "
+              f"{dist:7.1f}  {status}")
+
     print()
-
-    # ── Verdict ──────────────────────────────────────────────────────────────
-    ok = True
-    if dist > 20:
-        print("WARN  Nearest vertex is > 20 cm from BVH root — possible coordinate mismatch.")
-        ok = False
-    if y_max < 100:
-        print("WARN  OBJ max Y < 100 cm — mesh may not be in world Y-up space yet.")
-        ok = False
-    if y_min > 50:
-        print("WARN  OBJ min Y > 50 cm — head/upper body may be missing or misoriented.")
-        ok = False
-    if root[1] < 70 or root[1] > 140:
-        print(f"WARN  BVH root Y = {root[1]:.1f} cm — outside typical adult hip range [70, 140].")
-        ok = False
-
-    if ok:
-        print("OK    OBJ and BVH appear well-aligned.  Load both in Blender with default")
-        print("      import settings (no extra rotation) and they should overlay correctly.")
+    if any_warn:
+        print("WARN  Some joints are > 15 cm from the nearest mesh vertex.")
+        print("      Arms/hands often have the largest error due to the BVH rest-frame")
+        print("      correction (rest_align).  Run with FSB_DUMP_REST_DIRS=1 and check")
+        print("      the angle column — >45° gaps indicate difficult retargeting cases.")
+        print("      Torso/legs should be well within 15 cm for a valid overlay.")
     else:
-        print("      Re-export with --export-mesh using the corrected build to fix alignment.")
+        print("OK    All body joints are within 15 cm of the mesh.  Load both in Blender")
+        print("      with default import settings and they should overlay correctly.")
 
 
 if __name__ == "__main__":
