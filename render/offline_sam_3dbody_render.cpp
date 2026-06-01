@@ -151,6 +151,8 @@ static void print_usage(const char* prog)
         "  --no-bvh-body-shape-change Keep template body bone lengths\n"
         "  --no-bvh-hand-shape-change Keep template hand/finger bone lengths\n"
         "  --bvh-raw-fingers          Do not rescale finger End-Site OFFSETs\n"
+        "  --no-enforce-hand-limits   Disable the default finger-angle anatomical clamp\n"
+        "  --no-sticky-hand-pose      Disable the default 'inherit previous frame's hand pose'\n"
         "  --help / -h                This message\n",
         prog);
 }

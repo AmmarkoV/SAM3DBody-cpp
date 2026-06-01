@@ -113,6 +113,8 @@ static void print_usage(const char* prog)
     printf("  --no-bvh-body-shape-change  Keep the template's authored body bone lengths (no median rewrite)\n");
     printf("  --no-bvh-hand-shape-change  Keep the template's authored hand/finger bone lengths\n");
     printf("  --bvh-raw-fingers           Do NOT rescale finger End-Site OFFSETs to MHR fingertip lengths\n");
+    printf("  --no-enforce-hand-limits    Disable the default finger-angle anatomical clamp\n");
+    printf("  --no-sticky-hand-pose       Disable the default 'inherit previous frame's hand pose'\n");
     printf("  --headless        Do not open display windows\n");
     printf("  --info            Print pipeline info and exit\n");
     printf("  --butterworth              Apply Butterworth low-pass filter to MHR output vectors\n");
