@@ -678,6 +678,7 @@ bool BVHWriter::open(const std::string& template_path,
     q_local_.assign((size_t)nj * 4, 0.f);
     q_global_mhr_.assign((size_t)nj * 4, 0.f);
     t_global_mhr_.assign((size_t)nj * 3, 0.f);
+    s_global_mhr_.assign((size_t)nj, 1.f);
 
     tracks_.clear();
     people_.clear();
@@ -699,12 +700,31 @@ void BVHWriter::compute_per_frame_mhr_state(const fsb::MHRResult& r)
     const float* pre = lbs_->joint_prerotations;
     const int*  parents = lbs_->joint_parents;
 
+    // Decode the scale PCA into model_params[136:204], matching the mesh path
+    // (the render loop re-decodes scale before calling mhr_lbs_compute).  The
+    // pipeline runs with skip_body_model=true, so its lbs_data is null and
+    // r.mhr_model_params[136:204] is left ZERO — without this decode the writer's
+    // FK has scale=1 while the mesh has real per-joint scale, so the writer's bone
+    // lengths (→ the median OFFSET rewrite) disagree with the deformed mesh.  This
+    // was the residual foot error (l_lowleg→l_foot 44.6 cm writer vs 38 cm mesh).
+    std::array<float,204> params = r.mhr_model_params;
+    if (lbs_->scale_mean && lbs_->scale_comps && !r.scale.empty())
+    {
+        const int ns = lbs_->n_scale_out;   // 68
+        const int np = lbs_->n_scale_pc;    // 28
+        for (int j = 0; j < ns && 136 + j < 204; ++j)
+            params[136 + j] = lbs_->scale_mean[j];
+        for (int k = 0; k < np && k < (int)r.scale.size(); ++k)
+            for (int j = 0; j < ns && 136 + j < 204; ++j)
+                params[136 + j] += r.scale[k] * lbs_->scale_comps[k * ns + j];
+    }
+
     const int take = std::min(npc, 204);
     for (int row = 0; row < nj * 7; ++row)
     {
         const float* prow = PT + (size_t)row * npc;
         float acc = 0.f;
-        for (int k = 0; k < take; ++k) acc += prow[k] * r.mhr_model_params[k];
+        for (int k = 0; k < take; ++k) acc += prow[k] * params[k];
         joint_params_[row] = acc;
     }
 
@@ -717,12 +737,19 @@ void BVHWriter::compute_per_frame_mhr_state(const fsb::MHRResult& r)
 
         int p = parents[j];
         const float* off = lbs_->joint_offsets + j*3;
+        // Per-joint local scale = exp2(log2_scale).  mhr_lbs_compute scales each
+        // child offset by the PARENT's accumulated global scale; the BVH writer
+        // used to ignore this, so its FK bone lengths (→ the median offset rewrite)
+        // disagreed with the actual deformed-mesh skeleton (notably the foot chain,
+        // ~7 cm).  Apply the same scaling here so bone_samples match the mesh.
+        float s_local = exp2f(jp[6]);
         if (p < 0)
         {
             memcpy(&q_global_mhr_[j*4], &q_local_[j*4], 4*sizeof(float));
             t_global_mhr_[j*3+0] = off[0] + jp[0];
             t_global_mhr_[j*3+1] = off[1] + jp[1];
             t_global_mhr_[j*3+2] = off[2] + jp[2];
+            s_global_mhr_[j]     = s_local;
         }
         else
         {
@@ -730,9 +757,11 @@ void BVHWriter::compute_per_frame_mhr_state(const fsb::MHRResult& r)
             float local_off[3] = { off[0] + jp[0], off[1] + jp[1], off[2] + jp[2] };
             float rt[3];
             qrot(rt, &q_global_mhr_[p*4], local_off);
-            t_global_mhr_[j*3+0] = t_global_mhr_[p*3+0] + rt[0];
-            t_global_mhr_[j*3+1] = t_global_mhr_[p*3+1] + rt[1];
-            t_global_mhr_[j*3+2] = t_global_mhr_[p*3+2] + rt[2];
+            const float sp = s_global_mhr_[p];
+            t_global_mhr_[j*3+0] = t_global_mhr_[p*3+0] + sp * rt[0];
+            t_global_mhr_[j*3+1] = t_global_mhr_[p*3+1] + sp * rt[1];
+            t_global_mhr_[j*3+2] = t_global_mhr_[p*3+2] + sp * rt[2];
+            s_global_mhr_[j]     = sp * s_local;
         }
     }
 }

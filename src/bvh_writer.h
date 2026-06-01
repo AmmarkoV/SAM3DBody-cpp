@@ -171,6 +171,7 @@ private:
     std::vector<float> q_local_;
     std::vector<float> q_global_mhr_;
     std::vector<float> t_global_mhr_;
+    std::vector<float> s_global_mhr_;   // per-joint accumulated scale (matches mhr_lbs_compute)
     std::vector<float> q_global_mhr_rest_;
 
     // Helpers
