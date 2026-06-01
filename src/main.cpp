@@ -570,6 +570,10 @@ int main(int argc, char** argv)
         if (c.cap_w > 0) cap.set(cv::CAP_PROP_FRAME_WIDTH,  c.cap_w);
         if (c.cap_h > 0) cap.set(cv::CAP_PROP_FRAME_HEIGHT, c.cap_h);
         if (c.cap_fps > 0.0) cap.set(cv::CAP_PROP_FPS,      c.cap_fps);
+        if (c.start_frame > 0) {
+            cap.set(cv::CAP_PROP_POS_FRAMES, (double)c.start_frame);
+            printf("[start] seeking to frame %d\n", c.start_frame);
+        }
     }
 
     // Query the camera's native framerate for frame-sync logic.

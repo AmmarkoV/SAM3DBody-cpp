@@ -558,6 +558,7 @@ int main(int argc, const char** argv) {
     bool        filter_root_rot   = false;  // enabled by --butterworth-root-rotation
     float       rot_clamp_deg     = 1.0f;   // rejection threshold in degrees/frame
     int         max_frames        = -1;     // --frames N: stop after N frames
+    int         start_frame       = 0;      // --start N: seek to frame N first
     int  cuda_device  = 0;
     bool use_trt      = false;
     bool fp16         = true;
@@ -638,6 +639,7 @@ int main(int argc, const char** argv) {
     bw_cutoff                      = cc.bw_cutoff;
     rot_clamp_deg                  = cc.rot_clamp_deg;
     max_frames                     = cc.max_frames;
+    start_frame                    = cc.start_frame;
 
     // ── Pipeline ─────────────────────────────────────────────────────────────
     fsb::Pipeline pipeline;
@@ -677,6 +679,10 @@ int main(int argc, const char** argv) {
             if (cap_w > 0) cap.set(cv::CAP_PROP_FRAME_WIDTH,  cap_w);
             if (cap_h > 0) cap.set(cv::CAP_PROP_FRAME_HEIGHT, cap_h);
             if (cap_fps > 0.0) cap.set(cv::CAP_PROP_FPS,      cap_fps);
+            if (start_frame > 0) {
+                cap.set(cv::CAP_PROP_POS_FRAMES, (double)start_frame);
+                printf("[start] seeking to frame %d\n", start_frame);
+            }
         }
     }
 
@@ -837,9 +843,11 @@ int main(int argc, const char** argv) {
 #define NS_NOW() ({ struct timespec _t; clock_gettime(CLOCK_MONOTONIC,&_t); (long long)_t.tv_sec*1000000000LL + _t.tv_nsec; })
     long long t_last_frame = NS_NOW();
     double    fps_ema      = 0.0;
-    // 0-based processed-frame counter, kept in lockstep with the BVH writer's
-    // per-frame index so an exported PREFIX_pP_FFFFF.obj matches BVH frame F.
-    int       frame_index  = 0;
+    // Frame counter for the exported OBJ filenames.  Starts at start_frame so the
+    // .obj name reflects the absolute video frame when seeking with --start (the
+    // BVH keeps its own 0-based session timeline).  --frames counts from here.
+    int       frame_index  = start_frame;
+    const int frame_stop   = (max_frames > 0) ? start_frame + max_frames : -1;
 
     cv::Mat frame;
     while (glx3_checkEvents()) 
@@ -1148,7 +1156,7 @@ int main(int argc, const char** argv) {
 
         ++frame_index;   // lockstep with bvh_writer's session frame counter
 
-        if (max_frames > 0 && frame_index >= max_frames) break;
+        if (frame_stop > 0 && frame_index >= frame_stop) break;
         if (is_image) break;   // keep window open only for live sources
     }
 

@@ -256,34 +256,60 @@ def main():
     #   bvhB_dir  = R_globalB(anc) · bvh_rest_dir
     # where R_globalA(anc) = delta(anc_mhr) conjugated-chain, R_globalB(anc)=delta(anc_mhr)·qa⁻¹
 
+    # ── Realizable assignment: ONE world rotation per mapped joint ────────────
+    # A joint controls all its mapped child bones with a single rotation.  For a
+    # single-child joint we can aim that child perfectly (R = delta·qa⁻¹).  For a
+    # multi-child joint (e.g. chest → neck + both clavicles) one rotation cannot
+    # satisfy all; we pick the longest child bone as primary and measure the
+    # honest residual on the others.
+    children_of = {}   # parent_bvh_name → list of (child_jn, child_m, qa, rest_len)
+    for jn, m, ancn, am, qa in slots:
+        rest_len = math.sqrt(sum(c*c for c in vsub(bvh_rest[jn], bvh_rest[ancn])))
+        children_of.setdefault(ancn, []).append((jn, m, qa, rest_len))
+
+    # Targeted, low-risk plan: a joint bakes its child's q_align ONLY when it has
+    # exactly one mapped child (a single-child chain — the arm below the collar,
+    # and the lower leg).  Branch joints (chest→neck+2 clavicles, hip→2 thighs+
+    # spine) stay on the current method, since the overlay already shows their
+    # downstream joint positions are correct.  This is conflict-free and cannot
+    # regress the working torso/legs.
+    C = {}  # parent_bvh_name → qa to bake (identity = keep current method)
+    for ancn, kids in children_of.items():
+        C[ancn] = kids[0][2] if len(kids) == 1 else [0,0,0,1]
+
     print(f"{'bone (BVH)':12s} {'mhr_joint':12s} {'A err°':>7s} {'B err°':>7s}   verdict")
-    print('-'*60)
+    print('-'*62)
     sumA = sumB = 0.0; nA = 0
     for jn, m, ancn, am, qa in slots:
         mhr_dir = vsub(g_t[m], g_t[am])
         bvh_rest_dir = vsub(bvh_rest[jn], bvh_rest[ancn])
 
-        # Method A: BVH parent global orientation = delta(am)  (telescoped),
-        #           then the local of THIS joint is conj-aligned — but the bone dir
-        #           is governed by the parent's global, which under A is delta(am).
+        # Method A (current): parent global telescopes to delta(am); local conj by
+        # q_align of THIS joint, but the bone dir is governed by the parent global.
         RA = delta(am)
         bvhA_dir = qrot(RA, bvh_rest_dir)
 
-        # Method B: parent global = delta(am) · qa⁻¹  → bone points at MHR dir.
-        RB = qmul(delta(am), qconj(qa))
+        # Method B (realizable): parent global = delta(am) · C[parent]⁻¹, where
+        # C[parent] is the parent's single chosen alignment (its primary child).
+        RB = qmul(delta(am), qconj(C[ancn]))
         bvhB_dir = qrot(RB, bvh_rest_dir)
 
         eA = angle_between(mhr_dir, bvhA_dir)
         eB = angle_between(mhr_dir, bvhB_dir)
         sumA += eA; sumB += eB; nA += 1
-        verdict = 'B fixes' if eB + 2 < eA else ('~same' if abs(eA-eB) <= 2 else 'B WORSE')
-        print(f"{jn:12s} {mhr_names()[m]:12s} {eA:7.1f} {eB:7.1f}   {verdict}")
+        nkid = len(children_of[ancn])
+        tag = '' if nkid == 1 else f'(parent has {nkid} kids)'
+        verdict = ('B fixes' if eB + 2 < eA else
+                   ('~same' if abs(eA-eB) <= 2 else 'B WORSE'))
+        print(f"{jn:12s} {mhr_names()[m]:12s} {eA:7.1f} {eB:7.1f}   {verdict:8s}{tag}")
 
-    print('-'*60)
+    print('-'*62)
     print(f"{'MEAN':12s} {'':12s} {sumA/nA:7.1f} {sumB/nA:7.1f}")
     print()
-    print("err° = angle between MHR ground-truth bone direction and the BVH bone")
-    print("direction. Method A ≈ current export; Method B = corrected (q_align on parent).")
+    print("err° = angle between MHR ground-truth bone direction and the BVH bone.")
+    print("A = current export.  B = targeted fix: bake child q_align only on single-child")
+    print("chain joints (arm below collar, lower leg).  Branch joints (chest/hip) unchanged,")
+    print("so torso/leg positions cannot regress.  Collar bone is not addressed (= same as A).")
 
 
 if __name__ == '__main__':

@@ -136,10 +136,17 @@ private:
     std::string        id_prefix_;       // inserted before <id> in filenames
 
     // Rest-frame retarget: per-slot shortest-arc quaternion (MHR rest bone dir
-    // → body.bvh rest bone dir), applied as q_align·R·q_align⁻¹ to re-aim each
-    // joint's rotation onto the template's bone.  Fixes flexion→twist leak when
-    // the template rest pose differs from MHR's (e.g. T-pose vs A-pose arms).
+    // → body.bvh rest bone dir).  q_bone_align_[i] aligns the bone whose CHILD is
+    // slot i (ancestor→i).  Used to re-aim each joint's rotation onto the
+    // template's bone, fixing the flexion→twist / T-pose-vs-A-pose-arm leak.
     std::vector<float> q_bone_align_;    // [slots × 4]; identity where aligned
+    // Per-slot "bake" quaternion = q_bone_align_ of this slot's SINGLE mapped
+    // child (identity when the slot has zero or multiple mapped children).  A
+    // single-child chain joint bakes its child's alignment into its own world
+    // rotation so the child bone points where the MHR bone actually points; this
+    // is what corrects the arm (clavicle→uparm→lowarm→wrist) and lower-leg aim
+    // without disturbing branch joints (chest, hip) — see proto_bvh_arm_retarget.py.
+    std::vector<float> q_slot_bake_;     // [slots × 4]; indexed by bvh_jid
     bool               rest_align_ = true;
     int                total_channels_  = 0;
     float              frame_time_      = 1.0f / 30.0f;

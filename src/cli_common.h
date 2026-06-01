@@ -87,6 +87,7 @@ struct CommonConfig
     // ── Input source ────────────────────────────────────────────────────────
     std::string from;             // file / webcam index / empty = required
     int         max_frames = -1; // --frames N: stop after N frames (-1 = unlimited)
+    int         start_frame = 0; // --start N: skip to frame N before processing
 
     // ── BVH export ──────────────────────────────────────────────────────────
     std::string bvh_path;
@@ -137,6 +138,7 @@ inline bool parse_common_arg(int argc, const char* const* argv, int& i,
     CLI_STR ("--backbone",             backbone_name)
     CLI_STR ("--from",                 from)
     CLI_INT ("--frames",               max_frames)
+    CLI_INT ("--start",                start_frame)
     CLI_INT ("--cuda",                 cuda_device)
     CLI_BOOL("--trt",                  use_trt, true)
     CLI_BOOL("--no-fp16",              fp16,    false)
@@ -209,6 +211,7 @@ inline void print_common_args_help(FILE* fp)
         "  --yolo     PATH                YOLO pose model (.onnx)\n"
         "  --from     PATH                Input source (file path, or webcam index where supported)\n"
         "  --frames   N                   Stop after N frames (useful for quick tests; default unlimited)\n"
+        "  --start    N                   Skip to frame N before processing (seek into the video; default 0)\n"
         "  --cuda     N                   CUDA device (-1 = CPU; default 0)\n"
         "  --trt                          Use ONNX Runtime TensorRT EP\n"
         "  --no-fp16                      Disable FP16\n"

@@ -646,6 +646,32 @@ bool BVHWriter::open(const std::string& template_path,
             }
             if (dump) fprintf(stderr, "\n");
         }
+
+        // ── Per-slot "bake" align (single-child-chain aim correction) ─────────
+        // For each mapped slot, count its mapped child slots (those whose nearest
+        // mapped ancestor is this slot).  If exactly one, bake that child's bone
+        // alignment so this joint aims the child bone at the MHR direction; this
+        // fixes the arm and lower-leg aim.  Branch joints (chest→neck+2 clavicles,
+        // hip→2 thighs+spine) get identity and stay on the existing retarget, so
+        // their (already-correct) downstream positions cannot regress.
+        q_slot_bake_.assign(slots_.size() * 4, 0.f);
+        std::vector<int> n_children(slots_.size(), 0);
+        std::vector<int> only_child(slots_.size(), -1);
+        for (size_t i = 0; i < slots_.size(); ++i)
+        {
+            const BvhSlot& s = slots_[i];
+            if (s.mhr_idx < 0 || s.ancestor_bvh_jid < 0) continue;
+            int a = s.ancestor_bvh_jid;              // slot index == bvh_jid
+            ++n_children[a];
+            only_child[a] = (int)i;
+        }
+        for (size_t i = 0; i < slots_.size(); ++i)
+        {
+            float* b = &q_slot_bake_[i*4];
+            if (rest_align_ && n_children[i] == 1)
+                memcpy(b, &q_bone_align_[only_child[i]*4], 4*sizeof(float));
+            else { b[0]=b[1]=b[2]=0.f; b[3]=1.f; }   // identity
+        }
     }
 
     joint_params_.assign((size_t)nj * 7, 0.f);
@@ -781,17 +807,30 @@ void BVHWriter::append_row_from_state(PerPerson& p, const fsb::MHRResult& r)
             qmul(q_local_bvh, inv_par, q_delta_self);
         }
 
-        // Rest-frame retarget: conjugate by the precomputed shortest-arc
-        // alignment so the joint's swing is aimed at the TEMPLATE's bone, not
-        // MHR's.  No-op where rest directions already match; identity for root.
+        // Rest-frame retarget (single-child-chain aim correction).
+        //
+        // We want each BVH bone to point where the MHR bone actually points
+        // despite the rest-pose difference (body.bvh T-pose vs MHR A-pose arms).
+        // A bone's direction is set by its PARENT's world rotation, so to aim the
+        // bone we bake the bone's rest-alignment into the parent.  Telescoping the
+        // target world rotations W[j]=Δ(m_j)·conj(A[j]) down the chain gives the
+        // local rotation as a pre/post multiply on the plain delta-local:
+        //     q_local = A[ancestor] · q_local · conj(A[self])
+        // where A[x] = q_slot_bake_[x] is the alignment of x's single mapped child
+        // (identity for branch/leaf joints).  This replaces the old self-conjugate
+        // qa·R·qa⁻¹, which only rotated the delta's axis and could not bend the
+        // template's horizontal arm down.  See proto_bvh_arm_retarget.py.
         if (rest_align_)
         {
-            const float* qa = &q_bone_align_[i*4];
-            float qinv[4], tq[4], rq[4];
-            qconj(qinv, qa);
-            qmul(tq, qa, q_local_bvh);
-            qmul(rq, tq, qinv);
-            memcpy(q_local_bvh, rq, 4*sizeof(float));
+            const float* A_self = &q_slot_bake_[i*4];
+            const float  ident[4] = {0,0,0,1};
+            const float* A_par = (s.ancestor_bvh_jid >= 0)
+                               ? &q_slot_bake_[s.ancestor_bvh_jid*4] : ident;
+            float inv_self[4], tmp[4], out[4];
+            qconj(inv_self, A_self);
+            qmul(tmp, q_local_bvh, inv_self);   // q_local · conj(A_self)
+            qmul(out, A_par, tmp);              // A_par · (…)
+            memcpy(q_local_bvh, out, 4*sizeof(float));
         }
 
         float m[9];
