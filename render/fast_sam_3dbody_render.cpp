@@ -573,9 +573,9 @@ int main(int argc, const char** argv) {
     bool        bvh_body_shape_change          = true;
     bool        bvh_hand_shape_change          = true;
     bool        bvh_compensate_finger_endsites = true;
-    bool        bvh_enforce_hand_limits        = false;
+    bool        bvh_enforce_hand_limits        = true;   // default on (overwritten from cc)
     bool        bvh_zero_hand_pose             = false;
-    bool        bvh_sticky_hand_pose           = false;
+    bool        bvh_sticky_hand_pose           = true;   // default on (overwritten from cc)
     bool        bvh_rest_align                 = true;
     bool        bvh_dump_rest_dirs             = false;
     bool        bvh_foot_contact               = false;

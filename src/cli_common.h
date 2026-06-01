@@ -95,9 +95,9 @@ struct CommonConfig
     bool        bvh_body_shape_change          = true;   // --no-bvh-body-shape-change
     bool        bvh_hand_shape_change          = true;   // --no-bvh-hand-shape-change
     bool        bvh_compensate_finger_endsites = true;   // --bvh-raw-fingers
-    bool        bvh_enforce_hand_limits        = false;  // --enforce-hand-limits
+    bool        bvh_enforce_hand_limits        = true;   // default on; --no-enforce-hand-limits
     bool        bvh_zero_hand_pose             = false;  // --zero-hand-pose
-    bool        bvh_sticky_hand_pose           = false;  // --sticky-hand-pose
+    bool        bvh_sticky_hand_pose           = true;   // default on; --no-sticky-hand-pose
     bool        bvh_rest_align                 = true;    // --no-bvh-rest-align
     bool        bvh_dump_rest_dirs             = false;   // --dump-rest-dirs
     bool        bvh_foot_contact               = false;   // --foot-contact
@@ -153,9 +153,13 @@ inline bool parse_common_arg(int argc, const char* const* argv, int& i,
     CLI_BOOL("--no-bvh-body-shape-change", bvh_body_shape_change,          false)
     CLI_BOOL("--no-bvh-hand-shape-change", bvh_hand_shape_change,          false)
     CLI_BOOL("--bvh-raw-fingers",          bvh_compensate_finger_endsites, false)
+    // Hand limits + sticky hand pose are ON by default; keep the positive flags
+    // (now explicit no-ops) for back-compat and add --no-… to disable.
     CLI_BOOL("--enforce-hand-limits",      bvh_enforce_hand_limits,        true)
+    CLI_BOOL("--no-enforce-hand-limits",   bvh_enforce_hand_limits,        false)
     CLI_BOOL("--zero-hand-pose",           bvh_zero_hand_pose,             true)
     CLI_BOOL("--sticky-hand-pose",         bvh_sticky_hand_pose,           true)
+    CLI_BOOL("--no-sticky-hand-pose",      bvh_sticky_hand_pose,           false)
     CLI_BOOL("--no-bvh-rest-align",        bvh_rest_align,                 false)
     CLI_BOOL("--dump-rest-dirs",           bvh_dump_rest_dirs,             true)
     CLI_BOOL("--foot-contact",             bvh_foot_contact,               true)
@@ -223,10 +227,11 @@ inline void print_common_args_help(FILE* fp)
         "  --no-bvh-body-shape-change     Keep template body bone lengths\n"
         "  --no-bvh-hand-shape-change     Keep template hand/finger bone lengths\n"
         "  --bvh-raw-fingers              Do not rescale finger End-Site OFFSETs\n"
-        "  --enforce-hand-limits          Clamp finger joint angles to anatomical limits\n"
-        "                                 (fixes wild splay when hands are not visible)\n"
+        "  --no-enforce-hand-limits       Disable the default clamp of finger joint angles to anatomical\n"
+        "                                 limits (the clamp fixes wild splay when hands are not visible)\n"
         "  --zero-hand-pose               Always write neutral (straight) hand pose\n"
-        "  --sticky-hand-pose             Inherit previous frame's hand pose (neutral on first frame)\n"
+        "  --no-sticky-hand-pose          Disable the default 'inherit previous frame's hand pose when out\n"
+        "                                 of limits' behaviour (neutral on first frame)\n"
         "  --no-bvh-rest-align            Disable rest-frame retarget (re-aiming joint rotations onto the\n"
         "                                 template's bones; on by default — fixes arms under-bending when\n"
         "                                 the template rest pose differs from MHR, e.g. T-pose vs A-pose)\n"

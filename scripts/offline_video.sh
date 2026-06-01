@@ -106,8 +106,8 @@ FIXED_FLAGS=(
     --onnx-dir ./onnx
     --gguf     ./onnx/pipeline.gguf
     --yolo     ./onnx/yolo.onnx
-    --enforce-hand-limits
-    --sticky-hand-pose
+    # --enforce-hand-limits and --sticky-hand-pose are now ON by default;
+    # pass --no-enforce-hand-limits / --no-sticky-hand-pose to disable.
 )
 "$BIN" --from "$FROM_SRC" "${FIXED_FLAGS[@]}" "${OFFLINE_ARGS[@]}"
 OFFLINE_EXIT=$?
