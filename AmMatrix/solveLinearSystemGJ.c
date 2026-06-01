@@ -172,8 +172,13 @@ int makeSureNonZero(double * mat   , unsigned int activeLine , unsigned int tota
 
   //If we are here it means our line has a zero leading element
   unsigned int line=0;
-  fprintf(stderr,"makeSureNonZero : totalLines %u disregarded \n",totalLines);
-  for (line=activeLine+1; line<ElementsNumber; line++)
+  // Search for a pivot among the remaining ROWS (totalLines), not the column
+  // count (ElementsNumber).  The matrix is allocated as totalLines*ElementsNumber
+  // doubles, so iterating up to ElementsNumber (10) when totalLines is smaller
+  // (e.g. 8) read — and swapMatrixLines() then wrote — past the end of the
+  // malloc'd buffer.  totalLines was previously ignored on purpose; it is the
+  // correct bound.
+  for (line=activeLine+1; line<totalLines; line++)
     {
       if ( ( mat[line*ElementsNumber + activeLine] >=  0.0000001 )||
            ( mat[line*ElementsNumber + activeLine] <=  -0.0000001 ) )
@@ -434,7 +439,10 @@ int calculateFundamentalMatrix8Point(double * result3x3Matrix , unsigned int poi
     if (compiledPoints==0) { return 0; }
 
     unsigned int i=0;
-    for (i=0; i< pointsNum; i+=2)
+    // Each iteration fills two rows (i and i+1), so the guard must keep i+1 in
+    // range — for an odd pointsNum, "i < pointsNum" let the last iteration write
+    // row pointsNum, one past the pointsNum*elements allocation.
+    for (i=0; i+1 < pointsNum; i+=2)
     {
       //Shortcut our vars
       pxA = &pointsA[i*2 + 0]; pyA = &pointsA[i*2 + 1];
@@ -493,8 +501,15 @@ void testGJSolver()
 {
   double * F3x3 = alloc3x3Matrix();    if (F3x3 ==0) { return; }
   double * pointsA = (double *) malloc(sizeof(double) * 2 * 8);
-  memset(pointsA , 0 ,sizeof(double) * 2 * 8 );
   double * pointsB = (double *) malloc(sizeof(double) * 2 * 8);
+  if ( (pointsA==0) || (pointsB==0) )
+  {
+    free(pointsA);   // free(NULL) is a no-op
+    free(pointsB);
+    free3x3Matrix(&F3x3);
+    return;
+  }
+  memset(pointsA , 0 ,sizeof(double) * 2 * 8 );
   memset(pointsB , 0 ,sizeof(double) * 2 * 8 );
 
 

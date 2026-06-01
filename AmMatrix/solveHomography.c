@@ -121,8 +121,15 @@ void testHomographySolver()
 {
   double * F3x3 = alloc3x3Matrix();    if (F3x3 ==0) { return; }
   double * pointsA = (double *) malloc(sizeof(double) * 2 * 8);
-  memset(pointsA , 0 ,sizeof(double) * 2 * 8 );
   double * pointsB = (double *) malloc(sizeof(double) * 2 * 8);
+  if ( (pointsA==0) || (pointsB==0) )
+  {
+    free(pointsA);   // free(NULL) is a no-op
+    free(pointsB);
+    free3x3Matrix(&F3x3);
+    return;
+  }
+  memset(pointsA , 0 ,sizeof(double) * 2 * 8 );
   memset(pointsB , 0 ,sizeof(double) * 2 * 8 );
 
 
