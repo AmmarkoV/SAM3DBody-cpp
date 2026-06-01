@@ -751,6 +751,11 @@ int main(int argc, char** argv)
         total_inf_ms += inf_ms;
         ++frame_count;
 
+        if (c.max_frames > 0 && frame_count >= c.max_frames) {
+            printf("[frames] reached limit %d — stopping.\n", c.max_frames);
+            break;
+        }
+
         printf("frame %d  |  %.1f ms  |  %d person(s)\n",
                frame_count, inf_ms, (int)results.size());
         for (int i = 0; i < (int)results.size(); ++i)

@@ -557,6 +557,7 @@ int main(int argc, const char** argv) {
     float       bw_cutoff         = 6.0f;   // Hz; higher = less lag, less smoothing
     bool        filter_root_rot   = false;  // enabled by --butterworth-root-rotation
     float       rot_clamp_deg     = 1.0f;   // rejection threshold in degrees/frame
+    int         max_frames        = -1;     // --frames N: stop after N frames
     int  cuda_device  = 0;
     bool use_trt      = false;
     bool fp16         = true;
@@ -636,6 +637,7 @@ int main(int argc, const char** argv) {
     bvh_foot_contact               = cc.bvh_foot_contact;
     bw_cutoff                      = cc.bw_cutoff;
     rot_clamp_deg                  = cc.rot_clamp_deg;
+    max_frames                     = cc.max_frames;
 
     // ── Pipeline ─────────────────────────────────────────────────────────────
     fsb::Pipeline pipeline;
@@ -1146,6 +1148,7 @@ int main(int argc, const char** argv) {
 
         ++frame_index;   // lockstep with bvh_writer's session frame counter
 
+        if (max_frames > 0 && frame_index >= max_frames) break;
         if (is_image) break;   // keep window open only for live sources
     }
 
