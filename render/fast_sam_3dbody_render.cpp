@@ -585,6 +585,7 @@ int main(int argc, const char** argv) {
     float       rot_clamp_deg     = 1.0f;   // rejection threshold in degrees/frame
     int         max_frames        = -1;     // --frames N: stop after N frames
     int         start_frame       = 0;      // --start N: seek to frame N first
+    int         max_persons       = 0;      // --max-persons N: 0 = unlimited
     int  cuda_device  = 0;
     bool use_trt      = false;
     bool fp16         = true;
@@ -666,6 +667,7 @@ int main(int argc, const char** argv) {
     rot_clamp_deg                  = cc.rot_clamp_deg;
     max_frames                     = cc.max_frames;
     start_frame                    = cc.start_frame;
+    max_persons                    = cc.max_persons;
 
     // ── Pipeline ─────────────────────────────────────────────────────────────
     fsb::Pipeline pipeline;
@@ -677,6 +679,7 @@ int main(int argc, const char** argv) {
         cfg.cuda_device     = cuda_device;
         cfg.use_trt_ep      = use_trt;
         cfg.use_fp16        = fp16;
+        cfg.max_persons     = max_persons;
         cfg.skip_body_model = true;    // LBS runs natively in C; skip body_model.onnx
         if (!pipeline.load(cfg)) {
             fprintf(stderr, "Failed to load pipeline\n"); return 1;

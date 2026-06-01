@@ -105,6 +105,7 @@ static void print_usage(const char* prog)
         "  --no-fp16                  Disable FP16\n"
         "  --thresh   F               YOLO person confidence (default 0.50)\n"
         "  --nms      F               YOLO NMS IoU (default 0.45)\n"
+        "  --max-persons N            Cap to top-N most-confident people (0 = unlimited)\n"
         "\n"
         "SMOOTHING\n"
         "  --smoothing zero-phase|forward|off\n"

@@ -83,6 +83,7 @@ struct CommonConfig
     // `--thresh 0.6` to the renderer simply no-ops rather than erroring.
     float       person_thresh   = 0.50f;
     float       person_nms_iou  = 0.45f;
+    int         max_persons     = 0;      // --max-persons N: 0 = unlimited; >0 = top-N by conf
 
     // ── Input source ────────────────────────────────────────────────────────
     std::string from;             // file / webcam index / empty = required
@@ -146,6 +147,7 @@ inline bool parse_common_arg(int argc, const char* const* argv, int& i,
     // YOLO tuning
     CLI_FLT ("--thresh",               person_thresh)
     CLI_FLT ("--nms",                  person_nms_iou)
+    CLI_INT ("--max-persons",          max_persons)
 
     // BVH export
     CLI_STR ("--bvh",                  bvh_path)
@@ -193,6 +195,7 @@ inline void apply_common_to_pipeline_cfg(const CommonConfig& c,
     pc.use_fp16       = c.fp16;
     pc.person_thresh  = c.person_thresh;
     pc.person_nms_iou = c.person_nms_iou;
+    pc.max_persons    = c.max_persons;
 }
 
 // Centralised auto-derivation of the LBS path from --onnx-dir.  All three
@@ -221,6 +224,7 @@ inline void print_common_args_help(FILE* fp)
         "  --no-fp16                      Disable FP16\n"
         "  --thresh   F                   YOLO person confidence (default 0.50)\n"
         "  --nms      F                   YOLO NMS IoU (default 0.45)\n"
+        "  --max-persons N                Cap processing to the top-N most-confident people (0 = unlimited)\n"
         "  --bvh      PATH                Write BVH motion-capture file(s); per-person filenames appended\n"
         "  --bvh-template PATH            BVH skeleton template (default ./body_mhr.bvh,\n"
         "                                 MHR-rest aligned; use ./mocapnet.bvh for MakeHuman retarget)\n"
