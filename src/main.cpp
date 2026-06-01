@@ -476,33 +476,10 @@ int main(int argc, char** argv)
     // -----------------------------------------------------------------------
     // Optional BVH output
     // -----------------------------------------------------------------------
+    // The writer is declared here but opened later (after the input source is
+    // opened), because its frame time must match the source's real FPS — which
+    // is only known once cap is open.  See the open() call further down.
     BVHWriter bvh_writer;
-    if (!c.bvh_path.empty())
-    {
-        // Auto-detect body_model.lbs from the onnx directory for finger animation
-        std::string lbs_path = c.onnx_dir + "/body_model.lbs";
-
-        if (!bvh_writer.open(c.bvh_template, c.bvh_path,
-                             1.0f / 30.0f,    // default 30 fps; TODO: derive from cap_fps
-                             lbs_path,
-                             c.bvh_body_shape_change,
-                             c.bvh_hand_shape_change,
-                             c.bvh_compensate_finger_endsites,
-                             c.bvh_enforce_hand_limits,
-                             c.bvh_zero_hand_pose,
-                             c.bvh_sticky_hand_pose,
-                             c.bvh_rest_align,
-                             c.bvh_dump_rest_dirs))
-        {
-            fprintf(stderr, "[main] BVH writer failed to open (continuing without BVH output).\n");
-        }
-        else
-        {
-            bvh_writer.set_foot_contact(c.bvh_foot_contact);
-            printf("[main] Writing BVH to: %s  (template: %s)\n",
-                   c.bvh_path.c_str(), c.bvh_template.c_str());
-        }
-    }
 
     fsb::PipelineConfig pcfg;
     apply_common_to_pipeline_cfg(c, pcfg);  // all shared pipeline fields
@@ -594,6 +571,53 @@ int main(int argc, char** argv)
         fprintf(stderr, "[main] Cannot open input: %s\n", c.from.c_str());
         pipeline.free();
         return 1;
+    }
+
+    // -----------------------------------------------------------------------
+    // Resolve the source FPS so the BVH plays back at the right speed.
+    //   - explicit --fps override wins (c.cap_fps)
+    //   - webcams: driver value already queried above (cam_fps)
+    //   - video files: the encoded CAP_PROP_FPS
+    //   - images / unknown: 30 fps fallback
+    // The render and offline binaries do the same; only this path used to
+    // hardcode 30, which made BVH from 25/50/60 fps clips play at the wrong
+    // speed.
+    // -----------------------------------------------------------------------
+    double source_fps = c.cap_fps;
+    if (source_fps <= 0.0) source_fps = cam_fps;        // webcam driver value
+    if (source_fps <= 0.0 && !is_image && cap.isOpened())
+        source_fps = cap.get(cv::CAP_PROP_FPS);         // video-file encoded fps
+    if (source_fps <= 0.0) source_fps = 30.0;           // fallback
+    printf("[main] Source FPS: %.2f\n", source_fps);
+
+    // -----------------------------------------------------------------------
+    // Optional BVH output (deferred from above so the frame time matches FPS)
+    // -----------------------------------------------------------------------
+    if (!c.bvh_path.empty())
+    {
+        // Auto-detect body_model.lbs from the onnx directory for finger animation
+        std::string lbs_path = c.onnx_dir + "/body_model.lbs";
+
+        if (!bvh_writer.open(c.bvh_template, c.bvh_path,
+                             1.0f / (float)source_fps,
+                             lbs_path,
+                             c.bvh_body_shape_change,
+                             c.bvh_hand_shape_change,
+                             c.bvh_compensate_finger_endsites,
+                             c.bvh_enforce_hand_limits,
+                             c.bvh_zero_hand_pose,
+                             c.bvh_sticky_hand_pose,
+                             c.bvh_rest_align,
+                             c.bvh_dump_rest_dirs))
+        {
+            fprintf(stderr, "[main] BVH writer failed to open (continuing without BVH output).\n");
+        }
+        else
+        {
+            bvh_writer.set_foot_contact(c.bvh_foot_contact);
+            printf("[main] Writing BVH to: %s  (template: %s)\n",
+                   c.bvh_path.c_str(), c.bvh_template.c_str());
+        }
     }
 
     // -----------------------------------------------------------------------
