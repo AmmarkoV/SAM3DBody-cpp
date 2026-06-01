@@ -282,7 +282,8 @@ Full option list:
 --from     SRC     Webcam index (0,1,..) or path to image/video
 -o / --out PATH    Write 70-joint 3D keypoints to CSV per frame
 --bvh      PATH    Write BVH motion capture file(s) to PATH (see "BVH export" below)
---bvh-template P   BVH skeleton template (default: ./body.bvh)
+--bvh-template P   BVH skeleton template (default: ./body_mhr.bvh, MHR-rest aligned;
+                   use ./mocapnet.bvh for the MakeHuman/MocapNET copy-rotation retarget)
 --no-bvh-body-shape-change   Keep template body bone lengths (skip per-person rewrite)
 --no-bvh-hand-shape-change   Keep template hand/finger bone lengths (skip per-person rewrite)
 --bvh-raw-fingers            Do NOT rescale finger End-Site OFFSETs (keeps body.bvh's authored fingertips)
@@ -476,8 +477,17 @@ C-compatible file containing two primitives:
 ## BVH export (`--bvh`)
 
 Exports the per-frame MHR pose as one or more standard BVH motion-capture files.
-The hierarchy is taken from a BVH template (default `./body.bvh`, a [MocapNET](https://github.com/FORTH-ModelBasedTracker/MocapNET)/[MakeHuman](https://static.makehumancommunity.org/)
-T-pose skeleton); the motion comes from the MHR pipeline.
+The hierarchy is taken from a BVH template; the motion comes from the MHR pipeline.
+Two templates ship:
+
+- **`body_mhr.bvh`** (default) — MakeHuman joint *names* but its rest pose is
+  generated from the MHR rest skeleton (`tools/gen_mhr_bvh.py`).  Because the
+  template rest matches MHR, the retarget is near-identity and the exported
+  skeleton overlays the deformed mesh within ~2–3 cm per joint (verify with
+  `tools/check_mesh_bvh_overlay.py`).  Use this for animation / mesh-accurate work.
+- **`mocapnet.bvh`** — the original [MocapNET](https://github.com/FORTH-ModelBasedTracker/MocapNET)/[MakeHuman](https://static.makehumancommunity.org/)
+  T-pose skeleton, kept for the Blender MakeHuman/MPFB copy-rotation retarget
+  (`blender/blender_bvh_plugin.py`).  Select with `--bvh-template ./mocapnet.bvh`.
 
 ```bash
 # Single image / video / webcam → one or more <name>_<id>.bvh files

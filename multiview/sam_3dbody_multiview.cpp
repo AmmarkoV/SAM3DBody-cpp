@@ -31,7 +31,7 @@
 
 int main(int argc, char** argv)
 {
-    std::string sync_path, bvh_out, bvh_template = "./body.bvh";
+    std::string sync_path, bvh_out, bvh_template = "./body_mhr.bvh";
     offline::Config cfg;
     cfg.scene_detection = false;   // each stream is a single continuous shot
     double window_seconds = 3.0;   // length of the common window to process (0 = full overlap)

@@ -498,6 +498,32 @@ static void write_obj_mesh(const std::string& path,
     fclose(f);
 }
 
+// Writes the MHR LBS joint CENTRES (out_joints) in the SAME world space as
+// write_obj_mesh, one "idx x y z" line per joint.  Lets the overlay checker
+// compare BVH joints to MHR joints centre-to-centre (isolating skeleton/offset
+// error from the joint-centre-vs-surface gap you get comparing to mesh vertices).
+static void write_mhr_joints(const std::string& path,
+                             const float* joints, int n_joints,
+                             const float* cam_t,
+                             const float* pelvis_lbs,
+                             float scale)
+{
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) { fprintf(stderr, "[export] cannot open %s\n", path.c_str()); return; }
+    const float px = pelvis_lbs ? pelvis_lbs[0] : 0.f;
+    const float py = pelvis_lbs ? pelvis_lbs[1] : 0.f;
+    const float pz = pelvis_lbs ? pelvis_lbs[2] : 0.f;
+    const float tx = cam_t ? cam_t[0] * scale : 0.f;
+    const float ty = cam_t ? cam_t[1] * scale : 0.f;
+    const float tz = cam_t ? cam_t[2] * scale : 0.f;
+    for (int j = 0; j < n_joints; ++j)
+        fprintf(f, "%d %.6f %.6f %.6f\n", j,
+                 (joints[j*3+0] - px) * scale + tx,
+                -(joints[j*3+1] - py) * scale + ty,
+                -(joints[j*3+2] - pz) * scale + tz);
+    fclose(f);
+}
+
 // 2nd-order Butterworth is now sourced from src/outputFiltering.h
 // (struct ButterWorth + initButterWorth/filter, plus the wrap-aware
 //  ButterWorthWrap shim that absorbs the unwrap-then-filter trick the
@@ -773,7 +799,7 @@ int main(int argc, const char** argv) {
     // ── BVH writer ────────────────────────────────────────────────────────────
     BVHWriter bvh_writer;
     if (!bvh_path.empty()) {
-        if (bvh_template.empty()) bvh_template = "./body.bvh";
+        if (bvh_template.empty()) bvh_template = "./body_mhr.bvh";
         if (!bvh_writer.open(bvh_template, bvh_path, 1.f / video_fps, lbs_path,
                              bvh_body_shape_change, bvh_hand_shape_change,
                              bvh_compensate_finger_endsites,
@@ -1028,6 +1054,12 @@ int main(int argc, const char** argv) {
                 write_obj_mesh(opath, tri_model, r.pred_cam_t.data(),
                                lbs_joints.data() + 3,   // joint[1] = pelvis LBS position
                                MESH_EXPORT_POS_SCALE);
+                // Companion MHR joint-centre dump for centre-to-centre overlay checks.
+                snprintf(opath, sizeof(opath), "%s_p%d_%05d.joints",
+                         export_mesh_prefix.c_str(), person_idx, frame_index);
+                write_mhr_joints(opath, lbs_joints.data(), lbs->n_joints,
+                                 r.pred_cam_t.data(), lbs_joints.data() + 3,
+                                 MESH_EXPORT_POS_SCALE);
             }
 
             // First-frame verts dump for verify_transforms.py LBS comparison

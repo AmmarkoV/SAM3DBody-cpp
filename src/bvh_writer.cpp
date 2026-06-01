@@ -1133,25 +1133,35 @@ void BVHWriter::rewrite_offsets_for(PerPerson& p)
 {
     const int N = (int)mc_->jointHierarchySize;
     std::vector<std::array<float,3>> rest_pos(N);
-    for (int j = 0; j < N; ++j)
-    {
-        const auto& jh = mc_->jointHierarchy[j];
-        if (jh.isRoot) rest_pos[j] = { jh.offset[0], jh.offset[1], jh.offset[2] };
-        else
-        {
-            int par = (int)jh.parentJoint;
-            rest_pos[j] = { rest_pos[par][0] + jh.offset[0],
-                            rest_pos[par][1] + jh.offset[1],
-                            rest_pos[par][2] + jh.offset[2]
-                          };
-        }
-    }
 
+    // Single forward pass: derive each joint's rest position from its DIRECT
+    // parent's (already-updated) position, rewriting mapped bones as we go.  This
+    // is required for correctness — shortening/lengthening a bone shifts ALL of
+    // its descendants, so a child's "current length" must be measured against the
+    // ancestor's ALREADY-rewritten position.  (The old code pre-computed every
+    // rest_pos once from the template and never propagated a parent's rewrite to
+    // its descendants, so e.g. chest/neck/forearm/foot were set to the wrong
+    // length whenever an ancestor bone had moved — bvh joints then drifted 7–14 cm
+    // from the MHR/mesh joints.)  Parent jid < child jid in the template, so a
+    // straight 0..N-1 pass visits parents first.
     int n_rewritten = 0;
     int n_skipped   = 0;
     for (size_t i = 0; i < slots_.size(); ++i)
     {
         const BvhSlot& s = slots_[i];
+        auto& jh = mc_->jointHierarchy[i];
+
+        // rest_pos[i] from the current (possibly rewritten-ancestor) chain.
+        if (jh.isRoot)
+            rest_pos[i] = { jh.offset[0], jh.offset[1], jh.offset[2] };
+        else
+        {
+            int par = (int)jh.parentJoint;
+            rest_pos[i] = { rest_pos[par][0] + jh.offset[0],
+                            rest_pos[par][1] + jh.offset[1],
+                            rest_pos[par][2] + jh.offset[2] };
+        }
+
         if (s.mhr_idx < 0 || s.is_root) continue;
         if (s.ancestor_bvh_jid < 0)     continue;
         // Honour per-category disable flags — keeps the template's authored
@@ -1181,13 +1191,17 @@ void BVHWriter::rewrite_offsets_for(PerPerson& p)
         float inv_cur = 1.f / cur;
         float dir[3] = { dx*inv_cur, dy*inv_cur, dz*inv_cur };
         float delta_len = median_len - cur;
-        auto& jh = mc_->jointHierarchy[i];
+        if (getenv("FSB_DEBUG_OFFSETS"))
+            fprintf(stderr, "[offset] %-10s median_len=%.1f  cur=%.1f\n",
+                    mc_->jointHierarchy[i].jointName, median_len, cur);
         jh.offset[0] += delta_len * dir[0];
         jh.offset[1] += delta_len * dir[1];
         jh.offset[2] += delta_len * dir[2];
-        rest_pos[i] = { rest_pos[anc][0] + median_len * dir[0],
-                        rest_pos[anc][1] + median_len * dir[1],
-                        rest_pos[anc][2] + median_len * dir[2]
+        // Recompute from the direct parent so descendants build on the new pos.
+        int par = (int)jh.parentJoint;
+        rest_pos[i] = { rest_pos[par][0] + jh.offset[0],
+                        rest_pos[par][1] + jh.offset[1],
+                        rest_pos[par][2] + jh.offset[2]
                       };
         ++n_rewritten;
     }

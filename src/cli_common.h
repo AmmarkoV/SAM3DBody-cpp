@@ -91,7 +91,7 @@ struct CommonConfig
 
     // ── BVH export ──────────────────────────────────────────────────────────
     std::string bvh_path;
-    std::string bvh_template    = "./body.bvh";
+    std::string bvh_template    = "./body_mhr.bvh";
     bool        bvh_body_shape_change          = true;   // --no-bvh-body-shape-change
     bool        bvh_hand_shape_change          = true;   // --no-bvh-hand-shape-change
     bool        bvh_compensate_finger_endsites = true;   // --bvh-raw-fingers
@@ -218,7 +218,8 @@ inline void print_common_args_help(FILE* fp)
         "  --thresh   F                   YOLO person confidence (default 0.50)\n"
         "  --nms      F                   YOLO NMS IoU (default 0.45)\n"
         "  --bvh      PATH                Write BVH motion-capture file(s); per-person filenames appended\n"
-        "  --bvh-template PATH            BVH skeleton template (default ./body.bvh)\n"
+        "  --bvh-template PATH            BVH skeleton template (default ./body_mhr.bvh,\n"
+        "                                 MHR-rest aligned; use ./mocapnet.bvh for MakeHuman retarget)\n"
         "  --no-bvh-body-shape-change     Keep template body bone lengths\n"
         "  --no-bvh-hand-shape-change     Keep template hand/finger bone lengths\n"
         "  --bvh-raw-fingers              Do not rescale finger End-Site OFFSETs\n"

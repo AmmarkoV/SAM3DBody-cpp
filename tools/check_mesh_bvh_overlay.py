@@ -196,6 +196,38 @@ BODY_JOINTS = [
     'rThigh', 'rShin', 'rFoot',
 ]
 
+# BVH joint name → MHR joint name, for centre-to-centre comparison against the
+# companion .joints dump (mirrors NAME_MAP in src/bvh_writer.cpp).
+BVH_TO_MHR = {
+    'hip':'root','abdomen':'c_spine1','chest':'c_spine3','neck':'c_neck','head':'c_head',
+    'lCollar':'l_clavicle','lShldr':'l_uparm','lForeArm':'l_lowarm','lHand':'l_wrist',
+    'rCollar':'r_clavicle','rShldr':'r_uparm','rForeArm':'r_lowarm','rHand':'r_wrist',
+    'lThigh':'l_upleg','lShin':'l_lowleg','lFoot':'l_foot',
+    'rThigh':'r_upleg','rShin':'r_lowleg','rFoot':'r_foot',
+}
+
+def load_mhr_joints(path):
+    """Read a PREFIX_pP_FFFFF.joints file → {idx: (x,y,z)}.  None if missing."""
+    import os
+    if not os.path.exists(path): return None
+    out = {}
+    with open(path) as f:
+        for line in f:
+            p = line.split()
+            if len(p) == 4:
+                out[int(p[0])] = (float(p[1]), float(p[2]), float(p[3]))
+    return out
+
+def mhr_name_to_idx():
+    import re, os
+    # Locate mhr_joint_table.h relative to this tool (../src/).
+    here = os.path.dirname(os.path.abspath(__file__))
+    hdr = os.path.join(here, '..', 'src', 'mhr_joint_table.h')
+    if not os.path.exists(hdr): return {}
+    block = open(hdr).read().split('NAMES[N_JOINTS] = {',1)[1].split('};',1)[0]
+    names = re.findall(r'"([^"]+)"', block)
+    return {n:i for i,n in enumerate(names)}
+
 
 def main():
     if len(sys.argv) < 3:
@@ -256,13 +288,47 @@ def main():
     print()
     if any_warn:
         print("WARN  Some joints are > 15 cm from the nearest mesh vertex.")
-        print("      Arms/hands often have the largest error due to the BVH rest-frame")
-        print("      correction (rest_align).  Run with FSB_DUMP_REST_DIRS=1 and check")
-        print("      the angle column — >45° gaps indicate difficult retargeting cases.")
-        print("      Torso/legs should be well within 15 cm for a valid overlay.")
+        print("      Note: a joint CENTRE sits inside the body, so a few cm of this is the")
+        print("      joint-to-surface gap, not skeleton error.  See the centre-to-centre")
+        print("      table below (if a .joints file was exported) for the true skeleton error.")
     else:
-        print("OK    All body joints are within 15 cm of the mesh.  Load both in Blender")
-        print("      with default import settings and they should overlay correctly.")
+        print("OK    All body joints are within 15 cm of the mesh surface.  Load both in")
+        print("      Blender with default import settings; they should overlay correctly.")
+
+    # ── Centre-to-centre: BVH joint vs MHR joint (true skeleton error) ─────────
+    # The .obj's companion .joints file holds the MHR joint CENTRES in the same
+    # world space.  Comparing BVH-FK joints to those removes the joint-to-surface
+    # offset, isolating skeleton/OFFSET error from the rotation retarget.
+    jpath = obj_path[:-4] + '.joints' if obj_path.endswith('.obj') else obj_path + '.joints'
+    mhrj = load_mhr_joints(jpath)
+    if mhrj:
+        n2i = mhr_name_to_idx()
+        print()
+        print("Centre-to-centre (BVH joint vs MHR joint — true skeleton error):")
+        print(f"{'Joint':12s}  {'BVH pos (cm)':24s}  {'MHR pos (cm)':24s}  {'dist cm':>7s}")
+        print('-'*78)
+        tot = 0.0; cnt = 0; worst = (0.0, '')
+        for jname in BODY_JOINTS:
+            if jname not in joint_world: continue
+            mn = BVH_TO_MHR.get(jname)
+            if mn is None or mn not in n2i or n2i[mn] not in mhrj: continue
+            b = joint_world[jname]; mpos = mhrj[n2i[mn]]
+            d = math.sqrt(sum((b[i]-mpos[i])**2 for i in range(3)))
+            tot += d; cnt += 1
+            if d > worst[0]: worst = (d, jname)
+            print(f"{jname:12s}  ({b[0]:+7.1f},{b[1]:+7.1f},{b[2]:+7.1f})  "
+                  f"({mpos[0]:+7.1f},{mpos[1]:+7.1f},{mpos[2]:+7.1f})  {d:7.1f}")
+        if cnt:
+            print('-'*78)
+            print(f"{'MEAN':12s}  {'':24s}  {'':24s}  {tot/cnt:7.1f}")
+            print(f"worst: {worst[1]} at {worst[0]:.1f} cm")
+            print()
+            print("This is the real skeleton error (rotation + OFFSET length).  If it is")
+            print("small but the surface distances above are large, the residual is just")
+            print("joint-centre-to-skin.  If THIS is large, the OFFSETs/retarget need work.")
+    else:
+        print()
+        print(f"(no {jpath} — re-export with the current build to enable the centre-to-centre check)")
 
 
 if __name__ == "__main__":
