@@ -39,6 +39,7 @@ extern "C" {
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
 #include <string>
 #include <unordered_map>
@@ -248,6 +249,43 @@ constexpr NameMap NAME_MAP[] =
     { "finger3-1.r","r_middle1",HAND}, { "finger3-2.r","r_middle2",HAND}, { "finger3-3.r","r_middle3",HAND},
     { "finger4-1.r","r_ring1",HAND  }, { "finger4-2.r","r_ring2",HAND  }, { "finger4-3.r","r_ring3",HAND  },
     { "finger5-1.r","r_pinky1",HAND }, { "finger5-2.r","r_pinky2",HAND }, { "finger5-3.r","r_pinky3",HAND },
+
+    // ── Mixamo ("mixamorig:") retarget target ─────────────────────────────────
+    // Auto-selected when --bvh-template points at a Mixamo skeleton (e.g.
+    // ./mixamo.bvh).  The mixamorig: names never collide with the MakeHuman
+    // names above, so build_slots() simply maps whichever set is present in the
+    // loaded template — no separate flag or table-switch is required.
+    //
+    // Hierarchy notes / fallbacks (handled by the nearest-mapped-ancestor logic):
+    //   • Mixamo has 3 spine bones (Spine/Spine1/Spine2) → c_spine1/2/3.
+    //   • Mixamo's single Neck → c_neck (MHR neck twists are absorbed).
+    //   • Mixamo has no buttock bone: UpLeg maps straight to the MHR upper leg.
+    //   • Mixamo's single ToeBase is left unmapped (foot stays flat).
+    { "mixamorig:Hips","root",BODY },
+    { "mixamorig:Spine","c_spine1",BODY }, { "mixamorig:Spine1","c_spine2",BODY }, { "mixamorig:Spine2","c_spine3",BODY },
+    { "mixamorig:Neck","c_neck",BODY }, { "mixamorig:Head","c_head",BODY },
+
+    { "mixamorig:LeftShoulder","l_clavicle",BODY }, { "mixamorig:LeftArm","l_uparm",BODY },
+    { "mixamorig:LeftForeArm","l_lowarm",BODY },    { "mixamorig:LeftHand","l_wrist",BODY },
+    { "mixamorig:RightShoulder","r_clavicle",BODY },{ "mixamorig:RightArm","r_uparm",BODY },
+    { "mixamorig:RightForeArm","r_lowarm",BODY },   { "mixamorig:RightHand","r_wrist",BODY },
+
+    { "mixamorig:LeftUpLeg","l_upleg",BODY },  { "mixamorig:LeftLeg","l_lowleg",BODY },  { "mixamorig:LeftFoot","l_foot",BODY },
+    { "mixamorig:RightUpLeg","r_upleg",BODY }, { "mixamorig:RightLeg","r_lowleg",BODY }, { "mixamorig:RightFoot","r_foot",BODY },
+
+    // Left hand fingers (Mixamo Thumb/Index/Middle/Ring/Pinky, 3 phalanges each).
+    { "mixamorig:LeftHandThumb1","l_thumb1",HAND },  { "mixamorig:LeftHandThumb2","l_thumb2",HAND },  { "mixamorig:LeftHandThumb3","l_thumb3",HAND },
+    { "mixamorig:LeftHandIndex1","l_index1",HAND },  { "mixamorig:LeftHandIndex2","l_index2",HAND },  { "mixamorig:LeftHandIndex3","l_index3",HAND },
+    { "mixamorig:LeftHandMiddle1","l_middle1",HAND },{ "mixamorig:LeftHandMiddle2","l_middle2",HAND },{ "mixamorig:LeftHandMiddle3","l_middle3",HAND },
+    { "mixamorig:LeftHandRing1","l_ring1",HAND },    { "mixamorig:LeftHandRing2","l_ring2",HAND },    { "mixamorig:LeftHandRing3","l_ring3",HAND },
+    { "mixamorig:LeftHandPinky1","l_pinky1",HAND },  { "mixamorig:LeftHandPinky2","l_pinky2",HAND },  { "mixamorig:LeftHandPinky3","l_pinky3",HAND },
+
+    // Right hand fingers
+    { "mixamorig:RightHandThumb1","r_thumb1",HAND },  { "mixamorig:RightHandThumb2","r_thumb2",HAND },  { "mixamorig:RightHandThumb3","r_thumb3",HAND },
+    { "mixamorig:RightHandIndex1","r_index1",HAND },  { "mixamorig:RightHandIndex2","r_index2",HAND },  { "mixamorig:RightHandIndex3","r_index3",HAND },
+    { "mixamorig:RightHandMiddle1","r_middle1",HAND },{ "mixamorig:RightHandMiddle2","r_middle2",HAND },{ "mixamorig:RightHandMiddle3","r_middle3",HAND },
+    { "mixamorig:RightHandRing1","r_ring1",HAND },    { "mixamorig:RightHandRing2","r_ring2",HAND },    { "mixamorig:RightHandRing3","r_ring3",HAND },
+    { "mixamorig:RightHandPinky1","r_pinky1",HAND },  { "mixamorig:RightHandPinky2","r_pinky2",HAND },  { "mixamorig:RightHandPinky3","r_pinky3",HAND },
 };
 
 // ─── Hand joint angle limits (--enforce-hand-limits) ───────────────────────
@@ -1337,15 +1375,18 @@ void BVHWriter::foot_contact_pass(PerPerson& p)
     if (const char* e = std::getenv("FSB_FOOT_SPEED")) SPEED_THR   = (float)atof(e);
     if (const char* e = std::getenv("FSB_FOOT_BAND"))  HEIGHT_BAND = (float)atof(e);
 
-    auto find_jid = [&](const char* nm) -> int {
-        for (unsigned int j = 0; j < mc_->jointHierarchySize; ++j)
-            if (std::strcmp(mc_->jointHierarchy[j].jointName, nm) == 0) return (int)j;
+    // Accept either the MakeHuman/MocapNET names or the Mixamo template names
+    // (first match wins), so --foot-contact works regardless of --bvh-template.
+    auto find_jid = [&](std::initializer_list<const char*> names) -> int {
+        for (const char* nm : names)
+            for (unsigned int j = 0; j < mc_->jointHierarchySize; ++j)
+                if (std::strcmp(mc_->jointHierarchy[j].jointName, nm) == 0) return (int)j;
         return -1;
     };
     struct Leg { int hip, knee, ankle; };
     Leg legs[2] = {
-        { find_jid("lThigh"), find_jid("lShin"), find_jid("lFoot") },
-        { find_jid("rThigh"), find_jid("rShin"), find_jid("rFoot") },
+        { find_jid({"lThigh","mixamorig:LeftUpLeg"}),  find_jid({"lShin","mixamorig:LeftLeg"}),  find_jid({"lFoot","mixamorig:LeftFoot"})  },
+        { find_jid({"rThigh","mixamorig:RightUpLeg"}), find_jid({"rShin","mixamorig:RightLeg"}), find_jid({"rFoot","mixamorig:RightFoot"}) },
     };
     for (auto& L : legs)
         if (L.hip < 0 || L.knee < 0 || L.ankle < 0) {

@@ -111,7 +111,7 @@ static void print_usage(const char* prog)
     printf("  --render-size W H GL window width and height in pixels (default: match input)\n");
     printf("  -o / --out PATH   Write 3D keypoints to CSV (frame,skeleton_id,joint_x,y,z...)\n");
     printf("  --bvh PATH        Write BVH motion capture output to PATH (one file per tracked person)\n");
-    printf("  --bvh-template P  BVH skeleton template (default ./body_mhr.bvh; ./mocapnet.bvh for MakeHuman)\n");
+    printf("  --bvh-template P  BVH skeleton template (default ./body_mhr.bvh; ./mocapnet.bvh for MakeHuman; ./mixamo.bvh for Mixamo)\n");
     printf("  --no-bvh-body-shape-change  Keep the template's authored body bone lengths (no median rewrite)\n");
     printf("  --no-bvh-hand-shape-change  Keep the template's authored hand/finger bone lengths\n");
     printf("  --bvh-raw-fingers           Do NOT rescale finger End-Site OFFSETs to MHR fingertip lengths\n");
