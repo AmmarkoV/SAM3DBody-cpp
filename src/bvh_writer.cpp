@@ -350,8 +350,35 @@ static const HandLimitEntry HAND_LIMITS[] = {
 };
 // clang-format on
 
+// Mixamo ("mixamorig:") finger joints alias onto the MakeHuman rows above.
+// The Mixamo template (tools/gen_mixamo_bvh.py) declares the same ZXY finger
+// channels with identical semantics (Z=spread X=flex Y=twist), so the limits
+// are the same — we translate the name rather than duplicate the numbers, which
+// keeps a single source of truth for the values.  Finger order: Index→finger2,
+// Middle→finger3, Ring→finger4, Pinky→finger5; Thumb1/2/3→{l,r}thumb/finger1-2/3.
+struct HandLimitAlias { const char* mixamo; const char* makehuman; };
+// clang-format off
+static const HandLimitAlias HAND_LIMIT_ALIASES[] = {
+    { "mixamorig:RightHandIndex1","finger2-1.r" }, { "mixamorig:RightHandIndex2","finger2-2.r" }, { "mixamorig:RightHandIndex3","finger2-3.r" },
+    { "mixamorig:RightHandMiddle1","finger3-1.r"},{ "mixamorig:RightHandMiddle2","finger3-2.r"},{ "mixamorig:RightHandMiddle3","finger3-3.r"},
+    { "mixamorig:RightHandRing1","finger4-1.r"  },{ "mixamorig:RightHandRing2","finger4-2.r"  },{ "mixamorig:RightHandRing3","finger4-3.r"  },
+    { "mixamorig:RightHandPinky1","finger5-1.r" },{ "mixamorig:RightHandPinky2","finger5-2.r" },{ "mixamorig:RightHandPinky3","finger5-3.r" },
+    { "mixamorig:RightHandThumb1","rthumb"      },{ "mixamorig:RightHandThumb2","finger1-2.r" },{ "mixamorig:RightHandThumb3","finger1-3.r" },
+
+    { "mixamorig:LeftHandIndex1","finger2-1.l"  },{ "mixamorig:LeftHandIndex2","finger2-2.l"  },{ "mixamorig:LeftHandIndex3","finger2-3.l"  },
+    { "mixamorig:LeftHandMiddle1","finger3-1.l" },{ "mixamorig:LeftHandMiddle2","finger3-2.l" },{ "mixamorig:LeftHandMiddle3","finger3-3.l" },
+    { "mixamorig:LeftHandRing1","finger4-1.l"   },{ "mixamorig:LeftHandRing2","finger4-2.l"   },{ "mixamorig:LeftHandRing3","finger4-3.l"   },
+    { "mixamorig:LeftHandPinky1","finger5-1.l"  },{ "mixamorig:LeftHandPinky2","finger5-2.l"  },{ "mixamorig:LeftHandPinky3","finger5-3.l"  },
+    { "mixamorig:LeftHandThumb1","lthumb"       },{ "mixamorig:LeftHandThumb2","finger1-2.l"  },{ "mixamorig:LeftHandThumb3","finger1-3.l"  },
+};
+// clang-format on
+
 static const HandLimitEntry* find_hand_limit(const char* name)
 {
+    // Resolve a mixamorig: finger name to its MakeHuman equivalent first.
+    if (strncmp(name, "mixamorig:", 10) == 0)
+        for (const auto& a : HAND_LIMIT_ALIASES)
+            if (strcmp(a.mixamo, name) == 0) { name = a.makehuman; break; }
     for (const auto& e : HAND_LIMITS)
         if (strcmp(e.bvh_name, name) == 0) return &e;
     return nullptr;
