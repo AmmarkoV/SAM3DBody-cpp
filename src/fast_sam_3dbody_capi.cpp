@@ -39,6 +39,7 @@ extern "C" {
         pc.person_thresh    = cfg->person_thresh;
         pc.person_nms_iou   = cfg->person_nms_iou;
         pc.max_persons      = cfg->max_persons;
+        pc.detector         = cfg->detector;
         pc.focal_x          = cfg->focal_x;
         pc.focal_y          = cfg->focal_y;
         pc.principal_x      = cfg->principal_x;

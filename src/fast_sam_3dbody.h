@@ -92,6 +92,12 @@ struct PipelineConfig {
     float person_nms_iou = 0.45f;  // YOLO NMS IoU threshold
     int  max_persons     = 0;      // 0 = unlimited; >0 = cap after NMS (top-N by conf)
 
+    // Bounding-box detector provider (selects how the --yolo ONNX output is parsed).
+    // Kept as an int for the C-ABI-friendly struct style. Extend with new kinds
+    // (e.g. DET_YMAPNET) by adding an enum value, a parser, and a dispatch case.
+    enum DetectorKind { DET_YOLO_POSE = 0, DET_LIBREYOLO = 1 /*, DET_YMAPNET = 2 */ };
+    int  detector        = DET_YOLO_POSE; // 0 = YOLO11-pose (default), 1 = LibreYOLO (YOLOv9 bbox)
+
     // Camera intrinsics – set to 0 to use default (fx = image_width)
     float focal_x = 0.f;
     float focal_y = 0.f;

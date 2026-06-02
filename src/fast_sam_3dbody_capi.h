@@ -27,6 +27,7 @@ typedef struct {
     float principal_x;
     float principal_y;
     int   zero_face_params;   // 0/1  — force face expression coefficients to zero
+    int   detector;           // bbox provider: 0 = YOLO11-pose (default), 1 = LibreYOLO (YOLOv9 bbox)
 } FsbConfig;
 
 // ── Per-person result (fixed-size for easy ctypes mapping) ────────────────────

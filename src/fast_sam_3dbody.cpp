@@ -600,34 +600,48 @@ struct Pipeline::Impl
 
                 auto info   = outs[0].GetTensorTypeAndShapeInfo();
                 auto shape  = info.GetShape();
-                // shape is typically [1, 56, num_dets] for YOLOv8/11 pose
-                // transpose to [num_dets, 56] if needed
-                int nd = 0;
+                // Output is [1, C, N] (channels-first → needs transpose) or
+                // [1, N, C]. C is the per-detection feature count (56 for
+                // YOLO11-pose, 84 for YOLOv9 detection); N is the anchor count
+                // and is always the larger dim. Detect the layout by size so the
+                // same code feeds either parser.
+                int nd = 0, C = 0;
                 const float* raw = outs[0].GetTensorData<float>();
                 std::vector<float> row_major;
 
                 if (shape.size() == 3)
                 {
-                    if (shape[1] == 56)
+                    int d1 = (int)shape[1], d2 = (int)shape[2];
+                    if (d1 <= d2)
                     {
-                        // [1, 56, num_dets] → need transpose
-                        nd = (int)shape[2];
-                        row_major.resize(nd * 56);
+                        // [1, C, N] → transpose to row-major [N, C]
+                        C = d1; nd = d2;
+                        row_major.resize((size_t)nd * C);
                         for (int j = 0; j < nd; ++j)
-                            for (int k = 0; k < 56; ++k)
-                                row_major[j*56+k] = raw[k*nd + j];
+                            for (int k = 0; k < C; ++k)
+                                row_major[(size_t)j*C + k] = raw[(size_t)k*nd + j];
                     }
                     else
                     {
-                        // [1, num_dets, 56]
-                        nd = (int)shape[1];
-                        row_major.assign(raw, raw + nd * 56);
+                        // [1, N, C] → already row-major
+                        C = d2; nd = d1;
+                        row_major.assign(raw, raw + (size_t)nd * C);
                     }
                 }
-                // Reverse the letterbox: YOLO coords → original image coords.
-                //   (x_orig, y_orig) = ((x_yolo - pad_x) / scale, (y_yolo - pad_y) / scale)
-                dets = parse_yolo_output(row_major.data(), nd,
-                                         cfg.person_thresh, cfg.person_nms_iou);
+                // Parse per the selected provider. The letterbox reversal below
+                // (YOLO coords → original image coords) is shared by both.
+                switch (cfg.detector)
+                {
+                case PipelineConfig::DET_LIBREYOLO:
+                    dets = parse_yolov9_output(row_major.data(), nd, C,
+                                               cfg.person_thresh, cfg.person_nms_iou);
+                    break;
+                case PipelineConfig::DET_YOLO_POSE:
+                default:
+                    dets = parse_yolo_output(row_major.data(), nd,
+                                             cfg.person_thresh, cfg.person_nms_iou);
+                    break;
+                }
                 for (auto& d : dets)
                 {
                     d.x1 = (d.x1 - pad_x) / scale;

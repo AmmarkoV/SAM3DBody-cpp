@@ -103,6 +103,7 @@ static void print_usage(const char* prog)
     printf("  --thresh T        YOLO person confidence threshold (default 0.50)\n");
     printf("  --nms T           YOLO NMS IoU threshold (default 0.45)\n");
     printf("  --max-persons N   Cap to top-N most-confident people (0 = unlimited)\n");
+    printf("  --detector NAME   Bbox provider parsing --yolo output: yolo-pose (default) | libreyolo\n");
     printf("  --fx F            Camera focal length x (0 = image width)\n");
     printf("  --fy F            Camera focal length y (0 = image width)\n");
     printf("  --cx F            Principal point x (0 = width/2)\n");

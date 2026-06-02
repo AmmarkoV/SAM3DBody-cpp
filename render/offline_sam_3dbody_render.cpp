@@ -106,6 +106,7 @@ static void print_usage(const char* prog)
         "  --thresh   F               YOLO person confidence (default 0.50)\n"
         "  --nms      F               YOLO NMS IoU (default 0.45)\n"
         "  --max-persons N            Cap to top-N most-confident people (0 = unlimited)\n"
+        "  --detector NAME            Bbox provider parsing --yolo output: yolo-pose (default) | libreyolo\n"
         "\n"
         "SMOOTHING\n"
         "  --smoothing zero-phase|forward|off\n"

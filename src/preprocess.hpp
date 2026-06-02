@@ -232,6 +232,60 @@ inline std::vector<PersonDet> parse_yolo_output(
     return kept;
 }
 
+// Parse a YOLOv9 (LibreYOLO) detection output tensor [num_dets, num_feat],
+// already transposed to row-major. Layout per row:
+//   columns 0-3            : cx, cy, w, h  (YOLO input pixel coords, 0-640)
+//   columns 4 .. num_feat-1: per-class scores (anchor-free, no objectness)
+// COCO person is class 0, so confidence = column 4. A person-only model has
+// num_feat == 5 and the same column-4 convention. Bbox-only: no keypoints.
+// Caller scales to original image space via the same letterbox reversal used
+// for the pose path.
+inline std::vector<PersonDet> parse_yolov9_output(
+    const float*  data,          // [num_dets × num_feat]
+    int           num_dets,
+    int           num_feat,      // 4 + num_classes (typically 84)
+    float         conf_thresh,
+    float         nms_iou_thresh
+)
+{
+    std::vector<PersonDet> raw;
+    raw.reserve(64);
+
+    if (num_feat < 5) return raw;   // need at least 4 bbox + 1 class
+
+    for (int i = 0; i < num_dets; ++i) {
+        const float* row = data + (size_t)i * num_feat;
+        float conf = row[4];                 // class 0 = person
+        if (conf < conf_thresh) continue;
+        float cx = row[0], cy = row[1], w = row[2], h = row[3];
+        PersonDet d;
+        d.x1   = cx - w * 0.5f;
+        d.y1   = cy - h * 0.5f;
+        d.x2   = cx + w * 0.5f;
+        d.y2   = cy + h * 0.5f;
+        d.conf = conf;
+        d.has_kps = false;                   // detection-only: no keypoints
+        raw.push_back(d);
+    }
+
+    // Sort descending by confidence
+    std::sort(raw.begin(), raw.end(),
+        [](const PersonDet& a, const PersonDet& b){ return a.conf > b.conf; });
+
+    // Greedy NMS (shares iou() with the pose path)
+    std::vector<bool> suppressed(raw.size(), false);
+    std::vector<PersonDet> kept;
+    for (size_t i = 0; i < raw.size(); ++i) {
+        if (suppressed[i]) continue;
+        kept.push_back(raw[i]);
+        for (size_t j = i + 1; j < raw.size(); ++j) {
+            if (!suppressed[j] && iou(raw[i], raw[j]) > nms_iou_thresh)
+                suppressed[j] = true;
+        }
+    }
+    return kept;
+}
+
 // ─── Convert continuous body params to 133-dim Euler (fast path) ──────────────
 //
 // Implements compact_cont_to_model_params_body_fast in C++.

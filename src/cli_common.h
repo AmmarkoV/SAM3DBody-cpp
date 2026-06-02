@@ -84,6 +84,7 @@ struct CommonConfig
     float       person_thresh   = 0.50f;
     float       person_nms_iou  = 0.45f;
     int         max_persons     = 0;      // --max-persons N: 0 = unlimited; >0 = top-N by conf
+    std::string detector        = "yolo-pose"; // --detector: bbox provider (yolo-pose | libreyolo)
 
     // ── Input source ────────────────────────────────────────────────────────
     std::string from;             // file / webcam index / empty = required
@@ -148,6 +149,7 @@ inline bool parse_common_arg(int argc, const char* const* argv, int& i,
     CLI_FLT ("--thresh",               person_thresh)
     CLI_FLT ("--nms",                  person_nms_iou)
     CLI_INT ("--max-persons",          max_persons)
+    CLI_STR ("--detector",             detector)
 
     // BVH export
     CLI_STR ("--bvh",                  bvh_path)
@@ -180,6 +182,23 @@ inline bool parse_common_arg(int argc, const char* const* argv, int& i,
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
+// Map a --detector NAME string to a fsb::PipelineConfig::DetectorKind value.
+// Unknown names warn and fall back to the default (yolo-pose). Extend the table
+// (one row per kind) to add new providers, e.g. {"ymapnet", DET_YMAPNET}.
+inline int detector_kind_from_string(const std::string& name)
+{
+    struct DetMap { const char* name; int kind; };
+    static const DetMap kDetectors[] = {
+        { "yolo-pose", fsb::PipelineConfig::DET_YOLO_POSE },
+        { "libreyolo", fsb::PipelineConfig::DET_LIBREYOLO },
+    };
+    for (const auto& d : kDetectors)
+        if (name == d.name) return d.kind;
+    std::fprintf(stderr, "[cli] unknown --detector '%s'; using 'yolo-pose'\n",
+                 name.c_str());
+    return fsb::PipelineConfig::DET_YOLO_POSE;
+}
+
 // Populate the fields of a fsb::PipelineConfig that come straight from
 // CommonConfig.  Binary-specific fields (`skip_body_model`, `principal_x`,
 // `focal_x`, etc.) stay the caller's responsibility.
@@ -196,6 +215,7 @@ inline void apply_common_to_pipeline_cfg(const CommonConfig& c,
     pc.person_thresh  = c.person_thresh;
     pc.person_nms_iou = c.person_nms_iou;
     pc.max_persons    = c.max_persons;
+    pc.detector       = detector_kind_from_string(c.detector);
 }
 
 // Centralised auto-derivation of the LBS path from --onnx-dir.  All three
@@ -215,7 +235,9 @@ inline void print_common_args_help(FILE* fp)
         "  --backbone NAME                Backbone filename within onnx-dir (default backbone.onnx;\n"
         "                                 use backbone_int8.onnx after running tools/quantize_backbone.py)\n"
         "  --gguf     PATH                pipeline.gguf (MHR + camera heads)\n"
-        "  --yolo     PATH                YOLO pose model (.onnx)\n"
+        "  --yolo     PATH                Detector model (.onnx); YOLO11-pose or a LibreYOLO/YOLOv9 export\n"
+        "  --detector NAME                Bbox provider that parses --yolo output: yolo-pose (default,\n"
+        "                                 56-ch YOLO11-pose) | libreyolo (84-ch YOLOv9 detection, bbox-only)\n"
         "  --from     PATH                Input source (file path, or webcam index where supported)\n"
         "  --frames   N                   Stop after N frames (useful for quick tests; default unlimited)\n"
         "  --start    N                   Skip to frame N before processing (seek into the video; default 0)\n"
