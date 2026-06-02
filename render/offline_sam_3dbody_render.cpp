@@ -99,7 +99,7 @@ static void print_usage(const char* prog)
         "  --bvh      PATH            Output BVH base name.  Files written as <stem>_<id>.bvh.\n"
         "\n"
         "PIPELINE\n"
-        "  --bvh-template PATH        BVH skeleton template (default ./body_mhr.bvh; ./mocapnet.bvh for MakeHuman; ./mixamo.bvh for Mixamo)\n"
+        "  --bvh-template PATH        BVH skeleton template (default ./body_mhr.bvh; ./mocapnet.bvh for MakeHuman; ./mixamo.bvh for Mixamo; ./lafan.bvh for LAFAN1/GMR)\n"
         "  --cuda     N               CUDA device index, -1 for CPU (default 0)\n"
         "  --trt                      Use ONNX Runtime TensorRT EP\n"
         "  --no-fp16                  Disable FP16\n"

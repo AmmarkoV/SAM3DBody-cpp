@@ -286,6 +286,39 @@ constexpr NameMap NAME_MAP[] =
     { "mixamorig:RightHandMiddle1","r_middle1",HAND },{ "mixamorig:RightHandMiddle2","r_middle2",HAND },{ "mixamorig:RightHandMiddle3","r_middle3",HAND },
     { "mixamorig:RightHandRing1","r_ring1",HAND },    { "mixamorig:RightHandRing2","r_ring2",HAND },    { "mixamorig:RightHandRing3","r_ring3",HAND },
     { "mixamorig:RightHandPinky1","r_pinky1",HAND },  { "mixamorig:RightHandPinky2","r_pinky2",HAND },  { "mixamorig:RightHandPinky3","r_pinky3",HAND },
+
+    // ── LAFAN1 retarget target (for GMR / General Motion Retargeting) ──────────
+    // Auto-selected when --bvh-template points at ./lafan.bvh.  LAFAN1 is the
+    // Mixamo/Ubisoft hierarchy with bare joint names (no "mixamorig:" prefix) —
+    // GMR's BVH reader (utils/lafan1.py) parses names with the regex (\w+), which
+    // rejects the colon in "mixamorig:", so a de-prefixed template is required.
+    // Bare names never collide with the MakeHuman (lowercase) or mixamorig: rows,
+    // so build_slots() maps whichever set the loaded template actually declares.
+    //   • LeftToe/RightToe are left unmapped (foot stays flat); GMR reads the toe
+    //     orientation for its LeftFootMod/RightFootMod, which the rest pose gives.
+    { "Hips","root",BODY },
+    { "Spine","c_spine1",BODY }, { "Spine1","c_spine2",BODY }, { "Spine2","c_spine3",BODY },
+    { "Neck","c_neck",BODY }, { "Head","c_head",BODY },
+
+    { "LeftShoulder","l_clavicle",BODY }, { "LeftArm","l_uparm",BODY },
+    { "LeftForeArm","l_lowarm",BODY },    { "LeftHand","l_wrist",BODY },
+    { "RightShoulder","r_clavicle",BODY },{ "RightArm","r_uparm",BODY },
+    { "RightForeArm","r_lowarm",BODY },   { "RightHand","r_wrist",BODY },
+
+    { "LeftUpLeg","l_upleg",BODY },  { "LeftLeg","l_lowleg",BODY },  { "LeftFoot","l_foot",BODY },
+    { "RightUpLeg","r_upleg",BODY }, { "RightLeg","r_lowleg",BODY }, { "RightFoot","r_foot",BODY },
+
+    { "LeftHandThumb1","l_thumb1",HAND },  { "LeftHandThumb2","l_thumb2",HAND },  { "LeftHandThumb3","l_thumb3",HAND },
+    { "LeftHandIndex1","l_index1",HAND },  { "LeftHandIndex2","l_index2",HAND },  { "LeftHandIndex3","l_index3",HAND },
+    { "LeftHandMiddle1","l_middle1",HAND },{ "LeftHandMiddle2","l_middle2",HAND },{ "LeftHandMiddle3","l_middle3",HAND },
+    { "LeftHandRing1","l_ring1",HAND },    { "LeftHandRing2","l_ring2",HAND },    { "LeftHandRing3","l_ring3",HAND },
+    { "LeftHandPinky1","l_pinky1",HAND },  { "LeftHandPinky2","l_pinky2",HAND },  { "LeftHandPinky3","l_pinky3",HAND },
+
+    { "RightHandThumb1","r_thumb1",HAND },  { "RightHandThumb2","r_thumb2",HAND },  { "RightHandThumb3","r_thumb3",HAND },
+    { "RightHandIndex1","r_index1",HAND },  { "RightHandIndex2","r_index2",HAND },  { "RightHandIndex3","r_index3",HAND },
+    { "RightHandMiddle1","r_middle1",HAND },{ "RightHandMiddle2","r_middle2",HAND },{ "RightHandMiddle3","r_middle3",HAND },
+    { "RightHandRing1","r_ring1",HAND },    { "RightHandRing2","r_ring2",HAND },    { "RightHandRing3","r_ring3",HAND },
+    { "RightHandPinky1","r_pinky1",HAND },  { "RightHandPinky2","r_pinky2",HAND },  { "RightHandPinky3","r_pinky3",HAND },
 };
 
 // ─── Hand joint angle limits (--enforce-hand-limits) ───────────────────────
@@ -370,15 +403,29 @@ static const HandLimitAlias HAND_LIMIT_ALIASES[] = {
     { "mixamorig:LeftHandRing1","finger4-1.l"   },{ "mixamorig:LeftHandRing2","finger4-2.l"   },{ "mixamorig:LeftHandRing3","finger4-3.l"   },
     { "mixamorig:LeftHandPinky1","finger5-1.l"  },{ "mixamorig:LeftHandPinky2","finger5-2.l"  },{ "mixamorig:LeftHandPinky3","finger5-3.l"  },
     { "mixamorig:LeftHandThumb1","lthumb"       },{ "mixamorig:LeftHandThumb2","finger1-2.l"  },{ "mixamorig:LeftHandThumb3","finger1-3.l"  },
+
+    // LAFAN1 (bare, no prefix) finger names alias onto the same MakeHuman rows.
+    { "RightHandIndex1","finger2-1.r" }, { "RightHandIndex2","finger2-2.r" }, { "RightHandIndex3","finger2-3.r" },
+    { "RightHandMiddle1","finger3-1.r"},{ "RightHandMiddle2","finger3-2.r"},{ "RightHandMiddle3","finger3-3.r"},
+    { "RightHandRing1","finger4-1.r"  },{ "RightHandRing2","finger4-2.r"  },{ "RightHandRing3","finger4-3.r"  },
+    { "RightHandPinky1","finger5-1.r" },{ "RightHandPinky2","finger5-2.r" },{ "RightHandPinky3","finger5-3.r" },
+    { "RightHandThumb1","rthumb"      },{ "RightHandThumb2","finger1-2.r" },{ "RightHandThumb3","finger1-3.r" },
+
+    { "LeftHandIndex1","finger2-1.l"  },{ "LeftHandIndex2","finger2-2.l"  },{ "LeftHandIndex3","finger2-3.l"  },
+    { "LeftHandMiddle1","finger3-1.l" },{ "LeftHandMiddle2","finger3-2.l" },{ "LeftHandMiddle3","finger3-3.l" },
+    { "LeftHandRing1","finger4-1.l"   },{ "LeftHandRing2","finger4-2.l"   },{ "LeftHandRing3","finger4-3.l"   },
+    { "LeftHandPinky1","finger5-1.l"  },{ "LeftHandPinky2","finger5-2.l"  },{ "LeftHandPinky3","finger5-3.l"  },
+    { "LeftHandThumb1","lthumb"       },{ "LeftHandThumb2","finger1-2.l"  },{ "LeftHandThumb3","finger1-3.l"  },
 };
 // clang-format on
 
 static const HandLimitEntry* find_hand_limit(const char* name)
 {
-    // Resolve a mixamorig: finger name to its MakeHuman equivalent first.
-    if (strncmp(name, "mixamorig:", 10) == 0)
-        for (const auto& a : HAND_LIMIT_ALIASES)
-            if (strcmp(a.mixamo, name) == 0) { name = a.makehuman; break; }
+    // Resolve a mixamorig:/LAFAN1 finger name to its MakeHuman equivalent first.
+    // (The alias keys are unique finger names, so scanning unconditionally can't
+    // mis-translate a body joint.)
+    for (const auto& a : HAND_LIMIT_ALIASES)
+        if (strcmp(a.mixamo, name) == 0) { name = a.makehuman; break; }
     for (const auto& e : HAND_LIMITS)
         if (strcmp(e.bvh_name, name) == 0) return &e;
     return nullptr;
