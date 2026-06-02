@@ -53,9 +53,11 @@
 //        per-binary help can just call it as part of its own output.
 // ════════════════════════════════════════════════════════════════════════════
 
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <glob.h>     // resolve_detector_defaults(): find libreyolo*.onnx in onnx_dir
 
 #include "fast_sam_3dbody.h"  // for fsb::PipelineConfig
 
@@ -84,7 +86,15 @@ struct CommonConfig
     float       person_thresh   = 0.50f;
     float       person_nms_iou  = 0.45f;
     int         max_persons     = 0;      // --max-persons N: 0 = unlimited; >0 = top-N by conf
-    std::string detector        = "yolo-pose"; // --detector: bbox provider (yolo-pose | libreyolo)
+    // --detector: bbox provider. "auto" (default) prefers a LibreYOLO model when
+    // one is present in onnx_dir (or when --yolo points at a libreyolo/yolov9
+    // export), else falls back to yolo-pose. resolve_detector_defaults() turns
+    // this into a concrete name ("yolo-pose" | "libreyolo") before it is read.
+    std::string detector        = "auto";
+    // Did the user explicitly pass these on the command line?  Drives the
+    // "auto" detector choice and the per-detector default threshold.
+    bool        yolo_path_set   = false;  // --yolo given
+    bool        thresh_set      = false;  // --thresh / --detector-threshold given
 
     // ── Input source ────────────────────────────────────────────────────────
     std::string from;             // file / webcam index / empty = required
@@ -136,7 +146,10 @@ inline bool parse_common_arg(int argc, const char* const* argv, int& i,
     // Pipeline
     CLI_STR ("--onnx-dir",             onnx_dir)
     CLI_STR ("--gguf",                 gguf_path)
-    CLI_STR ("--yolo",                 yolo_path)
+    // --yolo also records that the user pinned the model so the "auto" detector
+    // selection won't second-guess their path.
+    if (std::strcmp(argv[i], "--yolo") == 0 && i + 1 < argc)
+    { c.yolo_path = argv[++i]; c.yolo_path_set = true; return true; }
     CLI_STR ("--backbone",             backbone_name)
     CLI_STR ("--from",                 from)
     CLI_INT ("--frames",               max_frames)
@@ -145,8 +158,13 @@ inline bool parse_common_arg(int argc, const char* const* argv, int& i,
     CLI_BOOL("--trt",                  use_trt, true)
     CLI_BOOL("--no-fp16",              fp16,    false)
 
-    // YOLO tuning
-    CLI_FLT ("--thresh",               person_thresh)
+    // Detector tuning.  --detector-threshold is the preferred, self-describing
+    // spelling; --thresh is kept as a back-compat alias.  Both record that the
+    // threshold was set so resolve_detector_defaults() won't override it with a
+    // per-detector default.
+    if ((std::strcmp(argv[i], "--detector-threshold") == 0 ||
+         std::strcmp(argv[i], "--thresh") == 0) && i + 1 < argc)
+    { c.person_thresh = std::stof(argv[++i]); c.thresh_set = true; return true; }
     CLI_FLT ("--nms",                  person_nms_iou)
     CLI_INT ("--max-persons",          max_persons)
     CLI_STR ("--detector",             detector)
@@ -199,6 +217,59 @@ inline int detector_kind_from_string(const std::string& name)
     return fsb::PipelineConfig::DET_YOLO_POSE;
 }
 
+// True if the model filename looks like a LibreYOLO / YOLOv9 detection export
+// (vs an Ultralytics YOLO11-pose model), based on its basename.
+inline bool path_looks_like_libreyolo(const std::string& p)
+{
+    std::string base = p;
+    size_t slash = base.find_last_of("/\\");
+    if (slash != std::string::npos) base = base.substr(slash + 1);
+    for (auto& ch : base) ch = (char)std::tolower((unsigned char)ch);
+    return base.find("libreyolo") != std::string::npos ||
+           base.find("yolov9")    != std::string::npos ||
+           base.find("yolo9")     != std::string::npos;
+}
+
+// Resolve the "auto" detector default and the per-detector confidence default.
+// Call this once, after the argv loop and before apply_common_to_pipeline_cfg()
+// (or before a binary reads c.detector / c.yolo_path directly).  It is the
+// single place that implements "prefer LibreYOLO when available":
+//
+//   * detector == "auto" and the user did NOT pass --yolo  → scan onnx_dir for
+//     a libreyolo*.onnx and, if found, adopt it (LibreYOLO preferred over the
+//     Ultralytics yolo.onnx default).
+//   * detector == "auto"                                   → pick libreyolo vs
+//     yolo-pose from the (possibly user-pinned) model filename.
+//   * threshold not set on the CLI                         → default 0.25 for
+//     libreyolo (the tiny model scores people lower) else 0.50.
+//
+// An explicit --detector / --yolo / --detector-threshold always wins.
+inline void resolve_detector_defaults(CommonConfig& c)
+{
+    if (c.detector == "auto") {
+        // Prefer a LibreYOLO model on disk when the user hasn't pinned --yolo.
+        if (!c.yolo_path_set) {
+            std::string pattern = c.onnx_dir + "/libreyolo*.onnx";
+            glob_t g{};
+            if (glob(pattern.c_str(), 0, nullptr, &g) == 0 && g.gl_pathc > 0) {
+                c.yolo_path = g.gl_pathv[0];
+                std::fprintf(stderr,
+                    "[cli] --detector auto: found LibreYOLO model '%s'; "
+                    "preferring it over yolo-pose\n", c.yolo_path.c_str());
+            }
+            globfree(&g);
+        }
+        c.detector = path_looks_like_libreyolo(c.yolo_path) ? "libreyolo"
+                                                            : "yolo-pose";
+    }
+
+    if (!c.thresh_set) {
+        c.person_thresh =
+            (detector_kind_from_string(c.detector) ==
+             fsb::PipelineConfig::DET_LIBREYOLO) ? 0.25f : 0.50f;
+    }
+}
+
 // Populate the fields of a fsb::PipelineConfig that come straight from
 // CommonConfig.  Binary-specific fields (`skip_body_model`, `principal_x`,
 // `focal_x`, etc.) stay the caller's responsibility.
@@ -236,16 +307,18 @@ inline void print_common_args_help(FILE* fp)
         "                                 use backbone_int8.onnx after running tools/quantize_backbone.py)\n"
         "  --gguf     PATH                pipeline.gguf (MHR + camera heads)\n"
         "  --yolo     PATH                Detector model (.onnx); YOLO11-pose or a LibreYOLO/YOLOv9 export\n"
-        "  --detector NAME                Bbox provider that parses --yolo output: yolo-pose (default,\n"
-        "                                 56-ch YOLO11-pose) | libreyolo (84-ch YOLOv9 detection, bbox-only)\n"
+        "  --detector NAME                Bbox provider parsing --yolo output: auto (default; prefers a\n"
+        "                                 libreyolo*.onnx in onnx-dir, else yolo-pose) | yolo-pose (56-ch\n"
+        "                                 YOLO11-pose) | libreyolo (84-ch YOLOv9 detection, bbox-only)\n"
         "  --from     PATH                Input source (file path, or webcam index where supported)\n"
         "  --frames   N                   Stop after N frames (useful for quick tests; default unlimited)\n"
         "  --start    N                   Skip to frame N before processing (seek into the video; default 0)\n"
         "  --cuda     N                   CUDA device (-1 = CPU; default 0)\n"
         "  --trt                          Use ONNX Runtime TensorRT EP\n"
         "  --no-fp16                      Disable FP16\n"
-        "  --thresh   F                   YOLO person confidence (default 0.50)\n"
-        "  --nms      F                   YOLO NMS IoU (default 0.45)\n"
+        "  --detector-threshold F         Person confidence threshold (default 0.50; 0.25 for libreyolo,\n"
+        "                                 whose tiny model scores people lower).  Alias: --thresh\n"
+        "  --nms      F                   Detector NMS IoU (default 0.45)\n"
         "  --max-persons N                Cap processing to the top-N most-confident people (0 = unlimited)\n"
         "  --bvh      PATH                Write BVH motion-capture file(s); per-person filenames appended\n"
         "  --bvh-template PATH            BVH skeleton template (default ./body_mhr.bvh,\n"

@@ -103,10 +103,11 @@ static void print_usage(const char* prog)
         "  --cuda     N               CUDA device index, -1 for CPU (default 0)\n"
         "  --trt                      Use ONNX Runtime TensorRT EP\n"
         "  --no-fp16                  Disable FP16\n"
-        "  --thresh   F               YOLO person confidence (default 0.50)\n"
-        "  --nms      F               YOLO NMS IoU (default 0.45)\n"
+        "  --detector-threshold F     Person confidence (default 0.50; 0.25 for libreyolo). Alias: --thresh\n"
+        "  --nms      F               Detector NMS IoU (default 0.45)\n"
         "  --max-persons N            Cap to top-N most-confident people (0 = unlimited)\n"
-        "  --detector NAME            Bbox provider parsing --yolo output: yolo-pose (default) | libreyolo\n"
+        "  --detector NAME            Bbox provider parsing --yolo output: auto (default; prefers a\n"
+        "                             libreyolo*.onnx in onnx-dir, else yolo-pose) | yolo-pose | libreyolo\n"
         "\n"
         "SMOOTHING\n"
         "  --smoothing zero-phase|forward|off\n"
@@ -255,6 +256,7 @@ int main(int argc, char** argv)
     fsb::Pipeline pipeline;
     {
         fsb::PipelineConfig pcfg;
+        resolve_detector_defaults(cfg);         // "auto" → libreyolo when available
         apply_common_to_pipeline_cfg(cfg, pcfg);
         pcfg.skip_body_model = false;  // we need keypoints_3d for jitter detection
         if (!pipeline.load(pcfg)) {

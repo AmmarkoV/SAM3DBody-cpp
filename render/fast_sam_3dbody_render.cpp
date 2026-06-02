@@ -642,6 +642,8 @@ int main(int argc, const char** argv) {
         if (!strcmp(argv[i], "--butterworth-root-rotation")){ filter_root_rot  = true; continue; }
         if (!strcmp(argv[i], "--headless"))                 { headless = true; continue; }
     }
+    resolve_detector_defaults(cc);  // "auto" → libreyolo when available; sets the
+                                    // per-detector default threshold too
     // Unpack the common parser's output into the local variables the
     // rest of main() expects.  Keeping the locals avoids a wholesale
     // refactor of the rendering loop's pipeline-config / BVH-writer /
@@ -683,6 +685,8 @@ int main(int argc, const char** argv) {
         cfg.use_fp16        = fp16;
         cfg.max_persons     = max_persons;
         cfg.detector        = detector;
+        cfg.person_thresh   = cc.person_thresh;   // honour --detector-threshold / per-detector default
+        cfg.person_nms_iou  = cc.person_nms_iou;
         cfg.skip_body_model = true;    // LBS runs natively in C; skip body_model.onnx
         if (!pipeline.load(cfg)) {
             fprintf(stderr, "Failed to load pipeline\n"); return 1;

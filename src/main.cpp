@@ -100,10 +100,11 @@ static void print_usage(const char* prog)
     printf("  --no-fp16         Disable FP16 for ONNX EP\n");
     printf("  --skip-body       Skip body model (no vertices / keypoints)\n");
     printf("  --dev-face        Enable face expression params (disabled by default)\n");
-    printf("  --thresh T        YOLO person confidence threshold (default 0.50)\n");
-    printf("  --nms T           YOLO NMS IoU threshold (default 0.45)\n");
+    printf("  --detector-threshold F  Person confidence (default 0.50; 0.25 for libreyolo). Alias: --thresh\n");
+    printf("  --nms T           Detector NMS IoU threshold (default 0.45)\n");
     printf("  --max-persons N   Cap to top-N most-confident people (0 = unlimited)\n");
-    printf("  --detector NAME   Bbox provider parsing --yolo output: yolo-pose (default) | libreyolo\n");
+    printf("  --detector NAME   Bbox provider parsing --yolo output: auto (default; prefers libreyolo*.onnx\n");
+    printf("                    in onnx-dir, else yolo-pose) | yolo-pose | libreyolo\n");
     printf("  --fx F            Camera focal length x (0 = image width)\n");
     printf("  --fy F            Camera focal length y (0 = image width)\n");
     printf("  --cx F            Principal point x (0 = width/2)\n");
@@ -483,6 +484,7 @@ int main(int argc, char** argv)
     BVHWriter bvh_writer;
 
     fsb::PipelineConfig pcfg;
+    resolve_detector_defaults(c);           // "auto" → libreyolo when available
     apply_common_to_pipeline_cfg(c, pcfg);  // all shared pipeline fields
     pcfg.skip_body_model  = c.skip_body;
     pcfg.zero_face_params = c.zero_face;
