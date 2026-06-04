@@ -96,6 +96,14 @@ public:
     // default — opt in via --foot-contact.
     void set_foot_contact(bool on) { foot_contact_ = on; }
 
+    // Override the BVH "Frame Time" written at close().  Useful for live capture
+    // when stale frames were dropped: the nominal camera period no longer matches
+    // the real per-frame wall-clock spacing, so playback would run fast.  Passing
+    // the measured effective period (wall_seconds / processed_frames) keeps the
+    // exported motion at real-time speed.  Ignored if <= 0.
+    void set_frame_time(float ft) { if (ft > 0.0f) frame_time_ = ft; }
+    float frame_time() const { return frame_time_; }
+
     BVHWriter()  = default;
     ~BVHWriter() { if (is_open()) close(); }
     BVHWriter(const BVHWriter&)            = delete;

@@ -596,6 +596,8 @@ int main(int argc, const char** argv) {
     int    cap_w      = 0;   // capture width  (0 = driver default)
     int    cap_h      = 0;   // capture height (0 = driver default)
     double cap_fps    = 0.0; // capture fps    (0 = driver default)
+    bool   no_drop    = false; // --no-drop: process every captured frame (lockstep),
+                               // disabling the live-source stale-frame skipping
 
     // Common flags go through the shared parser; binary-specific flags
     // (--mesh, --lbs, --save-frames, --render-size, --size, --fps,
@@ -641,6 +643,7 @@ int main(int argc, const char** argv) {
         if (!strcmp(argv[i], "--butterworth"))              { use_butterworth  = true; continue; }
         if (!strcmp(argv[i], "--butterworth-root-rotation")){ filter_root_rot  = true; continue; }
         if (!strcmp(argv[i], "--headless"))                 { headless = true; continue; }
+        if (!strcmp(argv[i], "--no-drop"))                  { no_drop = true; continue; }
     }
     resolve_detector_defaults(cc);  // "auto" → libreyolo when available; sets the
                                     // per-detector default threshold too
@@ -695,11 +698,17 @@ int main(int argc, const char** argv) {
 
     // ── Video/image source ────────────────────────────────────────────────────
     bool is_image = false;
+    bool is_live  = false;       // webcam / live device → drop stale frames to stay in sync
+    const int LIVE_BUFFER = 3;   // driver ring-buffer depth requested for live sources
     cv::Mat static_img;
     cv::VideoCapture cap;
     {
         bool numeric = !src.empty() &&
                        (src[0]=='-' || isdigit((unsigned char)src[0]));
+        // Live capture devices: a numeric camera index or a /dev/video* node.
+        // Video files and image paths are NOT live — they must be processed
+        // frame-exact, so frame-dropping is gated on this flag.
+        is_live = numeric || src.rfind("/dev/video", 0) == 0;
         if (numeric) {
             cap.open(std::stoi(src));
         } else {
@@ -715,6 +724,11 @@ int main(int argc, const char** argv) {
             if (cap_w > 0) cap.set(cv::CAP_PROP_FRAME_WIDTH,  cap_w);
             if (cap_h > 0) cap.set(cv::CAP_PROP_FRAME_HEIGHT, cap_h);
             if (cap_fps > 0.0) cap.set(cv::CAP_PROP_FPS,      cap_fps);
+            // Small ring buffer for live sources so the driver overwrites stale
+            // frames once we fall behind — bounds latency to a few frames instead
+            // of letting an unbounded FIFO accumulate.  Backend-dependent (V4L2
+            // honours it); the time-based drain below works regardless.
+            if (is_live && !no_drop) cap.set(cv::CAP_PROP_BUFFERSIZE, LIVE_BUFFER);
             if (start_frame > 0) {
                 cap.set(cv::CAP_PROP_POS_FRAMES, (double)start_frame);
                 printf("[start] seeking to frame %d\n", start_frame);
@@ -877,8 +891,13 @@ int main(int argc, const char** argv) {
 
     // ── Render loop ───────────────────────────────────────────────────────────
 #define NS_NOW() ({ struct timespec _t; clock_gettime(CLOCK_MONOTONIC,&_t); (long long)_t.tv_sec*1000000000LL + _t.tv_nsec; })
-    long long t_last_frame = NS_NOW();
-    double    fps_ema      = 0.0;
+    long long t_last_frame    = NS_NOW();
+    long long t_last_grab     = NS_NOW();   // wall-clock of the last frame we pulled (live sync)
+    long long t_session_start = NS_NOW();   // for measuring the effective live frame rate
+    double    fps_ema         = 0.0;
+    long long dropped_frames  = 0;       // stale live frames skipped to stay in sync
+    long long processed_frames = 0;      // frames actually run through the pipeline
+    bool      frame_dropping = is_live && !no_drop;  // active only for live sources
     // Frame counter for the exported OBJ filenames.  Starts at start_frame so the
     // .obj name reflects the absolute video frame when seeking with --start (the
     // BVH keeps its own 0-based session timeline).  --frames counts from here.
@@ -888,12 +907,30 @@ int main(int argc, const char** argv) {
     cv::Mat frame;
     while (glx3_checkEvents()) 
     {
-        if (is_image) 
+        if (is_image)
         {
             frame = static_img;
-        } else 
+        } else
         {
-            cap >> frame;
+            // Live sources: discard the frames that queued up while the previous
+            // frame was being processed, keeping only the newest.  How many to
+            // drop ≈ (time we spent busy) × fps, clamped to the ring depth (the
+            // driver has already overwritten anything older, so grabbing beyond
+            // that would block waiting on a not-yet-captured frame).  Video files
+            // fall through untouched and are read frame-by-frame.
+            if (frame_dropping)
+            {
+                double elapsed_s = (NS_NOW() - t_last_grab) / 1e9;
+                int    behind    = (int)(elapsed_s * video_fps) - 1;
+                if (behind > LIVE_BUFFER - 1) behind = LIVE_BUFFER - 1;
+                bool   ended     = false;
+                for (int s = 0; s < behind; ++s)
+                    if (!cap.grab()) { ended = true; break; }   // discard stale
+                    else             ++dropped_frames;
+                if (ended) break;                               // stream closed
+            }
+            cap >> frame;                 // newest available frame
+            t_last_grab = NS_NOW();
             if (frame.empty()) break;
         }
 
@@ -1197,9 +1234,53 @@ int main(int argc, const char** argv) {
         }
 
         ++frame_index;   // lockstep with bvh_writer's session frame counter
+        ++processed_frames;
 
         if (frame_stop > 0 && frame_index >= frame_stop) break;
         if (is_image) break;   // keep window open only for live sources
+    }
+
+    // ── Frame-sync summary (live sources only) ────────────────────────────────
+    // fprintf to stderr ends the in-place "\r" status line with a newline first.
+    if (is_live) {
+        fprintf(stderr, "\n");
+        long long total   = processed_frames + dropped_frames;
+        double    wall_s  = (NS_NOW() - t_session_start) / 1e9;
+        // Effective output rate: how many frames we actually emitted per real
+        // second.  Assuming a roughly constant rate, this is the correct BVH
+        // playback rate — the nominal camera fps over-counts because dropped
+        // (and slow-inference) frames don't reach the motion buffer.
+        double    eff_fps = (wall_s > 0.0) ? (processed_frames / wall_s) : 0.0;
+
+        if (frame_dropping) {
+            double pct = total > 0 ? (100.0 * dropped_frames / total) : 0.0;
+            printf("[sync] live frame-dropping ON: processed %lld frame(s), "
+                   "dropped %lld stale frame(s) to stay in sync (%.1f%% of %lld captured).\n",
+                   processed_frames, dropped_frames, pct, total);
+        } else {
+            printf("[sync] live frame-dropping OFF (--no-drop): processed %lld frame(s) in "
+                   "lockstep. If inference lags the camera, latency accumulates and the "
+                   "driver may still drop frames on its own.\n",
+                   processed_frames);
+        }
+
+        // Retime the recorded BVH to the measured rate so playback is real-time.
+        // Only meaningful when we were dropping frames: there each emitted frame
+        // tracks "now" in wall-clock, so processed_frames are spread evenly over
+        // wall_s and 1/eff_fps is the true inter-frame period.  With --no-drop the
+        // frames are consecutive camera frames that keep their nominal spacing, so
+        // we leave the Frame Time alone (and just report the throughput).
+        if (frame_dropping && bvh_writer.is_open() && eff_fps > 0.0 && processed_frames >= 5) {
+            float old_ft = bvh_writer.frame_time();
+            float new_ft = (float)(1.0 / eff_fps);
+            bvh_writer.set_frame_time(new_ft);
+            printf("[sync] effective rate %.2f fps over %.1f s — retimed BVH Frame Time "
+                   "%.4f → %.4f s/frame (was nominal %.2f fps) for real-time playback.\n",
+                   eff_fps, wall_s, old_ft, new_ft, old_ft > 0.f ? 1.f/old_ft : 0.f);
+        } else if (eff_fps > 0.0) {
+            printf("[sync] effective rate %.2f fps over %.1f s%s.\n", eff_fps, wall_s,
+                   bvh_writer.is_open() ? " (BVH Frame Time left at nominal)" : "");
+        }
     }
 
     // ── Cleanup ───────────────────────────────────────────────────────────────
