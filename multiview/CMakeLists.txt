@@ -15,7 +15,7 @@ target_compile_options(multiview_calib PRIVATE
 
 # Unit test: parse the committed fixture and check the values.
 add_executable(calib_test calib_test.c)
-target_link_libraries(calib_test PRIVATE multiview_calib m)
+target_link_libraries(calib_test PRIVATE multiview_calib ${MATH_LIB})
 add_test(NAME calib_test
          COMMAND calib_test ${CMAKE_CURRENT_SOURCE_DIR}/test_data/sample.calib)
 

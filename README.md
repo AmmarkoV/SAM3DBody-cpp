@@ -239,6 +239,18 @@ CMake handles dependencies automatically:
 > libonnxruntime_providers_cuda.so` or `Could not find an implementation for
 > Expand(13)`, see **[DEPENDENCIES.md](DEPENDENCIES.md)** for the cause and fix.
 
+#### Windows (headless build)
+
+Windows is supported as a **headless build only** (MSVC + CMake; OpenCV via
+vcpkg). CMake automatically fetches the `win-x64` ONNX Runtime and configures the
+CLI (`fast_sam_3dbody_run`) and offline BVH extractor (`offline_sam_3dbody_render`).
+
+The live OpenGL overlay viewer (`fast_sam_3dbody_render`) is **not built on
+Windows** — it depends on GLX/X11, which has no in-tree Windows equivalent. CMake
+prints a notice to this effect at configure time. For visualization on Windows,
+use the offline BVH output or the Python frontends. Linux remains the platform
+for live rendering.
+
 Outputs in `build/`:
 
 | File | Description |

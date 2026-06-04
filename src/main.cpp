@@ -11,17 +11,16 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <string>
-#include <sys/stat.h>
-#include <time.h>
 
-// Monotonic nanosecond timestamp (POSIX; avoids chrono overhead in tight loops)
+// Monotonic nanosecond timestamp (portable; std::chrono steady clock)
 static uint64_t get_mono_ns()
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
 }
 
 using Clock = std::chrono::steady_clock;
@@ -440,8 +439,7 @@ int main(int argc, char** argv)
     // instead of the repo root.
     // -----------------------------------------------------------------------
     {
-        struct stat st{};
-        if (c.onnx_dir == "./onnx" && stat("./onnx", &st) != 0)
+        if (c.onnx_dir == "./onnx" && !std::filesystem::exists("./onnx"))
         {
             fprintf(stderr,
                 "\n"
