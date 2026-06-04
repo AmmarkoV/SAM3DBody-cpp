@@ -85,7 +85,8 @@ Then run with `--backbone backbone_fp32.onnx --cuda -1`:
 > WSL2 users: if `nvidia-smi` works inside WSL, install the
 > [CUDA toolkit for WSL2](https://developer.nvidia.com/cuda-downloads)
 > (do **not** install the full Linux driver — only the WSL2 toolkit) and use
-> the standard `backbone.onnx` instead.
+> the standard `backbone.onnx` instead. See **[WSL.md](WSL.md)** for a full
+> step-by-step WSL2 setup guide.
 
 > **CMake will warn** at configure time if neither `onnx/` nor the zip is found.
 
@@ -232,6 +233,11 @@ CMake handles dependencies automatically:
 - **ONNX Runtime 1.20.1** – downloaded from GitHub releases if not found; point to an existing install with `-DONNX_RUNTIME_DIR=/path/to/onnxruntime`
 - **ggml** – fetched via `FetchContent` from GitHub
 - **CUDA** – auto-detected; set `-DCMAKE_CUDA_ARCHITECTURES=86` (or `75`, `89`, etc.) for your GPU; falls back to CPU-only if not found
+
+> **Builds fine but fails at runtime?** The ORT 1.20.1 CUDA provider needs
+> **CUDA 12.x + cuDNN 9.x**. If you see `Failed to load library
+> libonnxruntime_providers_cuda.so` or `Could not find an implementation for
+> Expand(13)`, see **[DEPENDENCIES.md](DEPENDENCIES.md)** for the cause and fix.
 
 Outputs in `build/`:
 
