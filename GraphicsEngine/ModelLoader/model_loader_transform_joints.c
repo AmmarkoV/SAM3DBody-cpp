@@ -1439,9 +1439,10 @@ int mhr_lbs_compute(const struct MHR_LBS_Data *d,
     int npc = d->pt_cols;
 
     /* First-frame dump: write model_params [204 floats] to /tmp/mhr_lbs_dump.bin
-     * so dump_joint_transforms.py can reproduce and verify every stage offline. */
+     * so dump_joint_transforms.py can reproduce and verify every stage offline.
+     * Opt-in only — set FSB_LBS_DUMP=1 to enable (off by default). */
     { static int dumped = 0;
-      if (!dumped) {
+      if (!dumped && getenv("FSB_LBS_DUMP")) {
           dumped = 1;
           FILE *fp = fopen("/tmp/mhr_lbs_dump.bin","wb");
           if (fp) {

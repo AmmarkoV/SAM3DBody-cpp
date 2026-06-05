@@ -337,6 +337,21 @@ struct Pipeline::Impl
     struct MHR_LBS_Data* lbs_data = nullptr;
     MHR_LBS_CUDACtx*    lbs_cuda = nullptr;   // GPU-accelerated path; null on CPU builds
 
+    // ── per-stage timing accumulators ──────────────────────────────────────────
+    // Wall time (ms) spent in each pipeline stage, summed across every
+    // process_*() call.  print_timing_summary() reports the per-frame averages.
+    struct StageTimers
+    {
+        double   detection  = 0.0;   // YOLO person detection
+        double   preprocess = 0.0;   // crop / normalise / condition+ray info
+        double   backbone   = 0.0;   // backbone.onnx
+        double   decoder    = 0.0;   // decoder.onnx
+        double   mhr_ffn    = 0.0;   // MHR + camera CPU FFN heads
+        double   body_model = 0.0;   // body_model.onnx or native LBS
+        uint64_t frames     = 0;     // images processed
+        uint64_t persons    = 0;     // total person crops processed
+    } timers;
+
     // ── load ──────────────────────────────────────────────────────────────────
     bool load(const PipelineConfig& c)
     {
@@ -672,10 +687,14 @@ struct Pipeline::Impl
         // Apply max_persons cap (sorted by confidence from NMS)
         if (cfg.max_persons > 0 && (int)dets.size() > cfg.max_persons)
             dets.resize(cfg.max_persons);
-        printf("[FSB] detection: %.1f ms  persons: %zu\n", ms(t0), dets.size());
+        double dt_detect = ms(t0);
+        timers.detection += dt_detect;
+        printf("[FSB] detection: %.1f ms  persons: %zu\n", dt_detect, dets.size());
 
         // ── per-person crops ──────────────────────────────────────────────────
         const int B = (int)dets.size();
+        timers.frames  += 1;
+        timers.persons += (uint64_t)B;
         const int plane = CROP_SIZE * CROP_SIZE;
 
         // Pre-allocate batch buffers
@@ -703,7 +722,9 @@ struct Pipeline::Impl
             float* ray_ptr = batch_ray.data() + i * 2 * ray_plane;
             compute_ray_cond(ccx, ccy, csz, fx, fy, cx, cy, ray_ptr);
         }
-        printf("[FSB] preprocess: %.1f ms\n", ms(t0));
+        double dt_pre = ms(t0);
+        timers.preprocess += dt_pre;
+        printf("[FSB] preprocess: %.1f ms\n", dt_pre);
 
         // ── backbone ─────────────────────────────────────────────────────────
         t0 = Clock::now();
@@ -722,7 +743,9 @@ struct Pipeline::Impl
                                 sess_backbone.output_names.data(), 1);
         const float* feat_ptr = backbone_out[0].GetTensorData<float>();
         std::vector<float> features(feat_ptr, feat_ptr + feat_elems);
-        printf("[FSB] backbone:   %.1f ms\n", ms(t0));
+        double dt_bb = ms(t0);
+        timers.backbone += dt_bb;
+        printf("[FSB] backbone:   %.1f ms\n", dt_bb);
 
         // ── decoder ──────────────────────────────────────────────────────────
         t0 = Clock::now();
@@ -754,13 +777,17 @@ struct Pipeline::Impl
                                dec_out_names.data(), 1);
         const float* token_ptr = decoder_out[0].GetTensorData<float>();
         std::vector<float> pose_tokens(token_ptr, token_ptr + token_elems);
-        printf("[FSB] decoder:    %.1f ms\n", ms(t0));
+        double dt_dec = ms(t0);
+        timers.decoder += dt_dec;
+        printf("[FSB] decoder:    %.1f ms\n", dt_dec);
 
         // ── MHR head (CPU FFN) ────────────────────────────────────────────────
         t0 = Clock::now();
         std::vector<float> mhr_raw  = cffn_run(mhr_ffn, pose_tokens.data(), B);
         std::vector<float> cam_raw  = cffn_run(cam_ffn, pose_tokens.data(), B);
-        printf("[FSB] MHR FFN:    %.1f ms\n", ms(t0));
+        double dt_ffn = ms(t0);
+        timers.mhr_ffn += dt_ffn;
+        printf("[FSB] MHR FFN:    %.1f ms\n", dt_ffn);
 
         // ── body model (optional) ─────────────────────────────────────────────
         std::vector<float> all_verts, all_skel;
@@ -833,7 +860,9 @@ struct Pipeline::Impl
             size_t sn = (size_t)B * 127   * 8;
             all_verts.assign(vp, vp + vn);
             all_skel.assign(sp,  sp + sn);
-            printf("[FSB] body_model: %.1f ms\n", ms(t0));
+            double dt_body = ms(t0);
+            timers.body_model += dt_body;
+            printf("[FSB] body_model: %.1f ms\n", dt_body);
         }
         else if (!cfg.skip_body_model && lbs_data)
         {
@@ -900,7 +929,9 @@ struct Pipeline::Impl
                 }
                 printf("[FSB] LBS person %d done\n", i);
             }
-            printf("[FSB] LBS:      %.1f ms, verts=%zu skel=%zu\n", ms(t0), all_verts.size(), all_skel.size());
+            double dt_lbs = ms(t0);
+            timers.body_model += dt_lbs;
+            printf("[FSB] LBS:      %.1f ms, verts=%zu skel=%zu\n", dt_lbs, all_verts.size(), all_skel.size());
         }
 
         // ── assemble MHRResult per person ────────────────────────────────────
@@ -1152,6 +1183,29 @@ struct Pipeline::Impl
         }
         loaded = false;
     }
+
+    // ── timing summary ──────────────────────────────────────────────────────────
+    // One line with the per-frame average wall time of every pipeline stage,
+    // plus the number of frames / person crops processed.
+    void print_timing_summary() const
+    {
+        if (timers.frames == 0)
+        {
+            printf("[FSB] timing: no frames processed.\n");
+            return;
+        }
+        const double n = (double)timers.frames;
+        const double total = timers.detection + timers.preprocess + timers.backbone +
+                             timers.decoder + timers.mhr_ffn + timers.body_model;
+        printf("[FSB] timing over %llu frame(s), %llu person crop(s)  |  "
+               "detection=%.2f  preprocess=%.2f  backbone=%.2f  decoder=%.2f  "
+               "mhr_ffn=%.2f  body_model=%.2f  |  total=%.2f ms/frame\n",
+               (unsigned long long)timers.frames,
+               (unsigned long long)timers.persons,
+               timers.detection / n, timers.preprocess / n, timers.backbone / n,
+               timers.decoder / n,   timers.mhr_ffn / n,    timers.body_model / n,
+               total / n);
+    }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1195,6 +1249,10 @@ void Pipeline::print_info() const
 std::vector<MHRResult> Pipeline::process_bgr(const uint8_t* bgr, int w, int h)
 {
     return impl_->process_bgr(bgr, w, h);
+}
+void Pipeline::print_timing_summary() const
+{
+    if (impl_) impl_->print_timing_summary();
 }
 std::vector<float> Pipeline::scene_embedding(const uint8_t* bgr, int w, int h)
 {

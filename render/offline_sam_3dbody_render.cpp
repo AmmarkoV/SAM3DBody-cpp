@@ -307,6 +307,7 @@ int main(int argc, char** argv)
     // PASS 6 — BVH export -----------------------------------------------
     export_to_bvh(frames, tracks, scene_cuts, fps, cfg);
 
+    pipeline.print_timing_summary();
     printf("done.\n");
     return 0;
 }

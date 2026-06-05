@@ -845,6 +845,7 @@ int main(int argc, char** argv)
         printf("  Inf fps  : %.1f\n", frame_count * 1000.0 / (total_inf_ms > 0 ? total_inf_ms : 1));
         printf("  Wall fps : %.1f\n", frame_count / (wall_s > 0 ? wall_s : 1));
         printf("  Inf ms   : %.2f / frame\n", total_inf_ms / frame_count);
+        pipeline.print_timing_summary();
     }
 
     if (bvh_writer.is_open())

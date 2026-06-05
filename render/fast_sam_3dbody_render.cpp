@@ -38,6 +38,7 @@ extern "C" {
 #include "../src/bvh_writer.h"
 
 #include <cstdio>
+#include <cstdlib>   // getenv (FSB_LBS_DUMP gate)
 #include <cstring>
 #include <string>
 #include <vector>
@@ -1112,9 +1113,10 @@ int main(int argc, const char** argv) {
                                  MESH_EXPORT_POS_SCALE);
             }
 
-            // First-frame verts dump for verify_transforms.py LBS comparison
+            // First-frame verts dump for verify_transforms.py LBS comparison.
+            // Opt-in only — set FSB_LBS_DUMP=1 to enable (off by default).
             { static int verts_dumped = 0;
-              if (!verts_dumped) {
+              if (!verts_dumped && getenv("FSB_LBS_DUMP")) {
                   verts_dumped = 1;
                   FILE* fp = fopen("/tmp/cpp_lbs_verts.bin", "wb");
                   if (fp) {
@@ -1285,6 +1287,8 @@ int main(int argc, const char** argv) {
                    bvh_writer.is_open() ? " (BVH Frame Time left at nominal)" : "");
         }
     }
+
+    pipeline.print_timing_summary();
 
     // ── Cleanup ───────────────────────────────────────────────────────────────
     if (bvh_writer.is_open()) bvh_writer.close();

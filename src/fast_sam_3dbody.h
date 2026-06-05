@@ -154,6 +154,11 @@ public:
     // Print loaded model info.
     void print_info() const;
 
+    // Print a one-line per-stage timing summary (per-frame averages of detection,
+    // preprocess, backbone, decoder, MHR FFN and body model), plus the number of
+    // frames and person crops processed across the lifetime of this Pipeline.
+    void print_timing_summary() const;
+
 private:
     struct Impl;
     Impl* impl_ = nullptr;
