@@ -1186,18 +1186,23 @@ struct Pipeline::Impl
 
     // ── timing summary ──────────────────────────────────────────────────────────
     // One line with the per-frame average wall time of every pipeline stage,
-    // plus the number of frames / person crops processed.
+    // plus the number of frames / person crops processed.  Printed to stderr so
+    // it stays visible alongside the live FPS/Latency line even when a frontend
+    // redirects stdout to a file (e.g. scripts/webcam.sh → /tmp/render_raw.txt).
     void print_timing_summary() const
     {
         if (timers.frames == 0)
         {
-            printf("[FSB] timing: no frames processed.\n");
+            fprintf(stderr, "[FSB] timing: no frames processed.\n");
             return;
         }
         const double n = (double)timers.frames;
         const double total = timers.detection + timers.preprocess + timers.backbone +
                              timers.decoder + timers.mhr_ffn + timers.body_model;
-        printf("[FSB] timing over %llu frame(s), %llu person crop(s)  |  "
+        // Leading newline: the live FPS/Latency line is redrawn with '\r' and no
+        // trailing newline, so start the summary on a fresh line.
+        fprintf(stderr,
+               "\n[FSB] timing over %llu frame(s), %llu person crop(s)  |  "
                "detection=%.2f  preprocess=%.2f  backbone=%.2f  decoder=%.2f  "
                "mhr_ffn=%.2f  body_model=%.2f  |  total=%.2f ms/frame\n",
                (unsigned long long)timers.frames,
