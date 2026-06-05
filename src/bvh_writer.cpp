@@ -1171,15 +1171,29 @@ void BVHWriter::append_row_from_state(PerPerson& p, const fsb::MHRResult& r)
 
         if (s.is_root && jh.hasPositionalChannels)
         {
-            set_channel(mc_, row, s.bvh_jid, BVH_POSITION_X, r.pred_cam_t[0] * POS_SCALE);
-            set_channel(mc_, row, s.bvh_jid, BVH_POSITION_Y, r.pred_cam_t[1] * POS_SCALE);
-            set_channel(mc_, row, s.bvh_jid, BVH_POSITION_Z, r.pred_cam_t[2] * POS_SCALE);
+            if (static_root_)
+            {
+                // Pin the body at the origin facing forward: drop both global
+                // translation and global rotation so only the local pose remains.
+                set_channel(mc_, row, s.bvh_jid, BVH_POSITION_X, 0.0f);
+                set_channel(mc_, row, s.bvh_jid, BVH_POSITION_Y, 0.0f);
+                set_channel(mc_, row, s.bvh_jid, BVH_POSITION_Z, 0.0f);
+                set_channel(mc_, row, s.bvh_jid, BVH_ROTATION_Z, 0.0f);
+                set_channel(mc_, row, s.bvh_jid, BVH_ROTATION_Y, 0.0f);
+                set_channel(mc_, row, s.bvh_jid, BVH_ROTATION_X, 0.0f);
+            }
+            else
+            {
+                set_channel(mc_, row, s.bvh_jid, BVH_POSITION_X, r.pred_cam_t[0] * POS_SCALE);
+                set_channel(mc_, row, s.bvh_jid, BVH_POSITION_Y, r.pred_cam_t[1] * POS_SCALE);
+                set_channel(mc_, row, s.bvh_jid, BVH_POSITION_Z, r.pred_cam_t[2] * POS_SCALE);
 
-            float a, b, c;
-            mat3_to_zyx(m, a, b, c);
-            set_channel(mc_, row, s.bvh_jid, BVH_ROTATION_Z, a * RAD2DEG);
-            set_channel(mc_, row, s.bvh_jid, BVH_ROTATION_Y, b * RAD2DEG);
-            set_channel(mc_, row, s.bvh_jid, BVH_ROTATION_X, c * RAD2DEG);
+                float a, b, c;
+                mat3_to_zyx(m, a, b, c);
+                set_channel(mc_, row, s.bvh_jid, BVH_ROTATION_Z, a * RAD2DEG);
+                set_channel(mc_, row, s.bvh_jid, BVH_ROTATION_Y, b * RAD2DEG);
+                set_channel(mc_, row, s.bvh_jid, BVH_ROTATION_X, c * RAD2DEG);
+            }
         }
         else
         {

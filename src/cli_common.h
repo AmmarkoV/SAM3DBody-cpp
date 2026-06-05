@@ -113,6 +113,7 @@ struct CommonConfig
     bool        bvh_rest_align                 = true;    // --no-bvh-rest-align
     bool        bvh_dump_rest_dirs             = false;   // --dump-rest-dirs
     bool        bvh_foot_contact               = false;   // --foot-contact
+    bool        bvh_static_root                = false;   // --bvh-static-root
 
     // ── Filtering knobs ─────────────────────────────────────────────────────
     // Defaults match the live binaries; the offline binary overrides
@@ -185,6 +186,7 @@ inline bool parse_common_arg(int argc, const char* const* argv, int& i,
     CLI_BOOL("--no-bvh-rest-align",        bvh_rest_align,                 false)
     CLI_BOOL("--dump-rest-dirs",           bvh_dump_rest_dirs,             true)
     CLI_BOOL("--foot-contact",             bvh_foot_contact,               true)
+    CLI_BOOL("--bvh-static-root",          bvh_static_root,                true)
 
     // Filters
     CLI_FLT ("--bw-cutoff",            bw_cutoff)
@@ -339,6 +341,8 @@ inline void print_common_args_help(FILE* fp)
         "  --dump-rest-dirs               Print the per-bone template-vs-MHR rest-direction table at open\n"
         "  --foot-contact                 Clean up foot-skate: level the root to a fitted floor and run\n"
         "                                 2-bone leg IK to pin planted feet (offline; off by default)\n"
+        "  --bvh-static-root              Zero the root position and rotation every frame, pinning the\n"
+        "                                 body in place (in-place motion; off by default)\n"
         "  --bw-cutoff HZ                 Butterworth cutoff (default 6 Hz)\n"
         "  --rot-clamp DEG                Geodesic SLERP clamp on global_rot (default 1 deg/frame;\n"
         "                                 offline binary defaults to 30)\n");

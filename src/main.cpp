@@ -117,6 +117,7 @@ static void print_usage(const char* prog)
     printf("  --bvh-raw-fingers           Do NOT rescale finger End-Site OFFSETs to MHR fingertip lengths\n");
     printf("  --no-enforce-hand-limits    Disable the default finger-angle anatomical clamp\n");
     printf("  --no-sticky-hand-pose       Disable the default 'inherit previous frame's hand pose'\n");
+    printf("  --bvh-static-root           Zero the root position and rotation each frame (in-place motion)\n");
     printf("  --headless        Do not open display windows\n");
     printf("  --info            Print pipeline info and exit\n");
     printf("  --butterworth              Apply Butterworth low-pass filter to MHR output vectors\n");
@@ -616,6 +617,7 @@ int main(int argc, char** argv)
         else
         {
             bvh_writer.set_foot_contact(c.bvh_foot_contact);
+            bvh_writer.set_static_root(c.bvh_static_root);
             printf("[main] Writing BVH to: %s  (template: %s)\n",
                    c.bvh_path.c_str(), c.bvh_template.c_str());
         }

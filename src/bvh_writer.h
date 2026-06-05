@@ -96,6 +96,12 @@ public:
     // default — opt in via --foot-contact.
     void set_foot_contact(bool on) { foot_contact_ = on; }
 
+    // Zero the root joint's position and rotation channels on every frame,
+    // pinning the body at the origin facing forward (in-place motion).  Useful
+    // for retargeting pipelines that want local pose without global travel.
+    // Off by default — opt in via --bvh-static-root.
+    void set_static_root(bool on) { static_root_ = on; }
+
     // Override the BVH "Frame Time" written at close().  Useful for live capture
     // when stale frames were dropped: the nominal camera period no longer matches
     // the real per-frame wall-clock spacing, so playback would run fast.  Passing
@@ -166,6 +172,7 @@ private:
     bool               zero_hand_pose_             = false;
     bool               sticky_hand_pose_           = false;
     bool               foot_contact_               = false;
+    bool               static_root_                = false;
 
     std::vector<BvhSlot> slots_;             // shared template
     int                  root_bvh_jid_ = -1;

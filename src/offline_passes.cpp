@@ -1191,6 +1191,7 @@ static void export_range(const std::vector<FrameRecord>& frames,
     }
     w.set_id_label_prefix(id_prefix);
     w.set_foot_contact(cfg.bvh_foot_contact);
+    w.set_static_root(cfg.bvh_static_root);
 
     // Per-track scratch, clamped to this segment: for each frame, is the track
     // present?  Lets us emit pad_ids without re-scanning the full session map.

@@ -579,6 +579,7 @@ int main(int argc, const char** argv) {
     bool        bvh_rest_align                 = true;
     bool        bvh_dump_rest_dirs             = false;
     bool        bvh_foot_contact               = false;
+    bool        bvh_static_root                = false;
     bool        use_butterworth    = false;
     float       bw_cutoff         = 6.0f;   // Hz; higher = less lag, less smoothing
     bool        filter_root_rot   = false;  // enabled by --butterworth-root-rotation
@@ -669,6 +670,7 @@ int main(int argc, const char** argv) {
     bvh_rest_align                 = cc.bvh_rest_align;
     bvh_dump_rest_dirs             = cc.bvh_dump_rest_dirs;
     bvh_foot_contact               = cc.bvh_foot_contact;
+    bvh_static_root                = cc.bvh_static_root;
     bw_cutoff                      = cc.bw_cutoff;
     rot_clamp_deg                  = cc.rot_clamp_deg;
     max_frames                     = cc.max_frames;
@@ -835,6 +837,7 @@ int main(int argc, const char** argv) {
             fprintf(stderr, "[BVH] Warning: could not open BVH writer\n");
         else {
             bvh_writer.set_foot_contact(bvh_foot_contact);
+            bvh_writer.set_static_root(bvh_static_root);
             printf("[BVH] Writing to %s (%.1f fps)\n", bvh_path.c_str(), video_fps);
         }
     }
