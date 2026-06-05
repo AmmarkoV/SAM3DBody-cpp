@@ -35,6 +35,7 @@ extern "C" {
 }
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -45,8 +46,125 @@ extern "C" {
 #include <unordered_map>
 #include <vector>
 
+// Portable helpers for the "idiot-proof" diagnostics below (cwd + dir listing).
+#if defined(_WIN32)
+  #include <direct.h>
+  #define BVHW_GETCWD _getcwd
+#else
+  #include <unistd.h>
+  #include <dirent.h>
+  #define BVHW_GETCWD getcwd
+#endif
+
 namespace
 {
+
+// ─── Friendly path diagnostics ─────────────────────────────────────────────
+// These exist so that a wrong --bvh-template (or an unmappable one) produces a
+// long, explicit, copy-pasteable error instead of a one-line failure.
+
+std::string bvhw_cwd()
+{
+    char buf[4096];
+    if (BVHW_GETCWD(buf, sizeof(buf)) != nullptr) return std::string(buf);
+    return std::string("<could not read current directory>");
+}
+
+bool bvhw_path_readable(const std::string& p)
+{
+    FILE* f = std::fopen(p.c_str(), "rb");
+    if (f) { std::fclose(f); return true; }
+    return false;
+}
+
+// Split "a/b/c.bvh" → dir "a/b" (or "." when none) and base "c.bvh".
+void bvhw_split_path(const std::string& p, std::string& dir, std::string& base)
+{
+    size_t slash = p.find_last_of("/\\");
+    if (slash == std::string::npos) { dir = "."; base = p; }
+    else                            { dir = p.substr(0, slash); base = p.substr(slash + 1); }
+    if (dir.empty()) dir = "/";
+}
+
+// List the *.bvh files living in `dir` (best-effort; POSIX only). Returns the
+// number printed so callers can tailor their hints.
+int bvhw_list_bvh_files(const std::string& dir)
+{
+#if defined(_WIN32)
+    (void)dir;
+    return -1;  // directory enumeration intentionally skipped on Windows
+#else
+    DIR* d = opendir(dir.c_str());
+    if (!d) return -1;
+    int n = 0;
+    struct dirent* e;
+    while ((e = readdir(d)) != nullptr)
+    {
+        const char* nm = e->d_name;
+        size_t len = std::strlen(nm);
+        if (len >= 4 && strcasecmp(nm + len - 4, ".bvh") == 0)
+        {
+            fprintf(stderr, "      %s%s%s\n",
+                    dir.c_str(), (dir.back() == '/' ? "" : "/"), nm);
+            ++n;
+        }
+    }
+    closedir(d);
+    return n;
+#endif
+}
+
+// Print a big, explicit error when a path-type option points at something that
+// cannot be opened. `option` is the CLI flag (e.g. "--bvh-template").
+void bvhw_report_unreadable_path(const char* option,
+                                 const char* what,
+                                 const std::string& path)
+{
+    int err = errno;
+    std::string dir, base;
+    bvhw_split_path(path, dir, base);
+
+    fprintf(stderr,
+"\n"
+"  ┌──────────────────────────────────────────────────────────────────────┐\n"
+"  │  ERROR: cannot open the %-45s│\n"
+"  └──────────────────────────────────────────────────────────────────────┘\n",
+        what);
+
+    fprintf(stderr, "  Option            : %s\n", option);
+    fprintf(stderr, "  Path you gave     : '%s'\n", path.c_str());
+    if (!path.empty() && path[0] != '/')
+        fprintf(stderr, "  Resolved (abs)    : %s/%s\n", bvhw_cwd().c_str(), path.c_str());
+    fprintf(stderr, "  Current directory : %s\n", bvhw_cwd().c_str());
+    fprintf(stderr, "  Reason            : %s\n", std::strerror(err ? err : ENOENT));
+
+    // Did the user just get the directory part wrong? Tell them what *is* there.
+    if (!bvhw_path_readable(dir) && dir != ".")
+        fprintf(stderr,
+            "  Note              : the directory '%s' does not exist either.\n",
+            dir.c_str());
+
+    fprintf(stderr, "\n  Tip: paths are relative to the current directory shown above.\n");
+
+    fprintf(stderr, "  .bvh files in the directory you pointed at ('%s'):\n", dir.c_str());
+    int inDir = bvhw_list_bvh_files(dir);
+    if (inDir == 0)  fprintf(stderr, "      (none found)\n");
+    if (inDir < 0)   fprintf(stderr, "      (could not list this directory)\n");
+
+    fprintf(stderr, "  .bvh files in the current directory ('.'):\n");
+    int inCwd = bvhw_list_bvh_files(".");
+    if (inCwd == 0)  fprintf(stderr, "      (none found)\n");
+    if (inCwd < 0)   fprintf(stderr, "      (could not list this directory)\n");
+
+    fprintf(stderr,
+"\n  Templates that ship with this project (run from the repo root):\n"
+"      ./body_mhr.bvh   default — native MHR skeleton\n"
+"      ./mocapnet.bvh   MakeHuman / MocapNET naming\n"
+"      ./mixamo.bvh     Mixamo  ('mixamorig:' joint names)\n"
+"      ./lafan.bvh      LAFAN1 / GMR humanoid-robot retargeting\n\n");
+}
+
+
 
 constexpr float RAD2DEG   = 57.29577951308232f;
 constexpr float POS_SCALE = 100.0f;             // metres → centimetres
@@ -598,6 +716,45 @@ bool BVHWriter::build_slots()
 
     fprintf(stderr, "[BVHWriter] mapped %d BVH joints to MHR; root jID=%d\n",
             n_mapped, root_bvh_jid_);
+
+    // Idiot-proofing: the template loaded fine but not one of its joint names is
+    // recognised. This almost always means the template is from a skeleton
+    // family we don't have a name map for (or the names were edited). Dump the
+    // names we actually saw so the mismatch is obvious at a glance.
+    if (n_mapped == 0)
+    {
+        fprintf(stderr,
+"\n"
+"  ┌──────────────────────────────────────────────────────────────────────┐\n"
+"  │  ERROR: the BVH template loaded, but none of its joint names matched  │\n"
+"  │         any skeleton this exporter knows how to retarget.             │\n"
+"  └──────────────────────────────────────────────────────────────────────┘\n");
+        fprintf(stderr,
+            "  The template parsed OK (%u joints) but 0 of them mapped to MHR.\n\n",
+            mc_->jointHierarchySize);
+
+        fprintf(stderr, "  Joint names found in your template:\n");
+        const unsigned int kMaxShow = 80;
+        for (unsigned int j = 0; j < mc_->jointHierarchySize && j < kMaxShow; ++j)
+        {
+            const char* nm = mc_->jointHierarchy[j].jointName;
+            fprintf(stderr, "      [%2u] %s\n", j, (nm && *nm) ? nm : "<empty>");
+        }
+        if (mc_->jointHierarchySize > kMaxShow)
+            fprintf(stderr, "      ... (%u more)\n", mc_->jointHierarchySize - kMaxShow);
+
+        fprintf(stderr,
+"\n  This exporter recognises these skeleton naming families:\n"
+"      • MHR     — root, c_spine1, l_uparm, ...        (./body_mhr.bvh)\n"
+"      • MakeHuman/MocapNET — hip, abdomen, lShldr ... (./mocapnet.bvh)\n"
+"      • Mixamo  — mixamorig:Hips, mixamorig:Spine, ... (./mixamo.bvh)\n"
+"      • LAFAN1/GMR — Hips, Spine, LeftArm, ...         (./lafan.bvh)\n"
+"\n"
+"  If your template is one of these but still didn't match, its joint\n"
+"  names were probably renamed. Otherwise, pass one of the bundled\n"
+"  templates above with --bvh-template, or add a name map for your\n"
+"  skeleton in NAME_MAP (src/bvh_writer.cpp).\n\n");
+    }
     return n_mapped > 0;
 }
 
@@ -623,11 +780,33 @@ bool BVHWriter::open(const std::string& template_path,
     sticky_hand_pose_            = sticky_hand_pose;
     rest_align_                  = rest_align;
 
+    // Idiot-proofing: a wrong/missing template path is by far the most common
+    // mistake, so check it up front and explain exactly what went wrong (cwd,
+    // resolved absolute path, what .bvh files actually exist nearby).
+    if (template_path.empty())
+    {
+        fprintf(stderr,
+            "[BVHWriter] --bvh-template is empty (no skeleton template given).\n");
+        bvhw_report_unreadable_path("--bvh-template", "BVH skeleton template", template_path);
+        return false;
+    }
+    if (!bvhw_path_readable(template_path))
+    {
+        bvhw_report_unreadable_path("--bvh-template", "BVH skeleton template", template_path);
+        return false;
+    }
+
     mc_ = (BVH_MotionCapture*)calloc(1, sizeof(*mc_));
     if (!mc_) return false;
     if (!bvh_loadBVH(template_path.c_str(), mc_, 1.0f))
     {
-        fprintf(stderr, "[BVHWriter] bvh_loadBVH('%s') failed\n", template_path.c_str());
+        fprintf(stderr,
+            "[BVHWriter] bvh_loadBVH('%s') failed: the file exists and is\n"
+            "            readable, but could not be parsed as a BVH skeleton.\n"
+            "            Check that it begins with a HIERARCHY section and a\n"
+            "            ROOT joint, and that it is a real .bvh (not e.g. an\n"
+            "            .fbx/.obj/.txt renamed to .bvh).\n",
+            template_path.c_str());
         free(mc_);
         mc_ = nullptr;
         return false;
@@ -652,10 +831,23 @@ bool BVHWriter::open(const std::string& template_path,
         mc_ = nullptr;
         return false;
     }
+    if (!bvhw_path_readable(lbs_path))
+    {
+        bvhw_report_unreadable_path("--onnx-dir/body_model.lbs",
+                                    "MHR body_model.lbs (skinning/joint table)", lbs_path);
+        fprintf(stderr,
+            "  The BVH writer needs body_model.lbs to map skeleton joints. It is\n"
+            "  expected next to the ONNX models; pass the right --onnx-dir.\n\n");
+        bvh_free(mc_);
+        free(mc_);
+        mc_ = nullptr;
+        return false;
+    }
     lbs_ = mhr_lbs_load(lbs_path.c_str());
     if (!lbs_)
     {
-        fprintf(stderr, "[BVHWriter] mhr_lbs_load('%s') failed\n", lbs_path.c_str());
+        fprintf(stderr, "[BVHWriter] mhr_lbs_load('%s') failed: the file exists\n"
+                        "            but is not a valid body_model.lbs.\n", lbs_path.c_str());
         bvh_free(mc_);
         free(mc_);
         mc_ = nullptr;
