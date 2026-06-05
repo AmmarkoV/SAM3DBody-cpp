@@ -342,9 +342,6 @@ void multiplyThree4x4DMatrices(double * result ,const double * matrixA ,const do
 * @param  Input 4x4 Float Matrix B
 * @retval 0=failure,1=success
 */
-void multiplyTwo4x4FMatrices_SSE(float * result ,const float * matrixA,const float * matrixB);
-
-
 void multiplyTwo4x4FMatricesS(struct Matrix4x4OfFloats * result ,const struct Matrix4x4OfFloats * matrixA ,const struct Matrix4x4OfFloats * matrixB);
 
 void multiplyTwoRaw4x4FMatricesS(float * result ,const float * matrixA ,const float * matrixB);
