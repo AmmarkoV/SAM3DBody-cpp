@@ -257,6 +257,7 @@ int main(int argc, char** argv)
     {
         fsb::PipelineConfig pcfg;
         resolve_detector_defaults(cfg);         // "auto" → libreyolo when available
+        resolve_backbone_defaults(cfg);         // CUDA: prefer backbone_fp16.onnx if present
         apply_common_to_pipeline_cfg(cfg, pcfg);
         pcfg.skip_body_model = false;  // we need keypoints_3d for jitter detection
         if (!pipeline.load(pcfg)) {

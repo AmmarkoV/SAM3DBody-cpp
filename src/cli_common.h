@@ -56,6 +56,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <fstream>    // resolve_backbone_defaults(): probe for backbone_fp16.onnx
 #include <string>
 #include <glob.h>     // resolve_detector_defaults(): find libreyolo*.onnx in onnx_dir
 
@@ -95,6 +96,7 @@ struct CommonConfig
     // "auto" detector choice and the per-detector default threshold.
     bool        yolo_path_set   = false;  // --yolo given
     bool        thresh_set      = false;  // --thresh / --detector-threshold given
+    bool        backbone_name_set = false; // --backbone given (pins the model; disables fp16 auto-prefer)
 
     // ── Input source ────────────────────────────────────────────────────────
     std::string from;             // file / webcam index / empty = required
@@ -151,7 +153,10 @@ inline bool parse_common_arg(int argc, const char* const* argv, int& i,
     // selection won't second-guess their path.
     if (std::strcmp(argv[i], "--yolo") == 0 && i + 1 < argc)
     { c.yolo_path = argv[++i]; c.yolo_path_set = true; return true; }
-    CLI_STR ("--backbone",             backbone_name)
+    // --backbone records that the user pinned the model so resolve_backbone_defaults()
+    // won't silently auto-upgrade them to backbone_fp16.onnx.
+    if (std::strcmp(argv[i], "--backbone") == 0 && i + 1 < argc)
+    { c.backbone_name = argv[++i]; c.backbone_name_set = true; return true; }
     CLI_STR ("--from",                 from)
     CLI_INT ("--frames",               max_frames)
     CLI_INT ("--start",                start_frame)
@@ -272,6 +277,34 @@ inline void resolve_detector_defaults(CommonConfig& c)
     }
 }
 
+// On CUDA, auto-prefer a float16 backbone when one has been exported next to the
+// default FP32 model (tools/export_backbone_fp16.py → <onnx_dir>/backbone_fp16.onnx).
+// ORT's CUDA EP runs a model in its native precision, so the FP16 weights are
+// what actually engages the GPU's tensor cores (~2× backbone throughput).
+//
+// Only fires when ALL of the following hold, so it never surprises the user:
+//   * the user did NOT pin a model with --backbone, and
+//   * backbone_name is still the plain FP32 default ("backbone.onnx") — i.e. a
+//     baked-in quant default (SAM3D_BACKBONE_QUANT → backbone_int8.onnx) wins, and
+//   * we are running on a CUDA device (FP16 on the CPU EP is not a win), and
+//   * <onnx_dir>/backbone_fp16.onnx actually exists.
+inline void resolve_backbone_defaults(CommonConfig& c)
+{
+    if (c.backbone_name_set)            return;   // user pinned --backbone
+    if (c.backbone_name != "backbone.onnx") return;   // non-default (e.g. int8) — respect it
+    if (c.cuda_device < 0)             return;   // CPU EP: FP16 offers no benefit
+
+    const std::string fp16_name = "backbone_fp16.onnx";
+    const std::string fp16_path = c.onnx_dir + "/" + fp16_name;
+    if (std::ifstream(fp16_path).good()) {
+        c.backbone_name = fp16_name;
+        std::fprintf(stderr,
+            "[cli] CUDA: found '%s'; preferring it over backbone.onnx "
+            "(FP16 tensor cores). Pin --backbone backbone.onnx to force FP32.\n",
+            fp16_path.c_str());
+    }
+}
+
 // Populate the fields of a fsb::PipelineConfig that come straight from
 // CommonConfig.  Binary-specific fields (`skip_body_model`, `principal_x`,
 // `focal_x`, etc.) stay the caller's responsibility.
@@ -305,8 +338,10 @@ inline void print_common_args_help(FILE* fp)
     std::fprintf(fp,
         "Common (parsed by cli_common.h):\n"
         "  --onnx-dir PATH                Directory with backbone/decoder ONNX files\n"
-        "  --backbone NAME                Backbone filename within onnx-dir (default backbone.onnx;\n"
-        "                                 use backbone_int8.onnx after running tools/quantize_backbone.py)\n"
+        "  --backbone NAME                Backbone filename within onnx-dir (default backbone.onnx; on CUDA,\n"
+        "                                 backbone_fp16.onnx is auto-preferred when present — see\n"
+        "                                 tools/export_backbone_fp16.py; or backbone_int8.onnx via\n"
+        "                                 tools/quantize_backbone.py)\n"
         "  --gguf     PATH                pipeline.gguf (MHR + camera heads)\n"
         "  --yolo     PATH                Detector model (.onnx); YOLO11-pose or a LibreYOLO/YOLOv9 export\n"
         "  --detector NAME                Bbox provider parsing --yolo output: auto (default; prefers a\n"

@@ -87,8 +87,9 @@ static void print_usage(const char* prog)
 {
     printf("Usage: %s [options]\n\n", prog);
     printf("  --onnx-dir PATH   Directory with backbone/decoder/body_model ONNX files\n");
-    printf("  --backbone NAME   Backbone filename in onnx-dir (default backbone.onnx;\n");
-    printf("                    use backbone_int8.onnx after tools/quantize_backbone.py)\n");
+    printf("  --backbone NAME   Backbone filename in onnx-dir (default backbone.onnx; on CUDA,\n");
+    printf("                    backbone_fp16.onnx is auto-preferred when present — see\n");
+    printf("                    tools/export_backbone_fp16.py; or backbone_int8.onnx via quantize_backbone.py)\n");
     printf("  --gguf PATH       pipeline.gguf (MHR + camera heads)\n");
     printf("  --yolo PATH       YOLO pose model (.onnx or .engine)\n");
     printf("  --from SRC        Webcam index (0,1,..) or path to image/video\n");
@@ -484,6 +485,7 @@ int main(int argc, char** argv)
 
     fsb::PipelineConfig pcfg;
     resolve_detector_defaults(c);           // "auto" → libreyolo when available
+    resolve_backbone_defaults(c);           // CUDA: prefer backbone_fp16.onnx if present
     apply_common_to_pipeline_cfg(c, pcfg);  // all shared pipeline fields
     pcfg.skip_body_model  = c.skip_body;
     pcfg.zero_face_params = c.zero_face;

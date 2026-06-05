@@ -649,6 +649,7 @@ int main(int argc, const char** argv) {
     }
     resolve_detector_defaults(cc);  // "auto" → libreyolo when available; sets the
                                     // per-detector default threshold too
+    resolve_backbone_defaults(cc);  // CUDA: prefer backbone_fp16.onnx if present
     // Unpack the common parser's output into the local variables the
     // rest of main() expects.  Keeping the locals avoids a wholesale
     // refactor of the rendering loop's pipeline-config / BVH-writer /
@@ -684,6 +685,7 @@ int main(int argc, const char** argv) {
     {
         fsb::PipelineConfig cfg;
         cfg.onnx_dir        = onnx_dir;
+        cfg.backbone_name   = cc.backbone_name;   // honour --backbone / fp16 auto-prefer
         cfg.gguf_path       = gguf_path;
         cfg.yolo_path       = yolo_path;
         cfg.cuda_device     = cuda_device;
