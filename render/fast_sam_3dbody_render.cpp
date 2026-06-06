@@ -686,6 +686,7 @@ int main(int argc, const char** argv) {
         fsb::PipelineConfig cfg;
         cfg.onnx_dir        = onnx_dir;
         cfg.backbone_name   = cc.backbone_name;   // honour --backbone / fp16 auto-prefer
+        cfg.decoder_name    = cc.decoder_name;    // honour --trt decoder_fp16 auto-swap
         cfg.gguf_path       = gguf_path;
         cfg.yolo_path       = yolo_path;
         cfg.cuda_device     = cuda_device;
