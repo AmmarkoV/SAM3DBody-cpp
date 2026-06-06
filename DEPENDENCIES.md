@@ -144,10 +144,13 @@ tools/run_trt.sh --onnx-dir ./onnx --from your_video.mp4
 > plain `tensorrt-cu12` metapackage may not pull the `…-libs` payload on its own,
 > so install `tensorrt-cu12-libs` explicitly as above.
 
-To wire it up manually instead of using the wrapper (e.g. for the render binary):
+The launcher scripts (`scripts/webcam.sh`, `webcam_p.sh`, `video.sh`,
+`offline_video.sh`) source `tools/trt_env.sh` automatically, so `--trt` just works
+there. To wire it up manually in your own shell, source the same helper (it
+auto-detects the venv's `python<ver>` dir):
 
 ```bash
-export LD_LIBRARY_PATH="$PWD/tools/.venv/lib/python3.12/site-packages/tensorrt_libs:$LD_LIBRARY_PATH"
+source tools/trt_env.sh
 ./build/fast_sam_3dbody_run --trt --cuda 0 --onnx-dir ./onnx --from your_video.mp4
 ```
 

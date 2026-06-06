@@ -4,6 +4,9 @@ THISDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$THISDIR"
 cd ..
 
+# Put the bundled TensorRT libs on LD_LIBRARY_PATH so --trt works (no-op otherwise).
+source "$THISDIR/../tools/trt_env.sh"
+
 # ── Parse --save [OUTPUT] from the argument list ─────────────────────────────
 # --save may be:
 #   --save              → save mode; output name derived from source

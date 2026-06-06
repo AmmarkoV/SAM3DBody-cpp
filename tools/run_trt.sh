@@ -23,11 +23,13 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TRT_LIBS="$ROOT/tools/.venv/lib/python3.12/site-packages/tensorrt_libs"
 BIN="${SAM3D_BIN:-$ROOT/build/fast_sam_3dbody_run}"
 
-if [ ! -d "$TRT_LIBS" ]; then
-    echo "tools/run_trt.sh: TensorRT libs not found at $TRT_LIBS" >&2
+# Shared helper: sets LD_LIBRARY_PATH + SAM3D_TRT_LIBS (auto-detects python<ver>).
+source "$ROOT/tools/trt_env.sh"
+
+if [ -z "${SAM3D_TRT_LIBS:-}" ]; then
+    echo "tools/run_trt.sh: TensorRT libs not found under $ROOT/tools/.venv" >&2
     echo "  Install them with:" >&2
     echo "    $ROOT/tools/.venv/bin/pip install 'tensorrt-cu12-libs==10.4.0' --extra-index-url https://pypi.nvidia.com" >&2
     exit 1
@@ -36,8 +38,6 @@ if [ ! -x "$BIN" ]; then
     echo "tools/run_trt.sh: binary not found/executable: $BIN  (build it, or set SAM3D_BIN)" >&2
     exit 1
 fi
-
-export LD_LIBRARY_PATH="$TRT_LIBS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 # Add --trt / --cuda 0 only if the caller didn't pass them.
 args=("$@")

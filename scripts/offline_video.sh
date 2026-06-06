@@ -37,6 +37,9 @@ THISDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$THISDIR"
 cd ..
 
+# Put the bundled TensorRT libs on LD_LIBRARY_PATH so --trt works (no-op otherwise).
+source "$THISDIR/../tools/trt_env.sh"
+
 # Locate the input video — accept the same forms scripts/video.sh does:
 # either `--from PATH` or a single positional path argument.
 FROM_SRC=""
