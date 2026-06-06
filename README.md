@@ -893,6 +893,56 @@ fsb_destroy(h);
 - Use `--skip-body` unless 3D vertices are required.
 - For higher throughput, batch multiple crops in a single backbone forward pass (already done when multiple persons are detected).
 
+### TensorRT acceleration (`--trt`)
+
+On CUDA the ONNX Runtime **TensorRT execution provider** builds fused FP16 engines
+that schedule the backbone's GEMMs onto the tensor cores far better than the plain
+CUDA EP. Measured on an **RTX 1000 Ada laptop** (6 GB), single person, 25-frame
+steady state (so the one-time engine build is amortised):
+
+| Stage | CUDA EP (FP16) | **TensorRT EP (FP16)** |
+|-------|---------------:|-----------------------:|
+| Detection | 25 ms | 12 ms |
+| **Backbone** | 230 ms | **148 ms** (1.56×) |
+| Decoder | 14 ms | 7 ms |
+| **Total / frame** | **273 ms (3.7 fps)** | **170 ms (5.9 fps)** |
+
+End-to-end **~1.6× faster**, with keypoints within ~4 mm of the CUDA path (FP16 is
+numerically equivalent here). Run it through the wrapper, which puts the bundled
+TensorRT 10.4 libs on the loader path and adds `--trt`:
+
+```bash
+tools/run_trt.sh --onnx-dir ./onnx --from your_video.mp4
+```
+
+One-time setup of the TensorRT runtime libs (see [DEPENDENCIES.md](DEPENDENCIES.md)):
+
+```bash
+python3 -m venv tools/.venv
+tools/.venv/bin/pip install "tensorrt-cu12-libs==10.4.0" --extra-index-url https://pypi.nvidia.com
+```
+
+Notes:
+- The **first** run per model+input-shape builds the engines (minutes) into
+  `onnx/trt_engine_cache/`; later runs reuse them.
+- `--trt` auto-selects TRT-buildable model variants: `backbone_fp16_trt.onnx`
+  (the rope `If` subgraphs folded out — plain `backbone_fp16.onnx` is not
+  TRT-buildable) and `decoder_fp16.onnx` (the stock decoder is bfloat16, which the
+  TRT EP rejects). Regenerate the fp16 decoder with
+  `tools/export_backbone_fp16.py --input onnx/decoder.onnx --output onnx/decoder_fp16.onnx`.
+- Without the TensorRT libs the EP silently falls back to the CUDA EP, so `--trt`
+  never errors — watch for the `[cli] TRT:` lines to confirm it engaged.
+
+### Why not INT8?
+
+INT8 was benchmarked and does **not** help here. ORT's CUDA EP runs `MatMulInteger`
+by dequantising to FP32 per-matmul, which on this 630 M-param ViT-H is ~17× *slower*
+than FP16. The only path to real INT8 tensor cores is TensorRT with static QDQ
+calibration, but calibrating a model this large materialises all activations and
+needs well over 32 GB of host RAM — impractical on the laptop-class machines this
+project targets, and ViT INT8 risks keypoint accuracy that FP16 does not. **FP16 +
+TensorRT is the recommended fast path.**
+
 
 
 ---

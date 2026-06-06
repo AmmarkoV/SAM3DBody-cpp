@@ -14,7 +14,7 @@ at runtime**, you are almost certainly in the right place.
 | CUDA | **12.x** | Required by the ORT 1.20.1 CUDA execution provider. |
 | cuDNN | **9.x** | Required by ORT ≥ 1.19. **cuDNN 8 will not work** and is the #1 cause of the CUDA EP failing to load. |
 | NVIDIA driver | Recent enough for CUDA 12 (≥ 525) | Check with `nvidia-smi`. |
-| TensorRT | **10.x** *(optional)* | Only needed for the `--trt` execution provider. ORT 1.20.1 dlopens `libnvinfer.so.10`. Without it, `--trt` falls back to the CUDA EP — see §6. |
+| TensorRT | **10.4** *(optional)* | Only needed for the `--trt` execution provider (~1.6× faster). ORT 1.20.1 dlopens `libnvinfer.so.10`; install into `tools/.venv` and run via `tools/run_trt.sh`. Without it, `--trt` falls back to the CUDA EP — see §6. |
 | OpenCV | core / imgproc / videoio / highgui / dnn | System package. |
 
 > The standard `onnx/backbone.onnx` is exported in **BFloat16** and runs **only on
@@ -127,26 +127,36 @@ the heavy backbone/decoder.
 
 ### Requirements
 
-ORT 1.20.1 links the TensorRT EP against **TensorRT 10** — it dlopens
-`libnvinfer.so.10` (and `libnvonnxparser.so.10`) at session-create time. These
-are **not** bundled; install NVIDIA TensorRT 10.x for CUDA 12 and make sure the
-loader can see it:
+ORT 1.20.1 links the TensorRT EP against **TensorRT 10.4** — it dlopens
+`libnvinfer.so.10`, `libnvonnxparser.so.10` and `libnvinfer_plugin.so.10` at
+session-create time. These are **not** bundled. Install the matching wheels into
+`tools/.venv` and run through the `tools/run_trt.sh` wrapper, which puts them on
+`LD_LIBRARY_PATH` and adds `--trt --cuda 0` for you:
 
 ```bash
-# pip wheels (no root; install into the venv/python you run from)
-pip install tensorrt-cu12            # pulls TensorRT 10.x for CUDA 12
+python3 -m venv tools/.venv
+tools/.venv/bin/pip install "tensorrt-cu12-libs==10.4.0" --extra-index-url https://pypi.nvidia.com
 
-export LD_LIBRARY_PATH=$(python -c "import os, tensorrt_libs; \
-print(os.path.dirname(tensorrt_libs.__file__))"):$LD_LIBRARY_PATH
-
-# …or a system .deb/.tar install from developer.nvidia.com/tensorrt, then:
-sudo ldconfig
+tools/run_trt.sh --onnx-dir ./onnx --from your_video.mp4
 ```
 
-Verify the runtime is visible:
+> Pin **10.4** — it is the TensorRT version ORT 1.20.1 was built against. The
+> plain `tensorrt-cu12` metapackage may not pull the `…-libs` payload on its own,
+> so install `tensorrt-cu12-libs` explicitly as above.
+
+To wire it up manually instead of using the wrapper (e.g. for the render binary):
 
 ```bash
-ldconfig -p | grep -i nvinfer        # should list libnvinfer.so.10
+export LD_LIBRARY_PATH="$PWD/tools/.venv/lib/python3.12/site-packages/tensorrt_libs:$LD_LIBRARY_PATH"
+./build/fast_sam_3dbody_run --trt --cuda 0 --onnx-dir ./onnx --from your_video.mp4
+```
+
+A system `.deb`/`.tar` TensorRT 10.4 install from developer.nvidia.com/tensorrt
+(then `sudo ldconfig`) works too. Verify the runtime is visible:
+
+```bash
+ldd build/onnxruntime_dl/lib/libonnxruntime_providers_tensorrt.so | grep -i nvinfer
+# every libnvinfer*.so.10 / libnvonnxparser.so.10 line should resolve (no "not found")
 ```
 
 ### Behaviour without TensorRT installed
@@ -173,24 +183,30 @@ cache dir to force a rebuild).
 
 To compile the EP out entirely: `cmake -DSAM3D_TENSORRT=OFF ..`.
 
-### Compatibility with the stock models (tested — important)
+### Model compatibility — auto-handled under `--trt`
 
-The EP loads and builds engines, but the **bundled ONNX models are not
-TensorRT-compatible as exported**, so `--trt` currently provides no benefit:
+The stock `backbone.onnx` / `decoder.onnx` are **not** TRT-buildable as exported,
+so `--trt` automatically swaps in TRT-friendly variants (see
+`resolve_backbone_defaults` in `src/cli_common.h`). Two issues, both worked around:
 
-- **backbone** — the DINOv3 backbone contains an `If` control-flow node
-  (`/rope_embed/If_*`) whose output has no static shape. TRT rejects it
-  (`… has no shape specified. Please run shape inference …`) and the loader
-  **falls back to the CUDA EP** — i.e. the bottleneck is *not* accelerated.
-- **decoder** — TRT builds an engine, but inference aborts with
-  `TensorRT EP output tensor data type: 16 not supported` (type 16 = bfloat16);
-  ORT's TRT EP does not support bf16 graph I/O.
+- **backbone** — the DINOv3 backbone has `If` control-flow nodes (`/rope_embed/If_*`)
+  with no static output shape; TRT rejects them (`… has no shape specified …`).
+  `--trt` uses **`backbone_fp16_trt.onnx`**, which has those `If` branches folded out.
+- **decoder** — `decoder.onnx` is bfloat16, and TRT aborts at inference with
+  `TensorRT EP output tensor data type: 16 not supported`. `--trt` uses
+  **`decoder_fp16.onnx`** (bf16→fp16, regenerate with
+  `tools/export_backbone_fp16.py --input onnx/decoder.onnx --output onnx/decoder_fp16.onnx`).
 
-Net: with the current models, the only worthwhile target (the backbone) can't run
-on TRT, and the decoder fails at runtime. Making `--trt` actually pay off requires
-re-exporting the models TRT-friendly — run ORT's `symbolic_shape_infer.py` on the
-backbone (and/or remove the `If`/rope branch) and export the decoder with fp16/fp32
-(not bf16) I/O. Until then, prefer the CUDA EP with `backbone_fp16.onnx`.
+With those in place, `--trt` gives a measured **~1.6×** end-to-end speedup on an
+RTX 1000 Ada laptop (backbone 230→148 ms, total 273→170 ms / 3.7→5.9 fps), keypoints
+within ~4 mm of the CUDA path. Confirm it engaged via the `[cli] TRT:` log lines —
+if you instead see `Falling back to CUDA…`, the TensorRT libs aren't on the loader
+path (see Requirements above).
+
+> **INT8 does not help** and is intentionally not wired up: ORT's CUDA EP runs
+> `MatMulInteger` by dequantising to fp32 (~17× *slower* than fp16 on this ViT-H),
+> and the only real int8-tensor-core route (TensorRT static QDQ) needs >32 GB host
+> RAM to calibrate a model this large. Stick with FP16 + TensorRT.
 
 ---
 
