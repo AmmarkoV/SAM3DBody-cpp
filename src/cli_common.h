@@ -55,10 +55,12 @@
 
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>    // ensure_trt_models(): std::system() to wget/unzip the TRT models
 #include <cstring>
 #include <fstream>    // resolve_backbone_defaults(): probe for backbone_fp16.onnx
 #include <string>
 #include <glob.h>     // resolve_detector_defaults(): find libreyolo*.onnx in onnx_dir
+#include <unistd.h>   // ensure_trt_models(): readlink("/proc/self/exe") to locate setup_trt.sh
 
 #include "fast_sam_3dbody.h"  // for fsb::PipelineConfig
 
@@ -278,6 +280,76 @@ inline void resolve_detector_defaults(CommonConfig& c)
     }
 }
 
+// Auto-fetch the TRT-ready models when --trt is requested but they're missing.
+// resolve_backbone_defaults() swaps in backbone_fp16_trt.onnx / decoder_fp16.onnx
+// under --trt only when they exist on disk; without them --trt silently falls back
+// to the CUDA EP.  Rather than duplicate the download here, we delegate to
+// tools/setup_trt.sh (one source of truth) with --skip-venv, so it just fetches
+// the models — and it prompts before pulling the ~1.7 GB archive.
+//
+// Best-effort: on any failure (script not found, user declines the prompt, no
+// network) we warn and return, and resolve_backbone_defaults() falls back to the
+// CUDA EP exactly as before.  Skipped when the user pinned --backbone (they're
+// driving the model choice) or on CPU (--cuda -1, where TRT/fp16 don't apply).
+inline void ensure_trt_models(const CommonConfig& c)
+{
+    if (!c.use_trt)          return;
+    if (c.cuda_device < 0)   return;   // CPU EP: TRT/fp16 N/A
+    if (c.backbone_name_set) return;   // user pinned a model — don't second-guess
+
+    auto exists = [&](const char* name) {
+        return std::ifstream(c.onnx_dir + "/" + name).good();
+    };
+    if (exists("backbone_fp16_trt.onnx") && exists("decoder_fp16.onnx"))
+        return;   // already have them
+
+    // Locate setup_trt.sh relative to this executable (binaries live in build/,
+    // so ../tools/), with the working dir as a fallback.
+    std::string script;
+    {
+        char buf[4096];
+        ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+        if (n > 0) {
+            buf[n] = '\0';
+            std::string exe(buf);
+            size_t s = exe.find_last_of('/');
+            if (s != std::string::npos) {
+                std::string cand = exe.substr(0, s) + "/../tools/setup_trt.sh";
+                if (std::ifstream(cand).good()) script = cand;
+            }
+        }
+        if (script.empty() && std::ifstream("tools/setup_trt.sh").good())
+            script = "tools/setup_trt.sh";
+    }
+    if (script.empty()) {
+        std::fprintf(stderr,
+            "[cli] TRT: backbone_fp16_trt.onnx / decoder_fp16.onnx missing and "
+            "tools/setup_trt.sh not found; falling back to CUDA EP. "
+            "Fetch them per DEPENDENCIES.md §6.\n");
+        return;
+    }
+
+    std::fprintf(stderr,
+        "[cli] TRT: backbone_fp16_trt.onnx / decoder_fp16.onnx missing in '%s'; "
+        "running '%s' to fetch them…\n", c.onnx_dir.c_str(), script.c_str());
+
+    const std::string cmd =
+        "bash '" + script + "' --skip-venv --onnx-dir '" + c.onnx_dir + "'";
+    if (std::system(cmd.c_str()) != 0) {
+        std::fprintf(stderr,
+            "[cli] TRT: setup_trt.sh did not fetch the models — falling back to CUDA EP.\n");
+        return;
+    }
+
+    if (exists("backbone_fp16_trt.onnx") && exists("decoder_fp16.onnx"))
+        std::fprintf(stderr, "[cli] TRT: prebuilt models ready in '%s'.\n",
+                     c.onnx_dir.c_str());
+    else
+        std::fprintf(stderr,
+            "[cli] TRT: models not fetched (declined or unavailable) — "
+            "falling back to CUDA EP.\n");
+}
+
 // On CUDA, auto-prefer a float16 backbone when one has been exported next to the
 // default backbone (tools/export_backbone_fp16.py → <onnx_dir>/backbone_fp16.onnx).
 // The stock backbone is bfloat16; the fp16 remap is 3× smaller on disk/VRAM and a
@@ -293,6 +365,10 @@ inline void resolve_detector_defaults(CommonConfig& c)
 inline void resolve_backbone_defaults(CommonConfig& c)
 {
     if (c.cuda_device < 0)             return;   // CPU EP: FP16 offers no benefit
+
+    // Under --trt, fetch the TRT-ready models on the fly if they're not on disk
+    // yet, so the swaps below can engage instead of falling back to the CUDA EP.
+    ensure_trt_models(c);
 
     auto exists = [&](const std::string& name) {
         return std::ifstream(c.onnx_dir + "/" + name).good();

@@ -129,15 +129,23 @@ the heavy backbone/decoder.
 
 ORT 1.20.1 links the TensorRT EP against **TensorRT 10.4** — it dlopens
 `libnvinfer.so.10`, `libnvonnxparser.so.10` and `libnvinfer_plugin.so.10` at
-session-create time. These are **not** bundled. Install the matching wheels into
-`tools/.venv` and run through the `tools/run_trt.sh` wrapper, which puts them on
-`LD_LIBRARY_PATH` and adds `--trt --cuda 0` for you:
+session-create time. These are **not** bundled.
+
+The quickest path is **`tools/setup_trt.sh`**, which creates `tools/.venv`,
+installs the matching TensorRT 10.4 libs, and downloads the prebuilt TRT models
+into `onnx/` in one shot:
+
+```bash
+tools/setup_trt.sh                              # venv + libs + models
+tools/run_trt.sh --onnx-dir ./onnx --from your_video.mp4
+```
+
+`tools/run_trt.sh` puts the libs on `LD_LIBRARY_PATH` and adds `--trt --cuda 0`
+for you. To do the libs install by hand instead:
 
 ```bash
 python3 -m venv tools/.venv
 tools/.venv/bin/pip install "tensorrt-cu12-libs==10.4.0" --extra-index-url https://pypi.nvidia.com
-
-tools/run_trt.sh --onnx-dir ./onnx --from your_video.mp4
 ```
 
 > Pin **10.4** — it is the TensorRT version ORT 1.20.1 was built against. The
@@ -190,7 +198,23 @@ To compile the EP out entirely: `cmake -DSAM3D_TENSORRT=OFF ..`.
 
 The stock `backbone.onnx` / `decoder.onnx` are **not** TRT-buildable as exported,
 so `--trt` automatically swaps in TRT-friendly variants (see
-`resolve_backbone_defaults` in `src/cli_common.h`). Two issues, both worked around:
+`resolve_backbone_defaults` in `src/cli_common.h`). You don't normally have to do
+anything: when `--trt` is requested and these variants are missing, the binaries
+invoke **`tools/setup_trt.sh --skip-venv`** to fetch them. That script **prompts
+before pulling the ~1.7 GB archive** (and refuses in a non-interactive shell unless
+run with `--yes`); on decline or failure it just warns and falls back to the CUDA EP.
+Run `tools/setup_trt.sh` yourself up front to get the models (and the TensorRT libs)
+before the first `--trt` run.
+
+To grab them manually, the zip already carries the `onnx/` prefix, so unzip it from
+the repo root:
+
+```bash
+wget https://huggingface.co/AmmarkoV/SAM3DBody-cpp-onnx-models/resolve/main/SAM3DBody-cpp-trt-models.zip
+unzip SAM3DBody-cpp-trt-models.zip   # extracts onnx/backbone_fp16_trt + onnx/decoder_fp16 (+ .data)
+```
+
+Two issues, both worked around:
 
 - **backbone** — the DINOv3 backbone has `If` control-flow nodes (`/rope_embed/If_*`)
   with no static output shape; TRT rejects them (`… has no shape specified …`).
