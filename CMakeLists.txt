@@ -71,6 +71,23 @@ if(SAM3D_BACKBONE_QUANT)
 endif()
 
 # ---------------------------------------------------------------------------
+# SAM3D_TENSORRT — compile in the ONNX Runtime TensorRT execution provider.
+#
+# This only enables the code path; the EP is used at runtime when --trt is
+# passed.  It needs no TensorRT SDK headers at build time (it uses ORT's own
+# OrtTensorRTProviderOptions), but the NVIDIA TensorRT *runtime* libraries
+# (libnvinfer.so, libnvonnxparser.so — matching the ORT build's TRT major
+# version) must be on the loader path at run time, or --trt falls back to the
+# CUDA EP.  Defaults ON for CUDA builds; harmless to leave on without TRT
+# installed (--trt simply degrades to CUDA).
+#
+# Usage:  cmake -DSAM3D_TENSORRT=OFF ..   (to compile it out)
+# ---------------------------------------------------------------------------
+option(SAM3D_TENSORRT
+    "Compile in the ONNX Runtime TensorRT EP (used at runtime via --trt)"
+    ON)
+
+# ---------------------------------------------------------------------------
 # CUDA  (optional – enables ONNX Runtime CUDA EP and ggml CUDA backend)
 # ---------------------------------------------------------------------------
 find_package(CUDAToolkit QUIET)
@@ -277,6 +294,13 @@ endif()
 
 if(SAM3D_BACKBONE_QUANT)
     target_compile_definitions(fast_sam_3dbody PUBLIC SAM3D_BACKBONE_QUANT)
+endif()
+
+# TensorRT EP: only meaningful for CUDA builds (it dlopens the NVIDIA TRT runtime
+# at session-create time and degrades to the CUDA EP if it's not present).
+if(SAM3D_TENSORRT AND WITH_CUDA)
+    target_compile_definitions(fast_sam_3dbody PRIVATE USE_TENSORRT_EP)
+    message(STATUS "SAM3D_TENSORRT=ON — TensorRT EP compiled in (enable at runtime with --trt)")
 endif()
 
 target_compile_options(fast_sam_3dbody PRIVATE

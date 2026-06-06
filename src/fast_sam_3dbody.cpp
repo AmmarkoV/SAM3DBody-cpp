@@ -51,6 +51,7 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <filesystem>
 #include <fstream>
 #include <cstdio>
 #include <cstring>
@@ -218,46 +219,91 @@ struct OrtSession
     bool load(Ort::Env& e, const std::string& path, bool cuda, int device,
               bool fp16_io = false, bool trt_ep = false)
     {
-        // Try with the requested EP first; fall back to CPU if it fails to load
-        // (e.g. libcudnn not installed, CUDA EP shared library missing).
-        for (int attempt = 0; attempt < 2; ++attempt)
+        // Execution-provider preference ladder, most→least preferred.  We try
+        // each in turn and fall back on failure, so a missing TensorRT runtime
+        // degrades to the CUDA EP, and a missing CUDA EP degrades to CPU, rather
+        // than aborting the load.
+        //   --trt  →  [TensorRT, CUDA, CPU]
+        //   --cuda →  [CUDA, CPU]
+        //   CPU    →  [CPU]
+        enum EP { EP_TRT, EP_CUDA, EP_CPU };
+        std::vector<EP> ladder;
+        if (cuda && trt_ep) ladder.push_back(EP_TRT);
+        if (cuda)           ladder.push_back(EP_CUDA);
+        ladder.push_back(EP_CPU);
+
+        auto ep_name = [](EP ep) {
+            return ep == EP_TRT ? "TensorRT" : ep == EP_CUDA ? "CUDA" : "CPU";
+        };
+
+        for (size_t a = 0; a < ladder.size(); ++a)
         {
-            bool try_cuda = cuda && (attempt == 0);
+            const EP ep = ladder[a];
+            const bool last = (a + 1 == ladder.size());
             Ort::SessionOptions opts;
             opts.SetIntraOpNumThreads(1);
             opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
             try
             {
-                if (try_cuda && !trt_ep)
+                if (ep == EP_TRT)
+                {
+#if defined(USE_TENSORRT_EP)
+                    OrtTensorRTProviderOptions tp{};
+                    tp.device_id             = device;
+                    tp.trt_fp16_enable       = fp16_io ? 1 : 0;
+                    tp.trt_max_workspace_size = (size_t)2 << 30;   // 2 GB build scratch
+                    // The legacy options struct is zero-initialised, but TRT
+                    // rejects 0 for these two (they must be positive) — set ORT's
+                    // documented defaults explicitly to silence the warnings.
+                    tp.trt_max_partition_iterations = 1000;
+                    tp.trt_min_subgraph_size        = 1;
+                    // Persist built engines next to the model so we don't pay the
+                    // (minutes-long) TensorRT engine build on every launch.  TRT
+                    // keys cache files by model + input shape + TRT/GPU version, so
+                    // the first run of each batch size builds, then reuses.
+                    namespace fs = std::filesystem;
+                    fs::path model_dir = fs::path(path).parent_path();
+                    if (model_dir.empty()) model_dir = ".";
+                    static std::string cache_dir;   // must outlive the Append call below
+                    cache_dir = (model_dir / "trt_engine_cache").string();
+                    std::error_code ec;
+                    fs::create_directories(cache_dir, ec);
+                    tp.trt_engine_cache_enable = 1;
+                    tp.trt_engine_cache_path   = cache_dir.c_str();
+                    opts.AppendExecutionProvider_TensorRT(tp);
+                    fprintf(stderr,
+                        "[ORT] '%s': TensorRT EP (fp16=%d, engine cache='%s').\n"
+                        "      First run builds engines (can take minutes); later runs reuse them.\n",
+                        path.c_str(), tp.trt_fp16_enable, cache_dir.c_str());
+#else
+                    continue;   // compiled without TRT — should not be in ladder, but be safe
+#endif
+                }
+                else if (ep == EP_CUDA)
                 {
                     OrtCUDAProviderOptions cp{};
                     cp.device_id = device;
                     opts.AppendExecutionProvider_CUDA(cp);
                 }
-#if defined(USE_TENSORRT_EP)
-                if (try_cuda && trt_ep)
-                {
-                    OrtTensorRTProviderOptions tp{};
-                    tp.device_id = device;
-                    tp.trt_fp16_enable = fp16_io ? 1 : 0;
-                    opts.AppendExecutionProvider_TensorRT(tp);
-                }
-#endif
+                // EP_CPU: append nothing — the default CPU EP runs.
+
                 session = new Ort::Session(e, path.c_str(), opts);
-                if (!try_cuda && cuda)
-                    fprintf(stderr, "[ORT] WARNING: '%s' running on CPU (CUDA EP unavailable)\n",
+                if (ep == EP_CPU && cuda)
+                    fprintf(stderr, "[ORT] WARNING: '%s' running on CPU (GPU EPs unavailable)\n",
                             path.c_str());
                 break;  // success
             }
             catch (const Ort::Exception& ex)
             {
-                if (try_cuda)
+                if (!last)
                 {
-                    fprintf(stderr, "[ORT] CUDA EP failed (%s)\n[ORT] Retrying '%s' on CPU…\n",
-                            ex.what(), path.c_str());
-                    continue;  // retry without CUDA
+                    fprintf(stderr,
+                        "[ORT] %s EP failed for '%s' (%s)\n[ORT] Falling back to %s…\n",
+                        ep_name(ep), path.c_str(), ex.what(), ep_name(ladder[a + 1]));
+                    continue;   // try the next EP down the ladder
                 }
-                fprintf(stderr, "[ORT] load '%s' failed: %s\n", path.c_str(), ex.what());
+                fprintf(stderr, "[ORT] load '%s' failed on %s: %s\n",
+                        path.c_str(), ep_name(ep), ex.what());
                 return false;
             }
         }
@@ -369,14 +415,14 @@ struct Pipeline::Impl
         printf("[FSB] Loading backbone … ");
         fflush(stdout);
         if (!sess_backbone.load(ort_env, opath(cfg.backbone_name.c_str()), cuda, dev,
-                                cfg.use_fp16, false))
+                                cfg.use_fp16, cfg.use_trt_ep))
             return false;
         printf("OK\n");
 
         printf("[FSB] Loading decoder  … ");
         fflush(stdout);
-        if (!sess_decoder.load(ort_env, opath("decoder.onnx"), cuda, dev,
-                               cfg.use_fp16, false))
+        if (!sess_decoder.load(ort_env, opath(cfg.decoder_name.c_str()), cuda, dev,
+                               cfg.use_fp16, cfg.use_trt_ep))
             return false;
         printf("OK\n");
 
@@ -391,7 +437,7 @@ struct Pipeline::Impl
                 bm_check.close();
                 printf("[FSB] Loading body_model.onnx … ");
                 fflush(stdout);
-                if (!sess_body.load(ort_env, bm_onnx, cuda, dev, false, false))
+                if (!sess_body.load(ort_env, bm_onnx, cuda, dev, false, cfg.use_trt_ep))
                     return false;
                 printf("OK\n");
 
@@ -476,7 +522,7 @@ struct Pipeline::Impl
         {
             printf("[FSB] Loading YOLO … ");
             fflush(stdout);
-            if (!sess_yolo.load(ort_env, cfg.yolo_path, cuda, dev, false, false))
+            if (!sess_yolo.load(ort_env, cfg.yolo_path, cuda, dev, false, cfg.use_trt_ep))
             {
                 fprintf(stderr, "[FSB] YOLO load failed – detection disabled\n");
             }

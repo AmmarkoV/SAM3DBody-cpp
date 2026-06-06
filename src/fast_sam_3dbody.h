@@ -78,6 +78,7 @@ struct PipelineConfig {
     // Paths
     std::string onnx_dir;           // Directory with backbone.onnx, decoder.onnx, body_model.onnx
     std::string backbone_name = "backbone.onnx"; // filename within onnx_dir; override for quantized variant
+    std::string decoder_name  = "decoder.onnx";  // filename within onnx_dir; resolver swaps in decoder_fp16.onnx under --trt
     std::string gguf_path;          // Path to pipeline.gguf
     std::string yolo_path;          // YOLO model: .onnx or .engine (TRT)
 

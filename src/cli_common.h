@@ -76,6 +76,7 @@ struct CommonConfig
 #else
     std::string backbone_name  = "backbone.onnx";
 #endif
+    std::string decoder_name   = "decoder.onnx";  // resolved to decoder_fp16.onnx under --trt
     int         cuda_device    = 0;       // -1 = CPU
     bool        use_trt        = false;
     bool        fp16           = true;    // can be disabled with --no-fp16
@@ -278,9 +279,10 @@ inline void resolve_detector_defaults(CommonConfig& c)
 }
 
 // On CUDA, auto-prefer a float16 backbone when one has been exported next to the
-// default FP32 model (tools/export_backbone_fp16.py → <onnx_dir>/backbone_fp16.onnx).
-// ORT's CUDA EP runs a model in its native precision, so the FP16 weights are
-// what actually engages the GPU's tensor cores (~2× backbone throughput).
+// default backbone (tools/export_backbone_fp16.py → <onnx_dir>/backbone_fp16.onnx).
+// The stock backbone is bfloat16; the fp16 remap is 3× smaller on disk/VRAM and a
+// few % faster on ORT's CUDA EP, with identical output. (Not 2×: the export bakes
+// in fp32 MatMul paths — see tools/export_backbone_fp16.py for the full story.)
 //
 // Only fires when ALL of the following hold, so it never surprises the user:
 //   * the user did NOT pin a model with --backbone, and
@@ -290,18 +292,48 @@ inline void resolve_detector_defaults(CommonConfig& c)
 //   * <onnx_dir>/backbone_fp16.onnx actually exists.
 inline void resolve_backbone_defaults(CommonConfig& c)
 {
-    if (c.backbone_name_set)            return;   // user pinned --backbone
-    if (c.backbone_name != "backbone.onnx") return;   // non-default (e.g. int8) — respect it
     if (c.cuda_device < 0)             return;   // CPU EP: FP16 offers no benefit
 
-    const std::string fp16_name = "backbone_fp16.onnx";
-    const std::string fp16_path = c.onnx_dir + "/" + fp16_name;
-    if (std::ifstream(fp16_path).good()) {
-        c.backbone_name = fp16_name;
+    auto exists = [&](const std::string& name) {
+        return std::ifstream(c.onnx_dir + "/" + name).good();
+    };
+
+    // ── Decoder ────────────────────────────────────────────────────────────────
+    // The stock decoder.onnx is bfloat16.  ORT's CUDA EP runs it fine, but the
+    // TensorRT EP rejects bf16 subgraph-boundary tensors ("output tensor data
+    // type: 16 not supported").  decoder_fp16.onnx is the bf16→fp16 remap that
+    // TRT accepts (regenerate with:
+    //   tools/export_backbone_fp16.py --input onnx/decoder.onnx \
+    //                                 --output onnx/decoder_fp16.onnx).
+    // Pick it up automatically under --trt so the decoder runs on TRT instead of
+    // crashing.
+    if (c.use_trt && c.decoder_name == "decoder.onnx" && exists("decoder_fp16.onnx")) {
+        c.decoder_name = "decoder_fp16.onnx";
         std::fprintf(stderr,
-            "[cli] CUDA: found '%s'; preferring it over backbone.onnx "
-            "(FP16 tensor cores). Pin --backbone backbone.onnx to force FP32.\n",
-            fp16_path.c_str());
+            "[cli] TRT: using 'decoder_fp16.onnx' (bf16 decoder.onnx is not TRT-compatible).\n");
+    }
+
+    // ── Backbone ───────────────────────────────────────────────────────────────
+    if (c.backbone_name_set)            return;   // user pinned --backbone
+    if (c.backbone_name != "backbone.onnx") return;   // non-default (e.g. int8) — respect it
+
+    // Under --trt prefer the If-folded fp16 backbone: the stock fp16 backbone
+    // still carries the rope_embed `If` subgraphs, which TRT cannot shape-infer
+    // ("/rope_embed/If_1_output_0 has no shape specified"), forcing a silent
+    // fall-back to the CUDA EP.  backbone_fp16_trt.onnx folds them out so the TRT
+    // engine builds and the heavy GEMMs run on the fp16 tensor cores.
+    if (c.use_trt && exists("backbone_fp16_trt.onnx")) {
+        c.backbone_name = "backbone_fp16_trt.onnx";
+        std::fprintf(stderr,
+            "[cli] TRT: preferring 'backbone_fp16_trt.onnx' (If-folded, TRT-buildable).\n");
+        return;
+    }
+
+    if (exists("backbone_fp16.onnx")) {
+        c.backbone_name = "backbone_fp16.onnx";
+        std::fprintf(stderr,
+            "[cli] CUDA: found 'backbone_fp16.onnx'; preferring it over backbone.onnx "
+            "(FP16: 3x smaller, ~6%% faster). Pin --backbone backbone.onnx to force the bf16 original.\n");
     }
 }
 
@@ -313,6 +345,7 @@ inline void apply_common_to_pipeline_cfg(const CommonConfig& c,
 {
     pc.onnx_dir       = c.onnx_dir;
     pc.backbone_name  = c.backbone_name;
+    pc.decoder_name   = c.decoder_name;
     pc.gguf_path      = c.gguf_path;
     pc.yolo_path      = c.yolo_path;
     pc.cuda_device    = c.cuda_device;

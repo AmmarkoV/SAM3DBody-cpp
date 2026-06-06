@@ -1,54 +1,57 @@
 #!/usr/bin/env python3
 """
-tools/export_backbone_fp16.py  —  run-once FP16 conversion for backbone.onnx
+tools/export_backbone_fp16.py  —  run-once bfloat16 → float16 remap for ONNX models
 
 WHY THIS EXISTS
 ---------------
-The backbone is a DINOv3-ViT-H (~630 M params) exported in float32
-(backbone.onnx + backbone.onnx.data, ~4.8 GB).  ONNX Runtime's CUDA EP runs a
-model in its *native* precision — there is no runtime "use fp16" switch on the
-CUDA EP (only the TensorRT EP has trt_fp16_enable).  So the FP32 backbone runs
-FP32 on the GPU and never touches the Ada/Turing tensor cores.
+The backbone (DINOv3-ViT-H, ~630 M params) and the decoder are exported with
+**bfloat16** weights (355 bf16 tensors in the backbone), with Cast→bf16 / Cast→
+fp32 nodes threading bf16 storage through compute.  This tool remaps every bf16
+tensor in the graph to **float16** (initializers, Cast targets, Constant /
+ConstantOfShape attribute tensors, and value_info), so:
 
-Converting the weights to float16 lets the CUDA EP issue half-precision GEMMs on
-the tensor cores.  On the tested RTX 1000 Ada laptop GPU this roughly halves the
-backbone time (~240 ms → ~120 ms) and the on-disk / VRAM footprint:
+  * ORT's CUDA EP uses its mature fp16 kernels instead of weaker bf16 ones; and
+  * the ONNX Runtime **TensorRT EP** accepts the model at all — TRT has no bf16
+    path and rejects bf16 subgraph-boundary tensors at run time
+    ("TensorRT EP output tensor data type: 16 not supported").
 
-    backbone.onnx + .data        ~4.8 GB  FP32
-    backbone_fp16.onnx + .data   ~2.4 GB  FP16
+  bf16 weights, |max| ≤ 62  →  fp16 (range ±65504; safe, +mantissa precision)
 
-I/O TYPES
----------
-By default the converted model KEEPS its graph inputs and outputs in float32
-(keep_io_types=True): the model casts FP32→FP16 on entry and FP16→FP32 on exit
-internally.  This means the C++ side feeds and reads the exact same FP32 tensors
-as before — no code change is required to *use* the model, only to *load* it.
-(The loader auto-prefers backbone_fp16.onnx on CUDA when present; see
-src/cli_common.h resolve_backbone_defaults.)
+WHY THE FP16 ATTRIBUTE PASS MATTERS (don't drop it):
+ConstantOfShape / Constant carry their *own* dtype in a `value` attribute.
+Converting initializers + value_info but missing these leaves the graph
+inconsistent — a fp16 value_info over a bf16 ConstantOfShape — which ORT rejects
+at load ("Type (tensor(float16)) … does not match expected type (bfloat16)").
 
-NUMERICS
---------
-A handful of ops are numerically sensitive in half precision.  The converter's
-default op_block_list keeps the worst offenders (e.g. some normalisations) in
-FP32, and --min-positive-val / --max-finite-val clamp tiny/huge constants so they
-don't underflow/overflow to 0/inf when narrowed.  DINOv3 was trained in
-bf16/fp16-friendly ranges, so FP16 inference is visually indistinguishable from
-FP32 here; if you ever see NaNs, add the offending op type via --block-op.
+MEASURED RESULT (RTX 1000 Ada laptop, DINOv3-ViT-H, batch=1, 25-frame steady state)
+-----------------------------------------------------------------------------------
+  on disk             :  5.05 GB  →  1.68 GB   (3× smaller, ~3.3 GB less VRAM)
+  backbone, CUDA EP   :  ~245 ms (bf16)  →  ~230 ms (fp16)     (~6% faster)
+  backbone, TRT EP    :  ~148 ms                               (1.6× vs CUDA EP)
+
+The big win is TensorRT: the heavy GEMMs are already fp16 in the graph, but ORT's
+CUDA EP schedules them far worse than a TRT fp16 engine does.  See tools/run_trt.sh
+and src/cli_common.h resolve_backbone_defaults for the --trt wiring.  Note the
+backbone's `If` (rope) subgraphs must additionally be folded for TRT to build it
+(backbone_fp16_trt.onnx); this tool does the bf16→fp16 remap only.
+
+Graph inputs/outputs stay float32, so the C++ side feeds/reads the same FP32
+buffers — no inference-code change needed, only a load-time model swap.
 
 USAGE
 -----
-    # Run-once conversion (needs ~6–8 GB free RAM for the 4.8 GB model):
+    # Backbone (default paths):
     python3 tools/export_backbone_fp16.py --onnx-dir ./onnx
+    # Decoder (TRT needs this; stock decoder.onnx is bf16 → TRT-incompatible):
+    python3 tools/export_backbone_fp16.py --input  onnx/decoder.onnx \
+                                          --output onnx/decoder_fp16.onnx
 
-    # Then just run normally — on CUDA the loader picks backbone_fp16.onnx up
-    # automatically; or pin it explicitly:
-    ./build/fast_sam_3dbody_run --from input.mp4 --backbone backbone_fp16.onnx
-
-The original backbone.onnx is never modified — both coexist in onnx/.
+Originals are never modified — converted models coexist in onnx/.  If the input
+has no bf16 tensors, the tool reports "nothing to convert" and exits.
 
 DEPENDENCIES
 ------------
-    pip3 install onnx onnxconverter-common numpy
+    pip3 install onnx numpy ml_dtypes
 """
 
 import argparse
@@ -58,9 +61,7 @@ import time
 
 # ── Dependency check ──────────────────────────────────────────────────────────
 _missing = []
-for _imp, _pip in (("onnx", "onnx"),
-                   ("onnxconverter_common", "onnxconverter-common"),
-                   ("numpy", "numpy")):
+for _imp, _pip in (("onnx", "onnx"), ("numpy", "numpy"), ("ml_dtypes", "ml_dtypes")):
     try:
         __import__(_imp)
     except ImportError:
@@ -70,12 +71,16 @@ if _missing:
     print("  pip3 install", " ".join(_missing))
     sys.exit(1)
 
+import numpy as np
 import onnx
-from onnxconverter_common import float16
+from onnx import TensorProto, numpy_helper
+
+BF16 = TensorProto.BFLOAT16   # 16
+F16  = TensorProto.FLOAT16    # 10
 
 
 def dir_size_gb(directory: str, prefix: str) -> float:
-    """Sum of files in `directory` whose name is `prefix` or `prefix.*` (external data)."""
+    """Sum of files in `directory` named `prefix` or `prefix.*` (external data)."""
     if not os.path.isdir(directory):
         return 0.0
     total = sum(
@@ -86,9 +91,58 @@ def dir_size_gb(directory: str, prefix: str) -> float:
     return total / 1e9
 
 
+def _remap_tensor_bf16(t, counts, key):
+    """If TensorProto `t` is bf16, rewrite it to fp16 in place (bf16→fp32→fp16)."""
+    if t.data_type == BF16:
+        arr = numpy_helper.to_array(t).astype(np.float32).astype(np.float16)
+        new_t = numpy_helper.from_array(arr, t.name)
+        t.CopyFrom(new_t)
+        counts[key] += 1
+
+
+def remap_graph_bf16_to_fp16(graph, counts):
+    """Recursively rewrite every bfloat16 in `graph` (and its subgraphs) to float16."""
+    # 1. Initializers: convert bf16 weight values bf16 → fp32 → fp16, in place.
+    for t in graph.initializer:
+        _remap_tensor_bf16(t, counts, "init")
+
+    for node in graph.node:
+        # 2a. Cast nodes that target bf16 → target fp16.
+        if node.op_type == "Cast":
+            for a in node.attribute:
+                if a.name == "to" and a.i == BF16:
+                    a.i = F16
+                    counts["cast"] += 1
+        # 2b. Tensor-valued attributes (Constant `value`, ConstantOfShape `value`,
+        #     …): these carry their own dtype and produce a bf16 *output* the
+        #     value_info pass below can't fix.  Missing these leaves the graph
+        #     inconsistent — e.g. a fp16 value_info over a bf16 ConstantOfShape,
+        #     which ORT rejects at load ("type … does not match expected type").
+        for a in node.attribute:
+            if a.type == onnx.AttributeProto.TENSOR:
+                _remap_tensor_bf16(a.t, counts, "attr")
+            elif a.type == onnx.AttributeProto.TENSORS:
+                for t in a.tensors:
+                    _remap_tensor_bf16(t, counts, "attr")
+            # Recurse into subgraph attributes (If/Loop/Scan bodies).
+            elif a.type == onnx.AttributeProto.GRAPH:
+                remap_graph_bf16_to_fp16(a.g, counts)
+            elif a.type == onnx.AttributeProto.GRAPHS:
+                for sub in a.graphs:
+                    remap_graph_bf16_to_fp16(sub, counts)
+
+    # 3. Tensor-type annotations on value_info / inputs / outputs.  (Graph I/O are
+    #    fp32 here, so this only ever touches internal bf16 value_info.)
+    for vi in list(graph.value_info) + list(graph.input) + list(graph.output):
+        tt = vi.type.tensor_type
+        if tt.elem_type == BF16:
+            tt.elem_type = F16
+            counts["vinfo"] += 1
+
+
 def main():
     ap = argparse.ArgumentParser(
-        description="Convert backbone.onnx weights to float16 for CUDA tensor cores",
+        description="Remap backbone.onnx weights from bfloat16 to float16 for CUDA tensor cores",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("--onnx-dir", default="./onnx",
@@ -97,15 +151,6 @@ def main():
                     help="Override input path (default: <onnx-dir>/backbone.onnx)")
     ap.add_argument("--output", default=None,
                     help="Override output path (default: <onnx-dir>/backbone_fp16.onnx)")
-    ap.add_argument("--cast-io", action="store_true",
-                    help="Also narrow graph inputs/outputs to float16 (keep_io_types=False). "
-                         "Requires matching C++ changes; NOT recommended — leave I/O as fp32.")
-    ap.add_argument("--block-op", action="append", default=[], metavar="OPTYPE",
-                    help="Keep this op type in FP32 (repeatable). Added to the default block list.")
-    ap.add_argument("--min-positive-val", type=float, default=1e-7,
-                    help="Smallest positive constant kept before flush-to-zero (default 1e-7)")
-    ap.add_argument("--max-finite-val", type=float, default=1e4,
-                    help="Largest finite constant before clamping (default 1e4)")
     args = ap.parse_args()
 
     in_path = args.input or os.path.join(args.onnx_dir, "backbone.onnx")
@@ -123,49 +168,58 @@ def main():
 
     print(f"Input:   {in_path}  ({in_gb:.2f} GB)")
     print(f"Output:  {out_path}")
-    print(f"I/O:     {'float16 (cast-io)' if args.cast_io else 'float32 (kept; no C++ change needed)'}")
     print(f"onnx:    {onnx.__version__}")
 
-    # The 4.8 GB FP32 model is held in RAM during conversion.  Warn if tight.
     try:
         import psutil
         avail_gb = psutil.virtual_memory().available / 1e9
         if avail_gb < in_gb * 1.6:
             print(f"\nWARNING: {avail_gb:.1f} GB RAM available, model is {in_gb:.2f} GB.")
-            print("         FP16 conversion needs ~1.5–2× the model size in RAM.")
+            print("         Conversion holds the model in RAM (~1.5–2× its size).")
     except ImportError:
         pass
 
-    print("\nLoading FP32 model (with external data) …")
+    print("\nLoading model (with external data) …")
     t0 = time.time()
     model = onnx.load(in_path, load_external_data=True)
 
-    # Default block list keeps fp16-unstable ops in fp32; extend with --block-op.
-    op_block_list = list(float16.DEFAULT_OP_BLOCK_LIST) + list(args.block_op)
-    if args.block_op:
-        print(f"  Extra FP32-kept ops: {args.block_op}")
+    # Sanity: how much is actually bf16?
+    n_bf16 = sum(1 for t in model.graph.initializer if t.data_type == BF16)
+    n_fp32 = sum(1 for t in model.graph.initializer if t.data_type == TensorProto.FLOAT)
+    n_fp16 = sum(1 for t in model.graph.initializer if t.data_type == F16)
+    print(f"  initializers: bf16={n_bf16}  fp32={n_fp32}  fp16={n_fp16}")
+    if n_bf16 == 0:
+        print("\nNothing to convert: no bfloat16 tensors found.")
+        print("  This model is not a bf16 export — see the NOTE in this file's header.")
+        sys.exit(2)
 
-    print("Converting weights/activations to float16 …")
-    # disable_shape_infer=True: ONNX shape inference can't run on a >2 GB model,
-    # and the conversion doesn't need it here.
-    model_fp16 = float16.convert_float_to_float16(
-        model,
-        keep_io_types=not args.cast_io,
-        op_block_list=op_block_list,
-        min_positive_val=args.min_positive_val,
-        max_finite_val=args.max_finite_val,
-        disable_shape_infer=True,
-    )
+    # Range guard: bf16 carries fp32 range; fp16 caps at ±65504.  Verify no weight
+    # would overflow before we narrow (NN weights are tiny, but check to be safe).
+    wmax = 0.0
+    for t in model.graph.initializer:
+        if t.data_type == BF16:
+            a = numpy_helper.to_array(t).astype(np.float32)
+            if a.size:
+                wmax = max(wmax, float(np.abs(a).max()))
+    print(f"  max |bf16 weight| = {wmax:g}  (fp16 max = 65504)")
+    if wmax > 65504.0:
+        print("\nERROR: some weights exceed fp16 range — refusing to convert (would inf).")
+        sys.exit(1)
 
-    # The fp16 model is still > 2 GB → must serialise weights as external data
-    # (protobuf single-file hard limit is 2 GB).  One sidecar: <out_base>.data.
+    print("Remapping bfloat16 → float16 …")
+    counts = {"init": 0, "cast": 0, "attr": 0, "vinfo": 0}
+    remap_graph_bf16_to_fp16(model.graph, counts)
+    print(f"  converted: {counts['init']} initializers, "
+          f"{counts['cast']} Cast targets, {counts['attr']} attr tensors, "
+          f"{counts['vinfo']} value_info")
+
+    # Output is > 2 GB → must use external data (protobuf single-file limit is 2 GB).
     print(f"Saving {out_path} (external data → {out_base}.data) …")
-    # Remove any stale sidecar so save() starts clean.
     stale = os.path.join(out_dir, out_base + ".data")
     if os.path.exists(stale):
         os.remove(stale)
     onnx.save(
-        model_fp16,
+        model,
         out_path,
         save_as_external_data=True,
         all_tensors_to_one_file=True,
@@ -185,9 +239,9 @@ def main():
     print("On CUDA the loader auto-prefers backbone_fp16.onnx; or pin it:")
     print(f"  --backbone {out_base}")
     print()
-    print("Compare against FP32:")
-    print(f"  FP32:  ./build/fast_sam_3dbody_run --from input.mp4 --backbone {in_base}")
-    print(f"  FP16:  ./build/fast_sam_3dbody_run --from input.mp4 --backbone {out_base}")
+    print("Compare against the bf16 original (watch the [FSB] timing backbone column):")
+    print(f"  bf16:  ./build/fast_sam_3dbody_run --from input.mp4 --backbone {in_base}")
+    print(f"  fp16:  ./build/fast_sam_3dbody_run --from input.mp4 --backbone {out_base}")
 
 
 if __name__ == "__main__":
