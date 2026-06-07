@@ -304,7 +304,7 @@ if(SAM3D_TENSORRT AND WITH_CUDA)
 endif()
 
 target_compile_options(fast_sam_3dbody PRIVATE
-    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wno-unused-parameter -O3 -march=native>
+    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -O3 -march=native>
     $<$<CXX_COMPILER_ID:MSVC>:/O2>
 )
 
@@ -316,7 +316,7 @@ add_executable(fast_sam_3dbody_run src/main.cpp)
 target_link_libraries(fast_sam_3dbody_run PRIVATE fast_sam_3dbody)
 
 target_compile_options(fast_sam_3dbody_run PRIVATE
-    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wno-unused-parameter -O3 -march=native>
+    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -O3 -march=native>
     $<$<CXX_COMPILER_ID:MSVC>:/O2>
 )
 
@@ -361,13 +361,13 @@ if(NOT WIN32)
 
     if(CMAKE_BUILD_TYPE STREQUAL "Debug")
         target_compile_options(fast_sam_3dbody_render PRIVATE
-            $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter -g -O0>
-            $<$<COMPILE_LANGUAGE:C>:-Wall -Wno-unused-parameter -g -O0>
+            $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -g -O0>
+            $<$<COMPILE_LANGUAGE:C>:-Wall -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -g -O0>
         )
     else()
         target_compile_options(fast_sam_3dbody_render PRIVATE
-            $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter -O3 -march=native>
-            $<$<COMPILE_LANGUAGE:C>:-Wall -Wno-unused-parameter -O2>
+            $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -O3 -march=native>
+            $<$<COMPILE_LANGUAGE:C>:-Wall -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -O2>
         )
     endif()
 else()
@@ -411,7 +411,7 @@ target_link_libraries(offline_sam_3dbody_render PRIVATE
 )
 
 target_compile_options(offline_sam_3dbody_render PRIVATE
-    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wno-unused-parameter -O3 -march=native>
+    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -O3 -march=native>
     $<$<CXX_COMPILER_ID:MSVC>:/O2>
 )
 

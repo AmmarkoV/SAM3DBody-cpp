@@ -425,7 +425,7 @@ int readBVHHeader(struct BVH_MotionCapture * bvhMotion,FILE * fd)
                InputParser_GetWord(ipcB,1,bvhMotion->jointHierarchy[jNum].jointName,MAX_BVH_JOINT_NAME);
 
                 //Also store lowercase version of joint name for internal use
-                strncpy(bvhMotion->jointHierarchy[jNum].jointNameLowercase,bvhMotion->jointHierarchy[jNum].jointName,MAX_BVH_JOINT_NAME);
+                memcpy(bvhMotion->jointHierarchy[jNum].jointNameLowercase,bvhMotion->jointHierarchy[jNum].jointName,MAX_BVH_JOINT_NAME+1);
                 //snprintf(bvhMotion->jointHierarchy[jNum].jointNameLowercase,MAX_BVH_JOINT_NAME,"%s",bvhMotion->jointHierarchy[jNum].jointName);
                 lowercase(bvhMotion->jointHierarchy[jNum].jointNameLowercase);
                 bvhMotion->jointHierarchy[jNum].jointNameHash = hashFunctionJoints(bvhMotion->jointHierarchy[jNum].jointNameLowercase);
@@ -469,7 +469,7 @@ int readBVHHeader(struct BVH_MotionCapture * bvhMotion,FILE * fd)
                 InputParser_GetWord(ipcB,1,bvhMotion->jointHierarchy[jNum].jointName,MAX_BVH_JOINT_NAME);
 
                 //Also store lowercase version of joint name for internal use
-                strncpy(bvhMotion->jointHierarchy[jNum].jointNameLowercase,bvhMotion->jointHierarchy[jNum].jointName,MAX_BVH_JOINT_NAME);
+                memcpy(bvhMotion->jointHierarchy[jNum].jointNameLowercase,bvhMotion->jointHierarchy[jNum].jointName,MAX_BVH_JOINT_NAME+1);
                 //snprintf(bvhMotion->jointHierarchy[jNum].jointNameLowercase,MAX_BVH_JOINT_NAME,"%s",bvhMotion->jointHierarchy[jNum].jointName);
                 lowercase(bvhMotion->jointHierarchy[jNum].jointNameLowercase);
                 bvhMotion->jointHierarchy[jNum].jointNameHash = hashFunctionJoints(bvhMotion->jointHierarchy[jNum].jointNameLowercase);
@@ -503,7 +503,9 @@ int readBVHHeader(struct BVH_MotionCapture * bvhMotion,FILE * fd)
                     if (debug) {fprintf(stderr,"-S-");}
                     if (jNum>0)
                     {
-                      int ret = snprintf(bvhMotion->jointHierarchy[jNum].jointName,MAX_BVH_JOINT_NAME,"EndSite_%s",bvhMotion->jointHierarchy[jNum-1].jointName);
+                      char parentJointName[MAX_BVH_JOINT_NAME+1];
+                      snprintf(parentJointName,sizeof(parentJointName),"%s",bvhMotion->jointHierarchy[jNum-1].jointName);
+                      int ret = snprintf(bvhMotion->jointHierarchy[jNum].jointName,MAX_BVH_JOINT_NAME,"EndSite_%s",parentJointName);
 
                       if (ret < 0)
                        {

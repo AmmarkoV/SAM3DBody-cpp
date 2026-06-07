@@ -750,7 +750,7 @@ int InputParser_SeperateWords(struct InputParserC * ipc,char * inpt,char keepcop
                           ipc->str = (char * ) malloc( sizeof(char) * (STRING_END+1) );
                           memset(ipc->str,0,sizeof(char) * (STRING_END+1));
                           ipc->local_allocation = 1;
-                          strncpy( ipc->str , inpt , STRING_END ) ;
+                          memcpy( ipc->str , inpt , STRING_END ) ;
                        } else
                        { ipc->str = inpt; }
 
