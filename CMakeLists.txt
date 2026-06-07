@@ -416,6 +416,53 @@ target_compile_options(offline_sam_3dbody_render PRIVATE
 )
 
 # ---------------------------------------------------------------------------
+# sam_3dbody_net  executable  (networked client/server — CLIENTSERVER.md)
+#
+# One binary, two modes (--server / --client).  Optional: depends on AmmarServer
+# (HTTP server lib) + AmmClient (HTTP client lib), fetched/built by
+# tools/setup_ammarserver.sh.  ./AmmarServer is typically a symlink to a dev
+# checkout.  When the libs are absent the target is silently skipped — a single
+# STATUS line, never a warning — so the core build is unaffected.  Linked against
+# the shared libs (the static AmmarServer lib pulls in sibling libs the .so
+# bundles), with an rpath so they resolve without LD_LIBRARY_PATH.
+# ---------------------------------------------------------------------------
+set(_AMM_DIR     "${CMAKE_CURRENT_SOURCE_DIR}/AmmarServer")
+set(_AMM_SRV_HDR "${_AMM_DIR}/src/AmmServerlib/AmmServerlib.h")
+set(_AMM_CLI_HDR "${_AMM_DIR}/src/AmmClient/AmmClient.h")
+set(_AMM_SRV_LIB "${_AMM_DIR}/src/AmmServerlib/libAmmarServer.so")
+set(_AMM_CLI_LIB "${_AMM_DIR}/src/AmmClient/libAmmClient.so")
+
+if(NOT WIN32 AND EXISTS "${_AMM_SRV_HDR}" AND EXISTS "${_AMM_CLI_HDR}"
+   AND EXISTS "${_AMM_SRV_LIB}" AND EXISTS "${_AMM_CLI_LIB}")
+    add_executable(sam_3dbody_net net/sam_3dbody_net.cpp)
+    target_include_directories(sam_3dbody_net PRIVATE
+        src
+        ${OpenCV_INCLUDE_DIRS}
+        "${_AMM_DIR}/src/AmmServerlib"
+        "${_AMM_DIR}/src/AmmClient"
+    )
+    target_link_libraries(sam_3dbody_net PRIVATE
+        fast_sam_3dbody
+        ${OpenCV_LIBS}
+        "${_AMM_SRV_LIB}"
+        "${_AMM_CLI_LIB}"
+        pthread
+        ${RT_LIB}
+        ${MATH_LIB}
+    )
+    set_target_properties(sam_3dbody_net PROPERTIES
+        BUILD_RPATH   "${_AMM_DIR}/src/AmmServerlib;${_AMM_DIR}/src/AmmClient"
+        INSTALL_RPATH "${_AMM_DIR}/src/AmmServerlib;${_AMM_DIR}/src/AmmClient"
+    )
+    target_compile_options(sam_3dbody_net PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -O3 -march=native>
+    )
+    message(STATUS "AmmarServer found — building sam_3dbody_net (networked client/server)")
+else()
+    message(STATUS "AmmarServer not found — skipping sam_3dbody_net; run tools/setup_ammarserver.sh to enable")
+endif()
+
+# ---------------------------------------------------------------------------
 # QR timecode synchronization tool (optional; needs X11/Xrandr/qrencode)
 # ---------------------------------------------------------------------------
 add_subdirectory(synchronization)
