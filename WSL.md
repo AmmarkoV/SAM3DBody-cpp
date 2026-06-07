@@ -203,3 +203,9 @@ and inside the loop over add-ons add this `elif`:
 elif "mpfb" in addon.lower():   # MPFB installed as a Blender extension
     haveMPFB = True
 ```
+
+
+---
+
+Thanks to Vivek Chouhan ( https://www.linkedin.com/in/vivek-chouhan/ ) for providing this information!
+

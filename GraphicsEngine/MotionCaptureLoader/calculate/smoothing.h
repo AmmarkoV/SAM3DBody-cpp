@@ -206,7 +206,7 @@ static int butterWorth_deallocate(struct ButterWorthArray * bwa)
 
 static float butterWorth_filterArrayElement(struct ButterWorthArray * handle,int valueID,float unfilteredValue)
 {
-  if ( (handle!=0) && (valueID<handle->numberOfSensors) )
+  if ( (handle!=0) && (valueID>=0) && ((unsigned int) valueID<handle->numberOfSensors) )
   {
     return butterWorth_filter(&handle->sensors[valueID],unfilteredValue);
   }

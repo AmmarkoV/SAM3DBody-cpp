@@ -51,15 +51,15 @@
 //
 //  USAGE
 //  ─────
-//     offline_sam_3dbody_render \
-//         --onnx-dir ./onnx --gguf ./onnx/pipeline.gguf \
-//         --yolo ./onnx/yolo.onnx --from clip.mp4 \
-//         --bvh ./out.bvh \
-//         [--smoothing zero-phase|forward|off] \
-//         [--bw-cutoff HZ] [--rot-clamp DEG] \
-//         [--interpolate-jitter] [--jitter-threshold-cm CM] \
-//         [--track-merge-frames N] [--track-merge-cm CM] \
-//         [--no-bvh-body-shape-change] [--no-bvh-hand-shape-change] \
+//     offline_sam_3dbody_render
+//         --onnx-dir ./onnx --gguf ./onnx/pipeline.gguf
+//         --yolo ./onnx/yolo.onnx --from clip.mp4
+//         --bvh ./out.bvh
+//         [--smoothing zero-phase|forward|off]
+//         [--bw-cutoff HZ] [--rot-clamp DEG]
+//         [--interpolate-jitter] [--jitter-threshold-cm CM]
+//         [--track-merge-frames N] [--track-merge-cm CM]
+//         [--no-bvh-body-shape-change] [--no-bvh-hand-shape-change]
 //         [--bvh-raw-fingers]
 //
 // ════════════════════════════════════════════════════════════════════════════

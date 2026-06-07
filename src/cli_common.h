@@ -379,7 +379,7 @@ inline void resolve_backbone_defaults(CommonConfig& c)
     // TensorRT EP rejects bf16 subgraph-boundary tensors ("output tensor data
     // type: 16 not supported").  decoder_fp16.onnx is the bf16→fp16 remap that
     // TRT accepts (regenerate with:
-    //   tools/export_backbone_fp16.py --input onnx/decoder.onnx \
+    //   tools/export_backbone_fp16.py --input onnx/decoder.onnx
     //                                 --output onnx/decoder_fp16.onnx).
     // Pick it up automatically under --trt so the decoder runs on TRT instead of
     // crashing.

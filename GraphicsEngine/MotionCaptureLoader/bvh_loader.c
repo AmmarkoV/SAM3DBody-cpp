@@ -842,15 +842,15 @@ int bvh_onlyAnimateGivenJoints(struct BVH_MotionCapture * bvhMotion,unsigned int
 
 
       unsigned int mID_Initial,mID_Target;
-      for (int frameID=0; frameID<bvhMotion->numberOfFramesEncountered; frameID++)
+      for (unsigned int frameID=0; frameID<bvhMotion->numberOfFramesEncountered; frameID++)
        {
          //fprintf(stderr,"FrameNumber %u\n",frameID);
-         for (int mID=0; mID<bvhMotion->numberOfValuesPerFrame; mID++)
+         for (unsigned int mID=0; mID<bvhMotion->numberOfValuesPerFrame; mID++)
          {
              unsigned int  jointID = bvhMotion->motionToJointLookup[mID].jointID;
              int isMIDProtected=0;
 
-             for (int aJ=0; aJ<numberOfArguments; aJ++)
+             for (unsigned int aJ=0; aJ<numberOfArguments; aJ++)
               {
                if (successJoints[aJ])
                 {
@@ -1726,7 +1726,7 @@ int bvh_selectJointsToHide2D(
    unsigned int copyingEngaged=0;
    unsigned int framesEliminated=0;
    //---------------------------------------------------
-   for (int fID=0; fID<bvhMotion->numberOfFrames; fID++)
+   for (unsigned int fID=0; fID<bvhMotion->numberOfFrames; fID++)
    {
      if (framesToRemove[fID])
      {

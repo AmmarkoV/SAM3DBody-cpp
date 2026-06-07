@@ -1038,7 +1038,7 @@ int tri_packageBoneDataPerVertex(struct TRI_BonesPackagedPerVertex * boneDataPer
        for (unsigned int boneID=0; boneID<model->header.numberOfBones; boneID++)
          {
            unsigned int targetBoneTransformIndex = boneID*16;
-           if ( (model->bones[boneID].info!=0) && (model->bones[boneID].info->finalVertexTransformation!=0) )
+           if ( model->bones[boneID].info!=0 )
            {
              float * s = model->bones[boneID].info->finalVertexTransformation;
              float * t = &boneDataPerVertex->boneTransforms[targetBoneTransformIndex];
