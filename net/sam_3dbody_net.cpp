@@ -361,13 +361,37 @@ static void* close_callback(AmmServer_DynamicRequest* rqst)
     return 0;
 }
 
-// GET / — human-readable status for a quick curl/browser check.
+// GET / — minimal browser page: pick an image, POST it to /infer, show the
+// SAM3D text response on the same page.  Uses the same multipart field name
+// ("uploadedfile") as the CLI client, so it exercises the identical path.
+// Embedded (not a disk file) so the server stays self-contained.  '\n' inside
+// the JS is written as "\\n" so the served bytes are a literal backslash-n.
+static const char INDEX_HTML[] =
+"<!doctype html><html><head><meta charset=\"utf-8\"><title>SAM3D-net</title>"
+"<style>body{font-family:sans-serif;margin:2em;max-width:900px}"
+"pre{background:#111;color:#0f0;padding:1em;overflow:auto;white-space:pre-wrap}"
+"img{max-width:320px;display:block;margin:1em 0;border:1px solid #ccc}</style>"
+"</head><body><h2>SAM-3D-Body &mdash; upload an image</h2>"
+"<input type=\"file\" id=\"f\" accept=\"image/*\"><img id=\"pv\">"
+"<pre id=\"out\">Pick an image&hellip;</pre><script>"
+"const f=document.getElementById('f'),out=document.getElementById('out'),pv=document.getElementById('pv');"
+"f.addEventListener('change',async()=>{"
+"const file=f.files[0];if(!file)return;"
+"pv.src=URL.createObjectURL(file);out.textContent='Running\\u2026';"
+"const fd=new FormData();fd.append('uploadedfile',file,file.name);"
+"try{const t0=performance.now();"
+"const r=await fetch('/infer',{method:'POST',body:fd});"
+"const txt=await r.text();"
+"out.textContent='('+Math.round(performance.now()-t0)+' ms)\\n'+txt;"
+"}catch(e){out.textContent='Error: '+e;}});"
+"</script></body></html>";
+
 static void* root_callback(AmmServer_DynamicRequest* rqst)
 {
-    snprintf(rqst->content, rqst->MAXcontentSize,
-             "SAM3D-net server up. POST a JPEG to /infer (form field "
-             "'uploadedfile', optional ?seq=&t_ms=). POST /close to flush the BVH.\n");
-    rqst->contentSize = strlen(rqst->content);
+    size_t n = sizeof(INDEX_HTML) - 1;   // exclude the trailing NUL
+    if (n > rqst->MAXcontentSize) n = rqst->MAXcontentSize;
+    memcpy(rqst->content, INDEX_HTML, n);
+    rqst->contentSize = n;
     return 0;
 }
 
@@ -435,7 +459,7 @@ static int run(const NetConfig& cfg)
     AmmServer_DoNOTCacheResourceHandler(g_server, &g_closeCtx);
 
     AmmServer_AddResourceHandler(g_server, &g_rootCtx, "/index.html",
-                                 4096, 0, (void*)&root_callback,
+                                 16 * 1024, 0, (void*)&root_callback,
                                  SAME_PAGE_FOR_ALL_CLIENTS);
 
     fprintf(stderr, "[server] ready on :%d  (POST /infer, /close)%s\n", cfg.port,
