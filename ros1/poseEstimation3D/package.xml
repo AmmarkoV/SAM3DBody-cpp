@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>poseEstimation3D</name>
+  <version>0.0.1</version>
+  <description>
+    Thin ROS 1 client for the SAM3DBody-cpp net server.  Streams an RGB image
+    topic to a remote GPU pose-estimation server (sam_3dbody_net) and republishes
+    the result as a TF tree and a Float32MultiArray — a drop-in 3D human pose
+    stack for old ROS 1 robots, the same way mocapnet_rosnode worked.
+  </description>
+  <maintainer email="ammarkov@gmail.com">Ammar Qammaz</maintainer>
+  <author email="ammarkov@gmail.com">Ammar Qammaz</author>
+  <license>BSD</license>
+  <url type="website">http://ammar.gr/</url>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <depend>roscpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>cv_bridge</depend>
+  <depend>image_transport</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+</package>
