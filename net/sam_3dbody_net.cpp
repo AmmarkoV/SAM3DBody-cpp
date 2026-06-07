@@ -78,6 +78,10 @@ struct NetConfig {
     std::string bvh_template = "./body_mhr.bvh";
     double      bvh_fps = 30.0;        // nominal frame time stamped into the BVH
     int         idle_finalize_s = 5;   // finalize the BVH after this idle gap
+
+    // Per-joint TF transforms in the response (JLOCAL lines).  Needs the LBS
+    // body model (onnx-dir/body_model.lbs); works even with --skip-body.
+    bool        jlocal = false;
 };
 
 // ============================================================================
@@ -98,10 +102,32 @@ static void append_floats(std::string& s, const char* tag,
 // Build the response body for one processed frame.  betas_sent tracks which
 // track ids have already had their (near-constant) shape/scale emitted, so we
 // only send BETAS on a track's first frame.
+//
+// ── Wire-format extension contract (forward compatibility) ──────────────────
+// The format is line-oriented: each line's first whitespace token is a record
+// type the consumer dispatches on.  Unknown tokens MUST be skipped, so new
+// record types are added without breaking existing clients; bump
+// SAM3D_FORMAT_VERSION only for incompatible changes.  Currently emitted:
+//   SAM3D P GROT CAMT BPOSE HPOSE BETAS KP3D KP2D END
+//   JLOCAL <joint> <parent> qx qy qz qw tx ty tz   per-joint LOCAL transform —
+//        parent-relative quaternion (xyzw) + translation (metres) = a TF
+//        broadcast set; root parent is "camera".  Emitted per person when the
+//        server runs with --jlocal (source: BVHWriter::compute_joint_locals).
+// Reserved for future ROS / TF-broadcast clients (see CLIENTSERVER.md
+// "Forward compatibility: ROS / TF outputs") — add as new per-person lines:
+//   HIER   <joint> <parent> ...                     joint tree, once per track.
+//   ROOTQ  qx qy qz qw tx ty tz                      camera->root as a quaternion.
+//   CONF   <70 floats>                               per-joint confidence.
+// Header may also gain: coord=<frame conv> units=m  (camera optical frame;
+// client remaps to ROS REP-103) and a real capture stamp once t_ms round-trips.
+// To avoid response bloat when several output types coexist, gate emission by a
+// client-selected output set (a future per-request 'out=' selector / server
+// --outputs flag); the default stays the full set above.
 static std::string format_results(unsigned seq, unsigned t_ms,
                                   const std::vector<fsb::MHRResult>& res,
                                   const std::vector<int>& ids,
-                                  std::unordered_map<int,bool>& betas_sent)
+                                  std::unordered_map<int,bool>& betas_sent,
+                                  const std::vector<std::vector<BVHWriter::JointLocal>>* jlocals)
 {
     std::string s;
     s.reserve(4096);
@@ -146,7 +172,19 @@ static std::string format_results(unsigned seq, unsigned t_ms,
             }
         }
 
-        // Optional 2-D keypoints when the body model ran.
+        // Optional keypoints — only populated when the body model ran
+        // (i.e. NOT --skip-body).  KP3D is metres in camera space; KP2D is
+        // projected image pixels.
+        if (!r.keypoints_3d.empty()) {
+            snprintf(b, sizeof(b), "KP3D %zu", r.keypoints_3d.size() / 3);
+            s += b;
+            for (size_t k = 0; k + 2 < r.keypoints_3d.size(); k += 3) {
+                snprintf(b, sizeof(b), " %.6g,%.6g,%.6g",
+                         r.keypoints_3d[k], r.keypoints_3d[k+1], r.keypoints_3d[k+2]);
+                s += b;
+            }
+            s += '\n';
+        }
         if (!r.keypoints_2d.empty()) {
             snprintf(b, sizeof(b), "KP2D %zu", r.keypoints_2d.size() / 2);
             s += b;
@@ -156,6 +194,21 @@ static std::string format_results(unsigned seq, unsigned t_ms,
                 s += b;
             }
             s += '\n';
+        }
+
+        // Per-joint local transforms (TF tree) — only when the server runs with
+        // --jlocal.  One line per MHR joint: parent-relative quaternion (xyzw) +
+        // translation (metres); the root's parent token is "camera".
+        if (jlocals && i < jlocals->size()) {
+            char jb[256];
+            for (const auto& jl : (*jlocals)[i]) {
+                const char* par = jl.parent[0] ? jl.parent : "camera";
+                snprintf(jb, sizeof(jb),
+                         "JLOCAL %s %s %.6g %.6g %.6g %.6g %.6g %.6g %.6g\n",
+                         jl.name, par, jl.q[0], jl.q[1], jl.q[2], jl.q[3],
+                         jl.t[0], jl.t[1], jl.t[2]);
+                s += jb;
+            }
         }
     }
 
@@ -172,7 +225,8 @@ namespace srv {
 static NetConfig            g_cfg;
 static fsb::Pipeline        g_pipeline;
 static BVHWriter            g_bvh;
-static bool                 g_bvh_enabled = false;
+static bool                 g_bvh_enabled = false;   // write a server-side .bvh
+static bool                 g_jlocal_enabled = false; // emit JLOCAL TF lines
 static bool                 g_bvh_open    = false;
 static std::mutex           g_mutex;          // guards pipeline + tracker + bvh
 static std::unordered_map<int,bool> g_betas_sent;
@@ -259,15 +313,20 @@ static unsigned long now_ms() { return AmmClient_GetTickCountMilliseconds(); }
 
 static void ensure_bvh_open()
 {
-    if (!g_bvh_enabled || g_bvh_open) return;
+    if ((!g_bvh_enabled && !g_jlocal_enabled) || g_bvh_open) return;
     std::string lbs = g_cfg.onnx_dir + "/body_model.lbs";
-    if (g_bvh.open(g_cfg.bvh_template, g_cfg.bvh_path,
+    // JLOCAL-only mode still needs an open writer (for its LBS + FK scratch); it
+    // never calls write_frame, so a placeholder out path is fine — no files are
+    // produced unless --bvh actually feeds frames.
+    std::string out = g_cfg.bvh_path.empty() ? "/tmp/.sam3dnet_jlocal" : g_cfg.bvh_path;
+    if (g_bvh.open(g_cfg.bvh_template, out,
                    1.0f / (float)g_cfg.bvh_fps, lbs)) {
         g_bvh_open = true;
     } else {
-        fprintf(stderr, "[server] BVH open failed (template=%s out=%s) — disabling BVH\n",
-                g_cfg.bvh_template.c_str(), g_cfg.bvh_path.c_str());
+        fprintf(stderr, "[server] BVH/LBS open failed (template=%s lbs=%s) — "
+                "disabling BVH + JLOCAL\n", g_cfg.bvh_template.c_str(), lbs.c_str());
         g_bvh_enabled = false;
+        g_jlocal_enabled = false;
     }
 }
 
@@ -324,15 +383,22 @@ static void* infer_callback(AmmServer_DynamicRequest* rqst)
         std::vector<int> pad_ids;
         std::vector<int> ids = assign_tracks(res, pad_ids);
 
-        if (g_bvh_enabled) {
-            ensure_bvh_open();
-            if (g_bvh_open) {
-                g_bvh.write_frame_external(res, ids, pad_ids);
-                g_dirty = true;
-            }
+        if (g_bvh_enabled || g_jlocal_enabled) ensure_bvh_open();
+        if (g_bvh_enabled && g_bvh_open) {
+            g_bvh.write_frame_external(res, ids, pad_ids);
+            g_dirty = true;
         }
 
-        body = format_results(seq, t_ms, res, ids, g_betas_sent);
+        // Per-person TF transforms (JLOCAL), computed by the same writer FK.
+        std::vector<std::vector<BVHWriter::JointLocal>> jlocals;
+        if (g_jlocal_enabled && g_bvh_open) {
+            jlocals.resize(res.size());
+            for (size_t i = 0; i < res.size(); ++i)
+                g_bvh.compute_joint_locals(res[i], jlocals[i]);
+        }
+
+        body = format_results(seq, t_ms, res, ids, g_betas_sent,
+                              g_jlocal_enabled ? &jlocals : nullptr);
     }
 
     g_last_activity_ms = now_ms();
@@ -405,6 +471,7 @@ static int run(const NetConfig& cfg)
 {
     g_cfg = cfg;
     g_bvh_enabled = !cfg.bvh_path.empty();
+    g_jlocal_enabled = cfg.jlocal;
 
     // ── Load the pipeline once, kept warm for the server's lifetime ─────────
     fsb::PipelineConfig pcfg;
@@ -462,8 +529,9 @@ static int run(const NetConfig& cfg)
                                  16 * 1024, 0, (void*)&root_callback,
                                  SAME_PAGE_FOR_ALL_CLIENTS);
 
-    fprintf(stderr, "[server] ready on :%d  (POST /infer, /close)%s\n", cfg.port,
-            g_bvh_enabled ? "  [BVH on]" : "");
+    fprintf(stderr, "[server] ready on :%d  (POST /infer, /close)%s%s\n", cfg.port,
+            g_bvh_enabled ? "  [BVH on]" : "",
+            g_jlocal_enabled ? "  [JLOCAL on]" : "");
 
     // ── Main loop: idle-timeout BVH finalize ────────────────────────────────
     g_last_activity_ms = now_ms();
@@ -535,6 +603,7 @@ static void parse_and_print(const char* body, unsigned int len, bool raw)
     std::string s(body, len);
     size_t pos = 0;
     int persons = 0;
+    int jlocal = 0;
     while (pos < s.size()) {
         size_t eol = s.find('\n', pos);
         if (eol == std::string::npos) eol = s.size();
@@ -547,10 +616,19 @@ static void parse_and_print(const char* body, unsigned int len, bool raw)
         } else if (line.compare(0, 2, "P ") == 0) {
             ++persons;
             printf("[client]   %s\n", line.c_str());   // index, id, bbox, focal
+        } else if (line.compare(0, 5, "KP3D ") == 0) {
+            // "KP3D <n> x,y,z x,y,z ..." — show the count and the first point.
+            int n = 0; char first[64] = "";
+            sscanf(line.c_str(), "KP3D %d %63s", &n, first);
+            printf("[client]     %d 3D points (metres); kp0=%s\n", n, first);
+        } else if (line.compare(0, 7, "JLOCAL ") == 0) {
+            ++jlocal;
         }
-        // GROT/CAMT/BPOSE/HPOSE/BETAS/KP* skipped in this minimal printer.
+        // GROT/CAMT/BPOSE/HPOSE/BETAS/KP2D skipped in this minimal printer
+        // (use --raw to dump the full body, including all KP3D/JLOCAL values).
     }
     if (persons == 0) printf("[client]   (no persons)\n");
+    if (jlocal)       printf("[client]   %d JLOCAL TF transforms\n", jlocal);
 }
 
 static int run(const NetConfig& cfg)
@@ -655,7 +733,9 @@ static void usage(const char* argv0)
 "  --bvh PATH          also write a server-side BVH (PATH_<id>.bvh)\n"
 "  --bvh-template P    BVH template (default ./body_mhr.bvh)\n"
 "  --bvh-fps Z         nominal BVH frame time (default 30)\n"
-"  --idle-finalize S   finalize the BVH after S idle seconds (default 5)\n\n"
+"  --idle-finalize S   finalize the BVH after S idle seconds (default 5)\n"
+"  --jlocal            add per-joint TF transforms (JLOCAL lines) to responses\n"
+"                      (parent-relative quat+offset, metres; needs body_model.lbs)\n\n"
 "Client options:\n"
 "  --host IP           server address (default 127.0.0.1)\n"
 "  --port N            server port (default 8080)\n"
@@ -697,6 +777,7 @@ int main(int argc, char** argv)
         else if (a == "--bvh-template")  c.bvh_template = next("--bvh-template");
         else if (a == "--bvh-fps")       c.bvh_fps = std::stod(next("--bvh-fps"));
         else if (a == "--idle-finalize") c.idle_finalize_s = std::stoi(next("--idle-finalize"));
+        else if (a == "--jlocal")        c.jlocal = true;
         else if (a == "-h" || a == "--help") { usage(argv[0]); return 0; }
         else { fprintf(stderr, "unknown option: %s\n", a.c_str()); usage(argv[0]); return 2; }
     }

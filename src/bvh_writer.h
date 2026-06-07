@@ -60,6 +60,25 @@ public:
                               const std::vector<int>& track_ids,
                               const std::vector<int>& pad_ids = {});
 
+    // ── Per-joint LOCAL transforms for live TF / ROS (CLIENTSERVER.md) ───────
+    // One entry per MHR joint: its transform RELATIVE TO ITS PARENT joint —
+    // rotation quaternion (xyzw) + translation (metres, in the parent's frame).
+    // That is a TF transform set verbatim (parent_frame → child_frame).  The
+    // root joint (parent == "") is placed in the camera frame: rotation = the
+    // body's global orientation, translation = pred_cam_t.  Frame is the native
+    // MHR camera-optical convention (x-right, y-down, z-forward); the consumer
+    // remaps to its target (e.g. ROS REP-103) — see mocapnet_rosnode.  Reuses
+    // the same FK as the BVH path (compute_per_frame_mhr_state); requires the
+    // writer to be open() with a valid lbs_path.  Returns false otherwise.
+    struct JointLocal {
+        const char* name;    // MHR joint name (points into static joint table)
+        const char* parent;  // parent joint name, or "" for the root
+        float       q[4];    // xyzw, parent-relative rotation
+        float       t[3];    // metres, parent-relative translation
+    };
+    bool compute_joint_locals(const fsb::MHRResult& r,
+                              std::vector<JointLocal>& out);
+
     // ── Multi-view fused write (MULTIVIEW_PLAN.md: AverageFuser) ─────────────
     // One view of a person: its MHRResult (in its own camera frame), the
     // quaternion that rotates that camera frame into the shared world, and the

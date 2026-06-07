@@ -1070,6 +1070,56 @@ void BVHWriter::compute_per_frame_mhr_state(const fsb::MHRResult& r)
     }
 }
 
+bool BVHWriter::compute_joint_locals(const fsb::MHRResult& r,
+                                     std::vector<JointLocal>& out)
+{
+    if (!lbs_ || q_local_.empty()) return false;
+
+    // Reuse the exact FK the BVH path uses: fills q_local_ (parent-relative
+    // local rotations), q_global_mhr_ (global rotations) and t_global_mhr_
+    // (global positions, in the LBS centimetre units).
+    compute_per_frame_mhr_state(r);
+
+    const int nj = lbs_->n_joints;
+    out.clear();
+    out.reserve(nj);
+    for (int j = 0; j < nj; ++j)
+    {
+        JointLocal jl;
+        jl.name = (j < mhr_joint_table::N_JOINTS) ? mhr_joint_table::NAMES[j] : "?";
+        const int p = lbs_->joint_parents[j];
+
+        if (p < 0)
+        {
+            // Root: placed in the camera frame.  Rotation = the body's global
+            // orientation; translation = pred_cam_t (already metres).
+            jl.parent = "";
+            memcpy(jl.q, &q_global_mhr_[j*4], 4*sizeof(float));
+            jl.t[0] = r.pred_cam_t[0];
+            jl.t[1] = r.pred_cam_t[1];
+            jl.t[2] = r.pred_cam_t[2];
+        }
+        else
+        {
+            jl.parent = (p < mhr_joint_table::N_JOINTS) ? mhr_joint_table::NAMES[p] : "?";
+            // Parent-relative rotation is the raw MHR local rotation (xyzw).
+            memcpy(jl.q, &q_local_[j*4], 4*sizeof(float));
+            // Parent-relative translation = R_parent_global^-1 (t[j]-t[p]); this
+            // absorbs the per-joint scale exactly.  cm -> m for ROS/TF.
+            float d[3] = { t_global_mhr_[j*3+0] - t_global_mhr_[p*3+0],
+                           t_global_mhr_[j*3+1] - t_global_mhr_[p*3+1],
+                           t_global_mhr_[j*3+2] - t_global_mhr_[p*3+2] };
+            float qpc[4]; qconj(qpc, &q_global_mhr_[p*4]);
+            float rl[3];  qrot(rl, qpc, d);
+            jl.t[0] = rl[0] * 0.01f;
+            jl.t[1] = rl[1] * 0.01f;
+            jl.t[2] = rl[2] * 0.01f;
+        }
+        out.push_back(jl);
+    }
+    return true;
+}
+
 // Write a single channel value into the in-row position `row[..]` resolved via
 // the BVH library helper (which always returns an offset relative to fID=0 as
 // long as numberOfFrames is set to ≥ 1 in mc_).
