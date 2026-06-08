@@ -17,13 +17,14 @@ find_package(OpenCV REQUIRED)
 
 catkin_package()
 
-## AmmClient (minimal HTTP client) is cloned into dependencies/ by initialize.sh
-## and compiled straight into the node — no prebuilt .so, no LD_LIBRARY_PATH.
-set(AMMCLIENT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/AmmarServer/src/AmmClient")
+## AmmClient (minimal HTTP client) is vendored into dependencies/AmmClient/ by
+## initialize.sh (real file copies, never symlinks) and compiled straight into
+## the node — no prebuilt .so, no LD_LIBRARY_PATH, fully self-contained/portable.
+set(AMMCLIENT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/AmmClient")
 if(NOT EXISTS "${AMMCLIENT_DIR}/AmmClient.c")
   message(FATAL_ERROR
     "AmmClient sources not found at ${AMMCLIENT_DIR}\n"
-    "  Run ./initialize.sh in this package first to fetch AmmarServer.")
+    "  Run ./initialize.sh in this package first to vendor AmmClient.")
 endif()
 
 include_directories(

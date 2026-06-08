@@ -1,1 +1,6 @@
-initialize.sh clones AmmarServer (for AmmClient) into this directory.
+initialize.sh vendors the AmmClient sources here:
+  - AmmClient/        real file copies of AmmClient.{c,h} network.{c,h}
+                      protocol.{c,h} tools.{c,h}  (compiled into the node)
+  - AmmarServer/      a full clone, only created when no dev tree / vendored
+                      copy is available to source the files from
+Both are git-ignored (see .gitignore); regenerate them with ./initialize.sh.
