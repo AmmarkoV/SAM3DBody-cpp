@@ -71,15 +71,23 @@ if [ ${#bvhs[@]} -eq 0 ]; then
     exit 1
 fi
 
+# We use our own driver (tools/gmr_retarget.py) with a POSITION-based GMR config
+# instead of GMR's stock bvh_to_robot.py. GMR's stock LAFAN config is orientation-
+# driven and calibrated for the real Ubisoft LAFAN1 +X-bone joint frames, which our
+# MHR-derived skeleton does not reproduce; retargeting by joint POSITION (our
+# positions are correct) sidesteps that. The driver also grounds the feet each
+# frame (our data is camera-space). See GMR.md for the full rationale.
+POS_CONFIG="$REPO/scripts/gmr_configs/bvh_lafan1pos_to_g1.json"
 for bvh in "${bvhs[@]}"; do
     id="$(basename "$bvh" .bvh)"        # e.g. football_0
     echo "[video_gmr]   retargeting $id -> $ROBOT"
     # Run from GMR_DIR so the package finds its ik_configs/ and assets/.
-    ( cd "$GMR_DIR" && "$VENV_PY" scripts/bvh_to_robot.py \
-        --bvh_file   "$bvh" \
-        --robot      "$ROBOT" \
-        --save_path  "$OUT/${id}_${ROBOT}.pkl" \
-        --record_video --video_path "$OUT/${id}_${ROBOT}.mp4" )
+    ( cd "$GMR_DIR" && "$VENV_PY" "$REPO/tools/gmr_retarget.py" \
+        --bvh    "$bvh" \
+        --robot  "$ROBOT" \
+        --config "$POS_CONFIG" \
+        --save   "$OUT/${id}_${ROBOT}.pkl" \
+        --video  "$OUT/${id}_${ROBOT}.mp4" )
 done
 
 echo "[video_gmr] done. Outputs in: $OUT"

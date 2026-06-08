@@ -288,6 +288,31 @@ inline void mat3_to_zyx(const float m[9], float& a, float& b, float& c)
         a = atan2f(-m[1], m[4]);
     }
 }
+// Decompose a rotation matrix into per-axis Euler angles (radians) consistent
+// with the template joint's declared BVH channel order, returned tagged by axis
+// in ex/ey/ez.  Channel PLACEMENT within the motion row is handled separately by
+// set_channel(); this only computes the angle values, so the caller writes each
+// of ex/ey/ez to its own BVH_ROTATION_{X,Y,Z} channel regardless of order.
+//
+// Only the orders our templates actually declare are implemented: ZXY (limbs and
+// fingers in every template, plus the LAFAN root) and ZYX (MocapNET/Mixamo roots).
+// We deliberately do not implement all six permutations — add a case here if a
+// new template needs one.  Unknown orders fall back to ZXY.
+inline void mat3_to_euler_for_order(const float m[9], char rotationOrder,
+                                    float& ex, float& ey, float& ez)
+{
+    float a, b, c;
+    if (rotationOrder == BVH_ROTATION_ORDER_ZYX)
+    {
+        mat3_to_zyx(m, a, b, c);   // a=Z, b=Y, c=X
+        ez = a; ey = b; ex = c;
+    }
+    else
+    {
+        mat3_to_zxy(m, a, b, c);   // a=Z, b=X, c=Y
+        ez = a; ex = b; ey = c;
+    }
+}
 
 // ─── small vec3 / mat3 helpers (foot-contact IK) ───────────────────────────
 inline void v3sub(const float* a, const float* b, float* o){ o[0]=a[0]-b[0]; o[1]=a[1]-b[1]; o[2]=a[2]-b[2]; }
@@ -1238,18 +1263,18 @@ void BVHWriter::append_row_from_state(PerPerson& p, const fsb::MHRResult& r)
                 set_channel(mc_, row, s.bvh_jid, BVH_POSITION_Y, r.pred_cam_t[1] * POS_SCALE);
                 set_channel(mc_, row, s.bvh_jid, BVH_POSITION_Z, r.pred_cam_t[2] * POS_SCALE);
 
-                float a, b, c;
-                mat3_to_zyx(m, a, b, c);
-                set_channel(mc_, row, s.bvh_jid, BVH_ROTATION_Z, a * RAD2DEG);
-                set_channel(mc_, row, s.bvh_jid, BVH_ROTATION_Y, b * RAD2DEG);
-                set_channel(mc_, row, s.bvh_jid, BVH_ROTATION_X, c * RAD2DEG);
+                float ex, ey, ez;
+                mat3_to_euler_for_order(m, jh.channelRotationOrder, ex, ey, ez);
+                set_channel(mc_, row, s.bvh_jid, BVH_ROTATION_Z, ez * RAD2DEG);
+                set_channel(mc_, row, s.bvh_jid, BVH_ROTATION_Y, ey * RAD2DEG);
+                set_channel(mc_, row, s.bvh_jid, BVH_ROTATION_X, ex * RAD2DEG);
             }
         }
         else
         {
-            float a, b, c;
-            mat3_to_zxy(m, a, b, c);
-            float az = a * RAD2DEG, bx = b * RAD2DEG, cy = c * RAD2DEG;
+            float ex, ey, ez;
+            mat3_to_euler_for_order(m, jh.channelRotationOrder, ex, ey, ez);
+            float az = ez * RAD2DEG, bx = ex * RAD2DEG, cy = ey * RAD2DEG;
 
             if (s.kind == SlotKind::Hand)
             {

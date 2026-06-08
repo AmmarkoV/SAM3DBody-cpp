@@ -2,7 +2,7 @@ HIERARCHY
 ROOT Hips
 {
   OFFSET 0.000000 0.000000 0.000000
-  CHANNELS 6 Xposition Yposition Zposition Zrotation Yrotation Xrotation
+  CHANNELS 6 Xposition Yposition Zposition Zrotation Xrotation Yrotation
   JOINT Spine
   {
     OFFSET 0.000000 10.000000 0.000000
