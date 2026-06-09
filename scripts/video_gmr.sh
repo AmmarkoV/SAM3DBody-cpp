@@ -117,10 +117,14 @@ for bvh in "${bvhs[@]}"; do
     echo "[video_gmr]   retargeting $id -> $ROBOT"
     # Run from GMR_DIR so the package finds its ik_configs/ and assets/.
     robot_mp4="$OUT/${id}_${ROBOT}.mp4"
+    # --flip-depth: MHR is camera-space; its depth sign is opposite to GMR's
+    # convention, so the robot would moonwalk front/back without this. Rigid
+    # depth-axis translation only (pose/facing untouched). See GMR.md.
     ( cd "$GMR_DIR" && "$VENV_PY" "$REPO/tools/gmr_retarget.py" \
         --bvh    "$bvh" \
         --robot  "$ROBOT" \
         --config "$POS_CONFIG" \
+        --flip-depth \
         --save   "$OUT/${id}_${ROBOT}.pkl" \
         --video  "$robot_mp4" )
 

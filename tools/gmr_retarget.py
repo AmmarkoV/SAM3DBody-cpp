@@ -19,6 +19,11 @@ ap.add_argument("--video")
 ap.add_argument("--no-ground", action="store_true")
 ap.add_argument("--human-height", type=float, default=0.0,
                 help="override actual_human_height (m); 0 = auto-scale from skeleton")
+ap.add_argument("--flip-depth", action="store_true",
+                help="reverse the global front/back (depth) motion. MHR is camera-space and "
+                     "its depth sign is opposite to GMR's Y-up->Z-up convention, so the robot "
+                     "otherwise moonwalks. This is a RIGID per-frame translation on the depth "
+                     "axis only (GMR world Y) — pose and facing are untouched.")
 a = ap.parse_args()
 
 from general_motion_retargeting import params
@@ -53,8 +58,26 @@ else:
 rt = GMR(src_human="bvh_lafan1", tgt_robot=a.robot, actual_human_height=human_height)
 viewer = RobotMotionViewer(robot_type=a.robot, motion_fps=30,
                            record_video=bool(a.video), video_path=a.video or "")
+
+# ── depth (front/back) correction ───────────────────────────────────────────
+# Reverse the global depth motion by rigidly translating every joint on GMR's
+# depth axis (world Y) about frame 0, so frame 0 stays put and the drift flips.
+# Rigid → pose, facing and the saved dof are all unchanged; only where the body
+# sits in depth changes. Keeps the human overlay consistent (applied pre-retarget).
+DEPTH = 1  # GMR world Y after the Y-up->Z-up load (X=L/R, Y=depth, Z=up)
+_y0 = float(np.asarray(frames[0]["Hips"][0])[DEPTH]) if a.flip_depth else 0.0
+def _flip_depth(fr):
+    shift = -2.0 * (float(np.asarray(fr["Hips"][0])[DEPTH]) - _y0)
+    out = {}
+    for j, (p, q) in fr.items():
+        p = np.asarray(p, dtype=float).copy(); p[DEPTH] += shift
+        out[j] = [p, q]
+    return out
+
 qpos_list = []
 for fr in frames:
+    if a.flip_depth:
+        fr = _flip_depth(fr)
     q = rt.retarget(fr, offset_to_ground=not a.no_ground)
     qpos_list.append(q.copy())
     viewer.step(root_pos=q[:3], root_rot=q[3:7], dof_pos=q[7:],
