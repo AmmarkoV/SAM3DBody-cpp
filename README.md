@@ -818,7 +818,11 @@ Drive a humanoid robot (Unitree G1, …) from a video via
 tools/setup_gmr.sh
 
 # Video → LAFAN BVH → robot motion (.pkl) + rendered .mp4, per detected person
-scripts/video_gmr.sh videos/boom.mp4 [unitree_g1]
+scripts/video_gmr.sh zeimpekiko.mkv [unitree_g1]
+
+# …add --side-by-side to also save the tracked MHR video and an
+# MHR | robot comparison (resolutions compensated to a common height):
+scripts/video_gmr.sh zeimpekiko.mkv unitree_g1 --side-by-side
 ```
 
 Outputs land in `gmr_out/<videoname>/`. Needs an X display (wrap with `xvfb-run`

@@ -11,8 +11,13 @@
 #       <name>_<id>_<robot>.pkl     robot motion (root_pos/root_rot/dof_pos)
 #       <name>_<id>_<robot>.mp4     rendered video of the retargeted robot
 #
+#  With --side-by-side it ALSO produces:
+#       <name>_mhr.mp4              the tracked MHR mesh render (input side)
+#       <name>_<id>_<robot>_sbs.mp4 MHR | robot, stacked horizontally (resolutions
+#                                   compensated to a common height — see SBS_HEIGHT)
+#
 #  Usage:
-#       scripts/video_gmr.sh <videoFile.mp4> [RobotType]
+#       scripts/video_gmr.sh <videoFile.mp4> [RobotType] [--side-by-side]
 #
 #  RobotType defaults to unitree_g1.  Robots that ship a LAFAN IK config in GMR:
 #       unitree_g1   fourier_n1   engineai_pm01   booster_t1   stanford_toddy
@@ -28,12 +33,26 @@ THISDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 REPO="$( cd "$THISDIR/.." && pwd )"
 
 # ── args ─────────────────────────────────────────────────────────────────────
-VIDEO="${1:-}"
-ROBOT="${2:-unitree_g1}"
+SIDE_BY_SIDE=0
+SBS_HEIGHT="${SBS_HEIGHT:-720}"   # common height the two clips are scaled to
+POS=()
+for arg in "$@"; do
+    case "$arg" in
+        --side-by-side) SIDE_BY_SIDE=1 ;;
+        -*) echo "ERROR: unknown option: $arg" >&2; exit 2 ;;
+        *) POS+=("$arg") ;;
+    esac
+done
+VIDEO="${POS[0]:-}"
+ROBOT="${POS[1]:-unitree_g1}"
 
 if [ -z "$VIDEO" ]; then
-    echo "Usage: $(basename "$0") <videoFile.mp4> [RobotType]" >&2
+    echo "Usage: $(basename "$0") <videoFile.mp4> [RobotType] [--side-by-side]" >&2
     exit 2
+fi
+if [ "$SIDE_BY_SIDE" -eq 1 ] && ! command -v ffmpeg >/dev/null 2>&1; then
+    echo "ERROR: --side-by-side needs ffmpeg on PATH." >&2
+    exit 1
 fi
 if [ ! -f "$VIDEO" ]; then
     echo "ERROR: video not found: $VIDEO" >&2
@@ -66,11 +85,16 @@ if [ ! -f "$LAFAN_TEMPLATE" ]; then
     echo "ERROR: $LAFAN_TEMPLATE not found — run tools/gen_lafan_bvh.py (or tools/setup_gmr.sh)." >&2
     exit 1
 fi
+# With --side-by-side, also render the tracked MHR mesh video (offline_video.sh's
+# --save shells out to the live renderer for the visualisation mp4).
+MHR_VIDEO="$OUT/${BASE}_mhr.mp4"
+SAVE_ARGS=()
+[ "$SIDE_BY_SIDE" -eq 1 ] && SAVE_ARGS=(--save "$MHR_VIDEO")
 "$REPO/scripts/offline_video.sh" \
     --from "$VIDEO" \
     --bvh  "$OUT/${BASE}.bvh" \
     --bvh-template "$LAFAN_TEMPLATE" \
-    --interpolate-jitter
+    --interpolate-jitter "${SAVE_ARGS[@]}"
 
 # ── 2) each person BVH -> robot motion (pkl) + rendered video (mp4) ──────────
 echo "[video_gmr] 2/2  BVH -> robot ($ROBOT)"
@@ -92,12 +116,30 @@ for bvh in "${bvhs[@]}"; do
     id="$(basename "$bvh" .bvh)"        # e.g. football_0
     echo "[video_gmr]   retargeting $id -> $ROBOT"
     # Run from GMR_DIR so the package finds its ik_configs/ and assets/.
+    robot_mp4="$OUT/${id}_${ROBOT}.mp4"
     ( cd "$GMR_DIR" && "$VENV_PY" "$REPO/tools/gmr_retarget.py" \
         --bvh    "$bvh" \
         --robot  "$ROBOT" \
         --config "$POS_CONFIG" \
         --save   "$OUT/${id}_${ROBOT}.pkl" \
-        --video  "$OUT/${id}_${ROBOT}.mp4" )
+        --video  "$robot_mp4" )
+
+    # ── optional: MHR | robot side-by-side (resolutions compensated to a common
+    #    height; widths kept per aspect ratio, so the two clips line up) ────────
+    if [ "$SIDE_BY_SIDE" -eq 1 ]; then
+        if [ -f "$MHR_VIDEO" ] && [ -f "$robot_mp4" ]; then
+            sbs="$OUT/${id}_${ROBOT}_sbs.mp4"
+            echo "[video_gmr]   compositing side-by-side -> $(basename "$sbs")"
+            ffmpeg -y -loglevel error -i "$MHR_VIDEO" -i "$robot_mp4" -filter_complex \
+              "[0:v]scale=-2:${SBS_HEIGHT},fps=30,setsar=1[l];\
+               [1:v]scale=-2:${SBS_HEIGHT},fps=30,setsar=1[r];\
+               [l][r]hstack=inputs=2[v]" \
+              -map "[v]" -pix_fmt yuv420p -threads 8 "$sbs" \
+              || echo "[video_gmr]   WARN: ffmpeg side-by-side failed for $id" >&2
+        else
+            echo "[video_gmr]   WARN: missing MHR or robot video; skipping side-by-side for $id" >&2
+        fi
+    fi
 done
 
 echo "[video_gmr] done. Outputs in: $OUT"
