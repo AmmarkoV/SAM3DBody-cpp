@@ -34,6 +34,11 @@ ap.add_argument("--bvh", required=True, help="a lafan_mhr-template BVH (calibrat
 ap.add_argument("--robot", default="unitree_g1")
 ap.add_argument("--config", default=None, help="base config (defaults to the repo position config)")
 ap.add_argument("--human-height", type=float, default=0.0, help="override actual_human_height (0=auto)")
+ap.add_argument("--bootstrap", action="store_true",
+                help="orientation-primary mode: derive each link's rot_offset from the CURRENT "
+                     "config's retarget result (offset = our_joint^-1 . achieved_robot_link). "
+                     "Use for the lower-body/torso offsets in the shipped orientation-primary config; "
+                     "arms are too unconstrained to bootstrap — calibrate them with gmr_calibrate_offsets.py.")
 a = ap.parse_args()
 
 HERE = Path(__file__).resolve().parent
@@ -57,6 +62,31 @@ IDX = range(0, len(frames), max(1, len(frames)//25))
 
 def wxyz(q):  # scipy xyzw -> json wxyz, rounded
     return [round(float(q[3]),4), round(float(q[0]),4), round(float(q[1]),4), round(float(q[2]),4)]
+
+# ── bootstrap mode: orientation offsets from the current retarget result ──────
+if a.bootstrap:
+    from scipy.spatial.transform import Rotation as R
+    rt = GMR(src_human="bvh_lafan1", tgt_robot=a.robot, actual_human_height=ahh, verbose=False)
+    # robot link -> human joint (orientation source) for the lower body + torso
+    BM = {"pelvis":"Hips","left_hip_roll_link":"LeftUpLeg","right_hip_roll_link":"RightUpLeg",
+          "left_knee_link":"LeftLeg","right_knee_link":"RightLeg",
+          "left_toe_link":"LeftFootMod","right_toe_link":"RightFootMod","torso_link":"Spine2"}
+    BM = {k:v for k,v in BM.items() if k in rt.robot_body_names}
+    acc = {k:[] for k in BM}
+    for i in IDX:
+        rt.retarget(frames[i], offset_to_ground=True); fr = frames[i]
+        for link,hj in BM.items():
+            hq = fr[hj][1]; H = R.from_quat([hq[1],hq[2],hq[3],hq[0]])
+            Rq = R.from_matrix(rt.configuration.data.xmat[rt.robot_body_names[link]].reshape(3,3))
+            acc[link].append((H.inv()*Rq).as_quat())
+    print(f"[bootstrap] from {CFG.name}  ahh={ahh:.3f}\n{'robot_link':22s} rot_offset(wxyz)                  dev")
+    for link,hj in BM.items():
+        o = np.array(acc[link]); o[(o@o[0])<0]*=-1; m = o.mean(0); m/=np.linalg.norm(m)
+        dev = np.array([(R.from_quat(x*np.sign(x@m)).inv()*R.from_quat(m)).magnitude() for x in o])*180/np.pi
+        print(f"{link:22s} {str(wxyz(m)):34s} {dev.mean():5.1f}")
+    print("\nLow dev (<15) = reliable. Paste into both ik tables. (shoulders/elbows/wrists "
+          "read high dev here — use gmr_calibrate_offsets.py for arms.)")
+    import sys; sys.exit(0)
 
 # ── 1) pelvis: sweep the 24 proper axis-aligned offsets ──────────────────────
 def proper_rots():
