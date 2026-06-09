@@ -6,9 +6,10 @@
 #  scripts/video_gmr.sh to turn the LAFAN BVH we export into humanoid-robot
 #  motion.
 #
-#  GMR itself lives at  $REPO/GMR  (a symlink to your GMR checkout) — this
-#  script does NOT clone it; it only creates a venv inside it and installs the
-#  runtime deps:
+#  GMR itself lives at  $REPO/GMR.  If it is not there, this script clones it
+#  (https://github.com/YanjieZe/GMR; override with GMR_REPO=...); an existing
+#  checkout or symlink is reused untouched.  It then creates a venv inside it and
+#  installs the runtime deps:
 #    - PyTorch with CUDA (the default Linux PyPI wheel is the CUDA build)
 #    - everything GMR needs EXCEPT `smplx`, which is only used by the SMPL-X
 #      input path; the BVH/LAFAN path we drive does not need it (so we also
@@ -26,12 +27,15 @@ REPO="$( cd "$THISDIR/.." && pwd )"
 GMR_DIR="$REPO/GMR"
 VENV="$GMR_DIR/venv"
 
-# ── GMR must already be present (symlink or checkout) ────────────────────────
+# ── GMR: clone it if not already present (symlink or checkout) ───────────────
+GMR_REPO="${GMR_REPO:-https://github.com/YanjieZe/GMR}"
 if [ ! -f "$GMR_DIR/setup.py" ]; then
-    echo "ERROR: GMR not found at $GMR_DIR (expected a GMR checkout or symlink)." >&2
-    echo "       Create it first, e.g.:" >&2
-    echo "           ln -s /path/to/GMR \"$GMR_DIR\"" >&2
-    exit 1
+    if [ -e "$GMR_DIR" ]; then
+        echo "ERROR: $GMR_DIR exists but has no setup.py (not a GMR checkout)." >&2
+        exit 1
+    fi
+    echo "[setup_gmr] GMR not found at $GMR_DIR — cloning $GMR_REPO"
+    git clone --depth 1 "$GMR_REPO" "$GMR_DIR"
 fi
 
 # ── Need Python >= 3.10 ──────────────────────────────────────────────────────

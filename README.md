@@ -808,6 +808,23 @@ this is a quick way to get a "what was the input?" video alongside the
 ./scripts/offline_video.sh --from matrix.mp4 --bvh mtx.bvh --save vis.mp4
 ```
 
+## Humanoid robot retargeting (GMR)
+
+Drive a humanoid robot (Unitree G1, …) from a video via
+[GMR](https://github.com/YanjieZe/GMR). GMR must be present at `./GMR` ( git clone https://github.com/YanjieZe/GMR ).
+
+```bash
+# One-time: create the GMR venv (CUDA torch, no smplx) + generate lafan_mhr.bvh
+tools/setup_gmr.sh
+
+# Video → LAFAN BVH → robot motion (.pkl) + rendered .mp4, per detected person
+scripts/video_gmr.sh videos/boom.mp4 [unitree_g1]
+```
+
+Outputs land in `gmr_out/<videoname>/`. Needs an X display (wrap with `xvfb-run`
+if headless). See **[GMR.md](GMR.md)** for the design, tuning, and the calibration
+tools in `tools/gmr_*.py`.
+
 ---
 
 ![SAM3DBody-cpp](doc/screen.jpg)
