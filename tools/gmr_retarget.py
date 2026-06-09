@@ -24,6 +24,16 @@ ap.add_argument("--flip-depth", action="store_true",
                      "its depth sign is opposite to GMR's Y-up->Z-up convention, so the robot "
                      "otherwise moonwalks. This is a RIGID per-frame translation on the depth "
                      "axis only (GMR world Y) — pose and facing are untouched.")
+ap.add_argument("--no-despike", action="store_true",
+                help="disable the glitch-frame filter (on by default). The filter replaces "
+                     "velocity-outlier frames (tracking singularities — esp. root-rotation "
+                     "flips that the CG-oriented jitter pass misses) by slerp/lerp interpolation "
+                     "from clean neighbours. Important for robot actuation: a single bad frame "
+                     "is a huge instantaneous joint velocity that can destabilise the robot.")
+ap.add_argument("--despike-root-deg", type=float, default=40.0,
+                help="root angular-velocity threshold (deg/frame) above which a frame is a glitch")
+ap.add_argument("--despike-pos-m", type=float, default=0.30,
+                help="per-joint position-jump threshold (m/frame) above which a frame is a glitch")
 a = ap.parse_args()
 
 from general_motion_retargeting import params
@@ -34,6 +44,67 @@ from general_motion_retargeting import GeneralMotionRetargeting as GMR, RobotMot
 from general_motion_retargeting.utils.lafan1 import load_bvh_file
 
 frames, h = load_bvh_file(a.bvh, format="lafan1")
+
+# ── Glitch-frame filter (robot safety) ───────────────────────────────────────
+# Monocular tracking occasionally emits a burst of garbage frames (esp. a root-
+# rotation flip/singularity) that the CG-oriented offline jitter pass misses.
+# For a robot, one such frame is a huge instantaneous joint velocity → it can
+# fall.  We flag velocity-outlier frames and replace them with slerp/lerp
+# interpolation from the nearest CLEAN frames on each side.
+def _slerp_wxyz(qa, qb, t):
+    a = np.array([qa[1], qa[2], qa[3], qa[0]]); b = np.array([qb[1], qb[2], qb[3], qb[0]])
+    if np.dot(a, b) < 0: b = -b
+    d = float(np.clip(np.dot(a, b), -1, 1))
+    if d > 0.9995: r = a + t * (b - a)
+    else:
+        th = np.arccos(d); r = (np.sin((1 - t) * th) * a + np.sin(t * th) * b) / np.sin(th)
+    r /= np.linalg.norm(r)
+    return np.array([r[3], r[0], r[1], r[2]])
+
+def despike_frames(frames, root_deg, pos_m):
+    from scipy.spatial.transform import Rotation as R
+    N = len(frames)
+    if N < 3: return 0
+    joints = list(frames[0].keys())
+    def hq(i): a = frames[i]["Hips"][1]; return R.from_quat([a[1], a[2], a[3], a[0]])
+    def jump(i, k):  # (root angVel deg, max joint pos jump m) between frames i and k
+        dav = (hq(i).inv() * hq(k)).magnitude() * 180 / np.pi
+        dp = max(np.linalg.norm(np.asarray(frames[k][j][0]) - np.asarray(frames[i][j][0])) for j in joints)
+        return dav, dp
+    v = [(0.0, 0.0)] + [jump(i - 1, i) for i in range(1, N)]   # v[i] = motion (i-1)->i
+    over = lambda x: x[0] > root_deg or x[1] > pos_m
+    # a frame is bad if it has a too-large jump on either side
+    bad = [ (i > 0 and over(v[i])) or (i < N - 1 and over(v[i + 1])) for i in range(N) ]
+    nbad = sum(bad)
+    if nbad == 0: return 0
+    i = 0
+    while i < N:
+        if not bad[i]: i += 1; continue
+        a0 = i
+        while i < N and bad[i]: i += 1
+        b0 = i - 1                                  # bad span [a0, b0]
+        lo = a0 - 1
+        while lo >= 0 and bad[lo]: lo -= 1
+        hi = b0 + 1
+        while hi < N and bad[hi]: hi += 1
+        if lo < 0 and hi >= N: break                # whole clip bad — give up
+        lo_ok, hi_ok = lo >= 0, hi < N
+        for t in range(a0, b0 + 1):
+            if not hi_ok or not lo_ok:              # one-sided: clamp to the clean frame
+                src = frames[hi if hi_ok else lo]
+                for j in joints:
+                    frames[t][j] = [np.asarray(src[j][0]).copy(), np.asarray(src[j][1]).copy()]
+                continue
+            al = (t - lo) / (hi - lo)
+            for j in joints:
+                p0 = np.asarray(frames[lo][j][0]); p1 = np.asarray(frames[hi][j][0])
+                frames[t][j] = [(1 - al) * p0 + al * p1,
+                                _slerp_wxyz(frames[lo][j][1], frames[hi][j][1], al)]
+    return nbad
+
+if not a.no_despike:
+    n = despike_frames(frames, a.despike_root_deg, a.despike_pos_m)
+    if n: print(f"[despike] replaced {n} glitch frame(s) of {len(frames)} by interpolation")
 
 # ── Scale compensation ────────────────────────────────────────────────────────
 # GMR scales targets by (actual_human_height / 1.8) * human_scale_table, and that
