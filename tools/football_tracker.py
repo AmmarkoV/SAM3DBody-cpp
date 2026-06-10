@@ -35,6 +35,8 @@ import argparse
 import ctypes
 import json
 import os
+import shutil
+import subprocess
 import sys
 import time
 
@@ -128,10 +130,50 @@ def pick_person(results: list, n: int, target_cxy) -> int:
     return best
 
 
-_PERSON_COLORS = [
-    (0, 255, 0), (0, 200, 255), (255, 80, 0), (255, 0, 200),
-    (200, 255, 0), (0, 100, 255), (180, 180, 255), (255, 200, 0),
-]
+def color_for_id(track_id: int) -> tuple:
+    """Stable, distinct BGR colour per track id (golden-ratio hue spacing) so a
+    player keeps the same colour across frames."""
+    hue = (int(track_id) * 0.61803398875) % 1.0          # 0..1, well spread
+    hsv = np.uint8([[[int(hue * 179), 220, 255]]])        # OpenCV hue is 0..179
+    b, g, r = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0]
+    return int(b), int(g), int(r)
+
+
+class _Mp4Writer:
+    """Web-friendly H.264 / yuv420p mp4 via an ffmpeg pipe (with +faststart so
+    it streams from a webserver).  Falls back to OpenCV's mp4v when ffmpeg is
+    not on PATH — that file plays in VLC but often not in browsers."""
+
+    def __init__(self, path: str, w: int, h: int, fps: float):
+        self.proc = None
+        self.cv = None
+        if shutil.which("ffmpeg"):
+            cmd = ["ffmpeg", "-y", "-loglevel", "error",
+                   "-f", "rawvideo", "-pix_fmt", "bgr24",
+                   "-s", f"{w}x{h}", "-r", f"{fps}", "-i", "-",
+                   # trunc(...) forces even dims, which yuv420p requires.
+                   "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                   "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                   "-movflags", "+faststart", path]
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        else:
+            print("ffmpeg not found — falling back to OpenCV mp4v "
+                  "(may not play in browsers).")
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            self.cv = cv2.VideoWriter(path, fourcc, fps, (w, h))
+
+    def write(self, frame: np.ndarray) -> None:
+        if self.proc is not None:
+            self.proc.stdin.write(np.ascontiguousarray(frame).tobytes())
+        else:
+            self.cv.write(frame)
+
+    def close(self) -> None:
+        if self.proc is not None:
+            self.proc.stdin.close()
+            self.proc.wait()
+        elif self.cv is not None:
+            self.cv.release()
 
 
 def run(args):
@@ -177,8 +219,7 @@ def run(args):
 
     writer = None
     if args.out:
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(args.out, fourcc, src_fps, (W, H))
+        writer = _Mp4Writer(args.out, W, H, src_fps)
 
     json_frames = []
     frame_idx = -1
@@ -205,7 +246,7 @@ def run(args):
         vis = frame.copy() if writer is not None else None
         frame_record = {"frame_index": frame_idx, "players": []}
 
-        for pi, ob in enumerate(objs):
+        for ob in objs:
             made = make_crop(frame, ob["xyxy"], args.pad,
                              args.target_height, args.max_scale)
             rec = {"track_id": ob["track_id"], "bbox_xyxy": [round(v, 1) for v in ob["xyxy"]],
@@ -242,7 +283,7 @@ def run(args):
                                 np.array(r.kps_3d, np.float32).reshape(70, 3), 4).tolist()
 
                         if vis is not None:
-                            col = _PERSON_COLORS[pi % len(_PERSON_COLORS)]
+                            col = color_for_id(ob["track_id"])
                             draw_mhr70(vis, r, kp_radius=2, edge_thick=1,
                                        kps_override=kps_full)
                             cv2.rectangle(vis, (int(x1), int(y1)),
@@ -273,7 +314,7 @@ def run(args):
             print(f"  frame {frame_idx}  ({processed} done, {rate:.1f} fps)")
 
     if writer:
-        writer.release()
+        writer.close()
     cap.release()
     lib.fsb_destroy(handle)
 
