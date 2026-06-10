@@ -7,7 +7,7 @@
 # Usage:
 #   gmr_retarget.py --bvh F.bvh --robot unitree_g1 --config C.json \
 #                   [--save out.pkl] [--video out.mp4] [--no-ground]
-import argparse, pickle, numpy as np
+import argparse, copy, pickle, numpy as np
 from pathlib import Path
 
 ap = argparse.ArgumentParser()
@@ -34,6 +34,10 @@ ap.add_argument("--despike-root-deg", type=float, default=40.0,
                 help="root angular-velocity threshold (deg/frame) above which a frame is a glitch")
 ap.add_argument("--despike-pos-m", type=float, default=0.30,
                 help="per-joint position-jump threshold (m/frame) above which a frame is a glitch")
+ap.add_argument("--despike-dof-deg", type=float, default=45.0,
+                help="OUTPUT max per-dof angular-velocity threshold (deg/frame) above which a "
+                     "retargeted frame is a glitch. The IK can amplify a clean input change into "
+                     "a huge joint jump the input check misses; this guards the actuation signal.")
 a = ap.parse_args()
 
 from general_motion_retargeting import params
@@ -104,7 +108,50 @@ def despike_frames(frames, root_deg, pos_m):
 
 if not a.no_despike:
     n = despike_frames(frames, a.despike_root_deg, a.despike_pos_m)
-    if n: print(f"[despike] replaced {n} glitch frame(s) of {len(frames)} by interpolation")
+    if n: print(f"[despike] input: replaced {n} glitch frame(s) of {len(frames)} by interpolation")
+
+# Output-side despike (the actual actuation signal).  The IK can amplify a moderate
+# (clean) input change into a large joint-angle jump that the input-velocity check
+# never sees, so for robot safety we ALSO despike the retargeted qpos: detect frames
+# whose root angVel / root pos / max-dof velocity is an outlier and replace them by
+# slerp (root_rot wxyz) / lerp (root_pos, dof) from the nearest clean neighbours.
+def despike_qpos(qp, root_deg, pos_m, dof_deg):
+    from scipy.spatial.transform import Rotation as R
+    N = len(qp)
+    if N < 3: return 0
+    def rq(i): w = qp[i, 3:7]; return R.from_quat([w[1], w[2], w[3], w[0]])
+    def jump(i, k):  # root angVel deg, root pos jump m, max dof jump deg, between i and k
+        dav = (rq(i).inv() * rq(k)).magnitude() * 180 / np.pi
+        dp = float(np.linalg.norm(qp[k, :3] - qp[i, :3]))
+        dd = float(np.max(np.abs(qp[k, 7:] - qp[i, 7:]))) * 180 / np.pi
+        return dav, dp, dd
+    v = [(0.0, 0.0, 0.0)] + [jump(i - 1, i) for i in range(1, N)]
+    over = lambda x: x[0] > root_deg or x[1] > pos_m or x[2] > dof_deg
+    bad = [ (i > 0 and over(v[i])) or (i < N - 1 and over(v[i + 1])) for i in range(N) ]
+    nbad = sum(bad)
+    if nbad == 0: return 0
+    i = 0
+    while i < N:
+        if not bad[i]: i += 1; continue
+        a0 = i
+        while i < N and bad[i]: i += 1
+        b0 = i - 1
+        lo = a0 - 1
+        while lo >= 0 and bad[lo]: lo -= 1
+        hi = b0 + 1
+        while hi < N and bad[hi]: hi += 1
+        if lo < 0 and hi >= N: break
+        lo_ok, hi_ok = lo >= 0, hi < N
+        for t in range(a0, b0 + 1):
+            if not hi_ok or not lo_ok:
+                src = hi if hi_ok else lo
+                qp[t] = qp[src]
+                continue
+            al = (t - lo) / (hi - lo)
+            qp[t, :3]  = (1 - al) * qp[lo, :3] + al * qp[hi, :3]
+            qp[t, 7:]  = (1 - al) * qp[lo, 7:] + al * qp[hi, 7:]
+            qp[t, 3:7] = _slerp_wxyz(qp[lo, 3:7], qp[hi, 3:7], al)
+    return nbad
 
 # ── Scale compensation ────────────────────────────────────────────────────────
 # GMR scales targets by (actual_human_height / 1.8) * human_scale_table, and that
@@ -145,18 +192,29 @@ def _flip_depth(fr):
         out[j] = [p, q]
     return out
 
-qpos_list = []
+# Pass 1: retarget every frame, collecting the qpos AND the human overlay, WITHOUT
+# rendering — so we can despike the output before it is shown or saved.
+qpos_list, overlays = [], []
 for fr in frames:
     if a.flip_depth:
         fr = _flip_depth(fr)
     q = rt.retarget(fr, offset_to_ground=not a.no_ground)
     qpos_list.append(q.copy())
+    overlays.append(copy.deepcopy(rt.scaled_human_data))
+
+qp = np.array(qpos_list)
+if not a.no_despike:
+    n = despike_qpos(qp, a.despike_root_deg, a.despike_pos_m, a.despike_dof_deg)
+    if n: print(f"[despike] output: replaced {n} glitch qpos frame(s) of {len(qp)} by interpolation")
+
+# Pass 2: render the cleaned qpos (overlay is the original human, for reference).
+for i in range(len(qp)):
+    q = qp[i]
     viewer.step(root_pos=q[:3], root_rot=q[3:7], dof_pos=q[7:],
-                human_motion_data=rt.scaled_human_data, rate_limit=False, follow_camera=True)
+                human_motion_data=overlays[i], rate_limit=False, follow_camera=True)
 viewer.close()
 
 if a.save:
-    qp = np.array(qpos_list)
     motion = {"fps": 30,
               "root_pos": qp[:, :3],
               "root_rot": qp[:, 3:7][:, [1, 2, 3, 0]],  # wxyz -> xyzw

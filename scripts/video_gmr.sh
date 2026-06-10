@@ -91,7 +91,7 @@ MHR_VIDEO="$OUT/${BASE}_mhr.mp4"
 SAVE_ARGS=()
 [ "$SIDE_BY_SIDE" -eq 1 ] && SAVE_ARGS=(--save "$MHR_VIDEO")
 "$REPO/scripts/offline_video.sh" \
-    --from "$VIDEO" \
+    --from "$VIDEO" --max-persons 1 \
     --bvh  "$OUT/${BASE}.bvh" \
     --bvh-template "$LAFAN_TEMPLATE" \
     --interpolate-jitter "${SAVE_ARGS[@]}"
