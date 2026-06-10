@@ -20,21 +20,42 @@ add_test(NAME calib_test
          COMMAND calib_test ${CMAKE_CURRENT_SOURCE_DIR}/test_data/sample.calib)
 
 # ---------------------------------------------------------------------------
-# aruco_qr — ArUco pose + QR timecode detection (needs the aruco/objdetect
-# OpenCV modules; requested here so the core targets keep their own component
-# set unchanged).
+# OpenCV.  The core multiview tools need a few standard modules; the ArUco/QR
+# sync tools additionally need the "aruco" module, which lives in opencv_contrib
+# and is absent from stock prebuilt OpenCV (notably the Windows release ZIP).
+# Probe for aruco without REQUIRED so its absence only disables those tools
+# instead of failing the whole build (mirrors the optional synchronization /
+# AmmarServer features).
 # ---------------------------------------------------------------------------
-find_package(OpenCV REQUIRED COMPONENTS core imgproc calib3d aruco objdetect videoio)
+find_package(OpenCV QUIET COMPONENTS aruco)
+if(OpenCV_aruco_FOUND OR TARGET opencv_aruco)
+    set(MULTIVIEW_HAVE_ARUCO TRUE)
+endif()
 
-add_library(multiview_aruco_qr STATIC aruco_qr.cpp)
-target_include_directories(multiview_aruco_qr PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${OpenCV_INCLUDE_DIRS})
-target_link_libraries(multiview_aruco_qr PUBLIC multiview_calib ${OpenCV_LIBS})
-target_compile_options(multiview_aruco_qr PRIVATE
-    $<$<CXX_COMPILER_ID:GNU,Clang>:-O2 -Wall -Wextra>
-)
+if(MULTIVIEW_HAVE_ARUCO)
+    find_package(OpenCV REQUIRED COMPONENTS core imgproc calib3d aruco objdetect videoio)
+else()
+    find_package(OpenCV REQUIRED COMPONENTS core imgproc calib3d objdetect videoio)
+    message(STATUS "  multiview: OpenCV 'aruco' module (opencv_contrib) not found — "
+                   "skipping ArUco/QR sync tools (aruco_qr_probe, sam_3dbody_extrinsics, "
+                   "sam_3dbody_synctime, sam_3dbody_sync). Build OpenCV with contrib to enable them.")
+endif()
 
-add_executable(aruco_qr_probe aruco_qr_probe.cpp)
-target_link_libraries(aruco_qr_probe PRIVATE multiview_aruco_qr ${OpenCV_LIBS})
+# ---------------------------------------------------------------------------
+# aruco_qr — ArUco pose + QR timecode detection (needs the opencv_contrib aruco
+# module).  Gated on MULTIVIEW_HAVE_ARUCO; every tool that links it is gated too.
+# ---------------------------------------------------------------------------
+if(MULTIVIEW_HAVE_ARUCO)
+    add_library(multiview_aruco_qr STATIC aruco_qr.cpp)
+    target_include_directories(multiview_aruco_qr PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${OpenCV_INCLUDE_DIRS})
+    target_link_libraries(multiview_aruco_qr PUBLIC multiview_calib ${OpenCV_LIBS})
+    target_compile_options(multiview_aruco_qr PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang>:-O2 -Wall -Wextra>
+    )
+
+    add_executable(aruco_qr_probe aruco_qr_probe.cpp)
+    target_link_libraries(aruco_qr_probe PRIVATE multiview_aruco_qr ${OpenCV_LIBS})
+endif()
 
 # ---------------------------------------------------------------------------
 # extrinsics — camera placement from shared static markers (pure C++ math) +
@@ -50,9 +71,11 @@ add_executable(extrinsics_test extrinsics_test.cpp)
 target_link_libraries(extrinsics_test PRIVATE multiview_extrinsics)
 add_test(NAME extrinsics_test COMMAND extrinsics_test)
 
-add_executable(sam_3dbody_extrinsics sam_3dbody_extrinsics.cpp)
-target_link_libraries(sam_3dbody_extrinsics PRIVATE
-    multiview_extrinsics multiview_aruco_qr multiview_calib ${OpenCV_LIBS})
+if(MULTIVIEW_HAVE_ARUCO)
+    add_executable(sam_3dbody_extrinsics sam_3dbody_extrinsics.cpp)
+    target_link_libraries(sam_3dbody_extrinsics PRIVATE
+        multiview_extrinsics multiview_aruco_qr multiview_calib ${OpenCV_LIBS})
+endif()
 
 # ---------------------------------------------------------------------------
 # sync_time — per-stream QR-timecode -> common clock fit (pure C++) + test +
@@ -68,9 +91,11 @@ add_executable(sync_time_test sync_time_test.cpp)
 target_link_libraries(sync_time_test PRIVATE multiview_sync_time)
 add_test(NAME sync_time_test COMMAND sync_time_test)
 
-add_executable(sam_3dbody_synctime sam_3dbody_synctime.cpp)
-target_link_libraries(sam_3dbody_synctime PRIVATE
-    multiview_sync_time multiview_aruco_qr ${OpenCV_LIBS})
+if(MULTIVIEW_HAVE_ARUCO)
+    add_executable(sam_3dbody_synctime sam_3dbody_synctime.cpp)
+    target_link_libraries(sam_3dbody_synctime PRIVATE
+        multiview_sync_time multiview_aruco_qr ${OpenCV_LIBS})
+endif()
 
 # ---------------------------------------------------------------------------
 # sync_io — read/write the session .sync file (pure C++) + round-trip test +
@@ -87,10 +112,12 @@ add_executable(sync_io_test sync_io_test.cpp)
 target_link_libraries(sync_io_test PRIVATE multiview_sync_io)
 add_test(NAME sync_io_test COMMAND sync_io_test)
 
-add_executable(sam_3dbody_sync sam_3dbody_sync.cpp)
-target_link_libraries(sam_3dbody_sync PRIVATE
-    multiview_sync_io multiview_sync_time multiview_extrinsics
-    multiview_aruco_qr multiview_calib ${OpenCV_LIBS})
+if(MULTIVIEW_HAVE_ARUCO)
+    add_executable(sam_3dbody_sync sam_3dbody_sync.cpp)
+    target_link_libraries(sam_3dbody_sync PRIVATE
+        multiview_sync_io multiview_sync_time multiview_extrinsics
+        multiview_aruco_qr multiview_calib ${OpenCV_LIBS})
+endif()
 
 # ---------------------------------------------------------------------------
 # fusion front-end — per-stream offline inference driven by a .sync (reuses the
@@ -105,4 +132,8 @@ add_executable(sam_3dbody_multiview sam_3dbody_multiview.cpp)
 target_link_libraries(sam_3dbody_multiview PRIVATE
     multiview_frontend multiview_sync_io fast_sam_3dbody ${OpenCV_LIBS})
 
-message(STATUS "  multiview: calib + aruco_qr + extrinsics + sync_time + sync_io (libs); tests: calib/extrinsics/sync_time/sync_io; tools: aruco_qr_probe, sam_3dbody_extrinsics, sam_3dbody_synctime, sam_3dbody_sync")
+if(MULTIVIEW_HAVE_ARUCO)
+    message(STATUS "  multiview: calib + aruco_qr + extrinsics + sync_time + sync_io (libs); tests: calib/extrinsics/sync_time/sync_io; tools: aruco_qr_probe, sam_3dbody_extrinsics, sam_3dbody_synctime, sam_3dbody_sync, sam_3dbody_multiview")
+else()
+    message(STATUS "  multiview: calib + extrinsics + sync_time + sync_io (libs); tests: calib/extrinsics/sync_time/sync_io; tools: sam_3dbody_multiview (ArUco/QR sync tools skipped — no opencv_contrib aruco)")
+endif()
