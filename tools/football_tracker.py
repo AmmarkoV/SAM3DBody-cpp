@@ -274,6 +274,22 @@ def run(args):
 
                     if kps_crop is not None:
                         kps_full = kps_crop / scale + np.array([ox, oy], np.float32)
+
+                    # Size sanity vs the detection box.  Camera FOV/distance is
+                    # ~constant across the match, so a player's pixel height is
+                    # bounded by its detection box.  When the depth solve in
+                    # _correct_kps2d goes bad the whole skeleton scales up
+                    # uniformly — reject those by comparing the core-joint height
+                    # (nose→ankles, robust to a single flung hand) to the box.
+                    if kps_crop is not None and args.max_size_ratio > 0:
+                        core_h = float(kps_full[0:21, 1].max()
+                                       - kps_full[0:21, 1].min())
+                        if (y2 - y1) > 1 and \
+                           core_h > args.max_size_ratio * (y2 - y1):
+                            rec["reject"] = "oversize"
+                            kps_crop = None    # treat like a non-detection
+
+                    if kps_crop is not None:
                         rec["found"] = True
                         rec["global_rot"] = [round(v, 4) for v in r.global_rot]
                         rec["body_pose"] = [round(v, 4) for v in r.body_pose]
@@ -352,6 +368,10 @@ def parse_args():
                    help="Context padding as a fraction of bbox size per side")
     p.add_argument("--thresh", type=float, default=0.3,
                    help="Person detection threshold inside the crop")
+    p.add_argument("--max-size-ratio", type=float, default=2.0,
+                   help="Reject a pose when its skeleton height exceeds this "
+                        "multiple of the detection bbox height (fixed-camera "
+                        "sanity filter; 0 = disabled)")
 
     p.add_argument("--max-frames", type=int, default=0, help="0 = all")
     p.add_argument("--stride", type=int, default=1, help="Process every Nth frame")
