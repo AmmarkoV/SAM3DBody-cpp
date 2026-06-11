@@ -39,6 +39,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections import defaultdict
 
 import cv2
 import numpy as np
@@ -48,8 +49,8 @@ import numpy as np
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO_ROOT)
 from fast_sam_3dbody_frontend import (  # noqa: E402
-    FsbConfig, FsbResult, load_library,
-    draw_mhr70, _correct_kps2d,
+    FsbConfig, FsbResult, load_library, _correct_kps2d,
+    MHR70_EDGES, _mhr_color, _MHR_HEAD_JOINTS,
 )
 
 
@@ -176,6 +177,138 @@ class _Mp4Writer:
             self.cv.release()
 
 
+def draw_skeleton_kps(frame: np.ndarray, kps: np.ndarray,
+                      kp_radius: int = 2, edge_thick: int = 1) -> None:
+    """Draw the 70-joint MHR70 skeleton from a bare 70x2 array (no FsbResult).
+    Mirrors fast_sam_3dbody_frontend.draw_mhr70 so real and filled poses look
+    identical."""
+    H, W = frame.shape[:2]
+    for i, j in MHR70_EDGES:
+        p1 = (int(kps[i, 0]), int(kps[i, 1]))
+        p2 = (int(kps[j, 0]), int(kps[j, 1]))
+        if not (0 <= p1[0] < W and 0 <= p1[1] < H and
+                0 <= p2[0] < W and 0 <= p2[1] < H):
+            continue
+        head = i in _MHR_HEAD_JOINTS or j in _MHR_HEAD_JOINTS
+        cv2.line(frame, p1, p2, _mhr_color(i),
+                 edge_thick * 2 if head else edge_thick, cv2.LINE_AA)
+    for k in range(70):
+        pt = (int(kps[k, 0]), int(kps[k, 1]))
+        if not (0 <= pt[0] < W and 0 <= pt[1] < H):
+            continue
+        r = kp_radius * 2 if k in _MHR_HEAD_JOINTS else kp_radius
+        cv2.circle(frame, pt, r, _mhr_color(k), -1, cv2.LINE_AA)
+
+
+def _bbox_anchor(bbox):
+    """Return (centre[2], height) of an xyxy box — the position + scale used to
+    normalise a pose so it is independent of where/how big the player is."""
+    x1, y1, x2, y2 = bbox
+    return np.array([(x1 + x2) * 0.5, (y1 + y2) * 0.5], np.float32), max(y2 - y1, 1.0)
+
+
+def fill_track_gaps(json_frames: list, max_gap: int) -> int:
+    """Fill kps_2d for rejected/failed frames by interpolating each track's body
+    pose from its surrounding good frames.
+
+    Position and scale always come from the current frame's detection box (which
+    is reliable every frame on a fixed camera); only the body articulation is
+    carried/interpolated.  Gaps longer than max_gap frames are left empty rather
+    than invented.  Returns the number of poses filled.
+    """
+    seq: dict[int, list] = defaultdict(list)         # track_id -> [(frame_idx, rec), ...]
+    for fr in json_frames:
+        for p in fr["players"]:
+            seq[p["track_id"]].append((fr["frame_index"], p))
+
+    filled = 0
+    for recs in seq.values():
+        # normalised pose for each good frame (centre-subtracted, height-scaled)
+        good = {}
+        for k, (_, p) in enumerate(recs):
+            if p.get("found") and "kps_2d" in p:
+                c, s = _bbox_anchor(p["bbox_xyxy"])
+                good[k] = (np.array(p["kps_2d"], np.float32) - c) / s
+        if not good:
+            continue
+        gidx = sorted(good)
+
+        for k, (fi, p) in enumerate(recs):
+            if k in good or "kps_2d" in p:
+                continue
+            prev = max((g for g in gidx if g < k), default=None)
+            nxt  = min((g for g in gidx if g > k), default=None)
+
+            if prev is not None and nxt is not None:
+                fp, fn = recs[prev][0], recs[nxt][0]
+                if fn - fp > max_gap:
+                    continue                          # gap too long → don't invent
+                a = (fi - fp) / (fn - fp)
+                norm = (1 - a) * good[prev] + a * good[nxt]
+            elif prev is not None:
+                if fi - recs[prev][0] > max_gap:
+                    continue
+                norm = good[prev]                     # hold (no future sample)
+            else:
+                if recs[nxt][0] - fi > max_gap:
+                    continue
+                norm = good[nxt]                      # hold backwards (track start)
+
+            c, s = _bbox_anchor(p["bbox_xyxy"])
+            p["kps_2d"] = np.round(norm * s + c, 1).tolist()
+            p["filled"] = True
+            filled += 1
+    return filled
+
+
+def render_overlay(video: str, out: str, json_frames: list,
+                   W: int, H: int, fps: float) -> None:
+    """Second pass: re-decode the video and draw poses (real + filled) from the
+    collected/filled records."""
+    by_idx = {fr["frame_index"]: fr for fr in json_frames}
+    if not by_idx:
+        return
+    last = max(by_idx)
+
+    cap = cv2.VideoCapture(video)
+    writer = _Mp4Writer(out, W, H, fps)
+    fidx = -1
+    while True:
+        ok, vis = cap.read()
+        if not ok or vis is None:
+            break
+        fidx += 1
+        if fidx > last:
+            break
+        fr = by_idx.get(fidx)
+        if fr is None:                                # frame skipped by --stride
+            continue
+
+        n_real = 0
+        for p in fr["players"]:
+            col = color_for_id(p["track_id"])
+            x1, y1, x2, y2 = (int(v) for v in p["bbox_xyxy"])
+            if "kps_2d" in p:
+                draw_skeleton_kps(vis, np.asarray(p["kps_2d"], np.float32))
+                filled = p.get("filled", False)
+                n_real += not filled
+                box_col = tuple(c // 2 for c in col) if filled else col
+                cv2.rectangle(vis, (x1, y1), (x2, y2), box_col, 1)
+                label = f"#{p['track_id']}" + ("~" if filled else "")
+                cv2.putText(vis, label, (x1, max(y1 - 3, 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, box_col, 1, cv2.LINE_AA)
+            else:
+                cv2.rectangle(vis, (x1, y1), (x2, y2), (60, 60, 60), 1)
+
+        cv2.putText(vis, f"frame {fidx}  {n_real}/{len(fr['players'])} poses",
+                    (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+        writer.write(vis)
+
+    writer.close()
+    cap.release()
+
+
 def run(args):
     lib = load_library(args.lib_dir)
 
@@ -217,10 +350,7 @@ def run(args):
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    writer = None
-    if args.out:
-        writer = _Mp4Writer(args.out, W, H, src_fps)
-
+    # ── Phase 1: inference (per crop) — collect records, no drawing yet ───────
     json_frames = []
     frame_idx = -1
     processed = 0
@@ -243,7 +373,6 @@ def run(args):
         if args.max_persons:
             objs = objs[:args.max_persons]
 
-        vis = frame.copy() if writer is not None else None
         frame_record = {"frame_index": frame_idx, "players": []}
 
         for ob in objs:
@@ -298,41 +427,28 @@ def run(args):
                             rec["kps_3d"] = np.round(
                                 np.array(r.kps_3d, np.float32).reshape(70, 3), 4).tolist()
 
-                        if vis is not None:
-                            col = color_for_id(ob["track_id"])
-                            draw_mhr70(vis, r, kp_radius=2, edge_thick=1,
-                                       kps_override=kps_full)
-                            cv2.rectangle(vis, (int(x1), int(y1)),
-                                          (int(x2), int(y2)), col, 1)
-                            cv2.putText(vis, f"#{ob['track_id']}",
-                                        (int(x1), int(y1) - 3),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, col, 1,
-                                        cv2.LINE_AA)
-
-            if vis is not None and not rec["found"]:
-                x1, y1, x2, y2 = (int(v) for v in ob["xyxy"])
-                cv2.rectangle(vis, (x1, y1), (x2, y2), (60, 60, 60), 1)
-
             frame_record["players"].append(rec)
 
         json_frames.append(frame_record)
         processed += 1
 
-        if vis is not None:
-            found = sum(1 for p in frame_record["players"] if p["found"])
-            cv2.putText(vis, f"frame {frame_idx}  {found}/{len(objs)} poses",
-                        (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                        (255, 255, 255), 2, cv2.LINE_AA)
-            writer.write(vis)
-
         if processed % 10 == 0:
             rate = processed / (time.perf_counter() - t_start)
             print(f"  frame {frame_idx}  ({processed} done, {rate:.1f} fps)")
 
-    if writer:
-        writer.close()
     cap.release()
     lib.fsb_destroy(handle)
+
+    # ── Phase 2: temporal fill across rejected / failed frames ────────────────
+    n_filled = 0
+    if args.temporal_fill:
+        n_filled = fill_track_gaps(json_frames, args.fill_max_gap)
+        print(f"Temporal fill: {n_filled} pose(s) interpolated across gaps "
+              f"(max gap {args.fill_max_gap} frames)")
+
+    # ── Phase 3: render overlay (real + filled poses) ─────────────────────────
+    if args.out:
+        render_overlay(args.video, args.out, json_frames, W, H, src_fps)
 
     if args.json:
         with open(args.json, "w") as f:
@@ -345,7 +461,7 @@ def run(args):
     total = sum(len(fr["players"]) for fr in json_frames)
     hits = sum(1 for fr in json_frames for p in fr["players"] if p["found"])
     print(f"Done: {processed} frames, {hits}/{total} player poses recovered "
-          f"({100*hits/max(total,1):.0f}%).")
+          f"({100*hits/max(total,1):.0f}%), {n_filled} filled by temporal pass.")
 
 
 def parse_args():
@@ -372,6 +488,15 @@ def parse_args():
                    help="Reject a pose when its skeleton height exceeds this "
                         "multiple of the detection bbox height (fixed-camera "
                         "sanity filter; 0 = disabled)")
+    p.add_argument("--temporal-fill", dest="temporal_fill", action="store_true",
+                   default=True,
+                   help="Interpolate each track's pose across rejected/failed "
+                        "frames from neighbouring good frames (default: on)")
+    p.add_argument("--no-temporal-fill", dest="temporal_fill",
+                   action="store_false",
+                   help="Disable temporal gap filling")
+    p.add_argument("--fill-max-gap", type=int, default=10,
+                   help="Longest gap (frames) to bridge per track when filling")
 
     p.add_argument("--max-frames", type=int, default=0, help="0 = all")
     p.add_argument("--stride", type=int, default=1, help="Process every Nth frame")
