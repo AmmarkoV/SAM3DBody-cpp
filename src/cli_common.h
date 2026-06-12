@@ -59,13 +59,17 @@
 #include <cstring>
 #include <fstream>    // resolve_backbone_defaults(): probe for backbone_fp16.onnx
 #include <string>
+
+#include "export_macros.h"
+
+#ifndef _WIN32
 #include <glob.h>     // resolve_detector_defaults(): find libreyolo*.onnx in onnx_dir
 #include <unistd.h>   // ensure_trt_models(): readlink("/proc/self/exe") to locate setup_trt.sh
+#endif
 
-#include "fast_sam_3dbody.h"  // for fsb::PipelineConfig
+#include "fast_sam_3dbody_capi.h"
 
-
-struct CommonConfig
+struct FSB_API CommonConfig
 {
     // ── Pipeline (model paths + ONNX runtime knobs) ──────────────────────────
     std::string onnx_dir       = "./onnx";
@@ -259,6 +263,7 @@ inline void resolve_detector_defaults(CommonConfig& c)
     if (c.detector == "auto") {
         // Prefer a LibreYOLO model on disk when the user hasn't pinned --yolo.
         if (!c.yolo_path_set) {
+#ifndef _WIN32
             std::string pattern = c.onnx_dir + "/libreyolo*.onnx";
             glob_t g{};
             if (glob(pattern.c_str(), 0, nullptr, &g) == 0 && g.gl_pathc > 0) {
@@ -268,6 +273,16 @@ inline void resolve_detector_defaults(CommonConfig& c)
                     "preferring it over yolo-pose\n", c.yolo_path.c_str());
             }
             globfree(&g);
+#else
+            // Windows fallback: no globbing, just check for a common name
+            std::string libreyolo = c.onnx_dir + "/libreyolo.onnx";
+            if (std::ifstream(libreyolo).good()) {
+                c.yolo_path = libreyolo;
+                std::fprintf(stderr,
+                    "[cli] --detector auto: found LibreYOLO model '%s'; "
+                    "preferring it over yolo-pose\n", c.yolo_path.c_str());
+            }
+#endif
         }
         c.detector = path_looks_like_libreyolo(c.yolo_path) ? "libreyolo"
                                                             : "yolo-pose";
@@ -306,6 +321,7 @@ inline void ensure_trt_models(const CommonConfig& c)
     // Locate setup_trt.sh relative to this executable (binaries live in build/,
     // so ../tools/), with the working dir as a fallback.
     std::string script;
+#ifndef _WIN32
     {
         char buf[4096];
         ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
@@ -321,6 +337,10 @@ inline void ensure_trt_models(const CommonConfig& c)
         if (script.empty() && std::ifstream("tools/setup_trt.sh").good())
             script = "tools/setup_trt.sh";
     }
+#else
+    if (std::ifstream("tools/setup_trt.sh").good())
+        script = "tools/setup_trt.sh";
+#endif
     if (script.empty()) {
         std::fprintf(stderr,
             "[cli] TRT: backbone_fp16_trt.onnx / decoder_fp16.onnx missing and "

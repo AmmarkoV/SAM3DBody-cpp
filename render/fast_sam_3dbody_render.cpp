@@ -17,10 +17,23 @@
 // GLEW must come before any other GL header.
 #include <GL/glew.h>
 #include <GL/gl.h>
+#ifndef _WIN32
 #include <GL/glx.h>
+#endif
+
+#ifdef _WIN32
+#include <chrono>
+#define NS_NOW() (std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count())
+#else
+#define NS_NOW() ({ struct timespec _t; clock_gettime(CLOCK_MONOTONIC,&_t); (long long)_t.tv_sec*1000000000LL + _t.tv_nsec; })
+#endif
 
 extern "C" {
+#ifdef _WIN32
+#include "../GraphicsEngine/System/win32_gl.h"
+#else
 #include "../GraphicsEngine/System/glx3.h"
+#endif
 #include "../GraphicsEngine/ModelLoader/model_loader_tri.h"
 #include "../GraphicsEngine/ModelLoader/model_loader_transform_joints.h"
 }
@@ -98,7 +111,7 @@ static GLuint compile_shader(GLenum type, const char* src) {
     return s;
 }
 
-static GLuint link_program(const char* vs, const char* fs) 
+static GLuint link_program(const char* vs, const char* fs)
 {
     GLuint p = glCreateProgram();
     GLuint v = compile_shader(GL_VERTEX_SHADER,   vs);
@@ -116,13 +129,13 @@ static GLuint link_program(const char* vs, const char* fs)
 
 // ── GPU mesh state ───────────────────────────────────────────────────────────
 
-struct MeshGPU 
+struct MeshGPU
 {
     GLuint vao, vbo_pos, vbo_norm, ebo;
     GLsizei n_indices;
 };
 
-static MeshGPU upload_mesh_once(const struct TRI_Model* m) 
+static MeshGPU upload_mesh_once(const struct TRI_Model* m)
 {
     MeshGPU g{};
     g.n_indices = (GLsizei)m->header.numberOfIndices;
@@ -330,10 +343,10 @@ static bool upload_bg_frame(BgTex& t, const cv::Mat& bgr)
 
 // ── 4x4 matrix multiply (column-major) ──────────────────────────────────────
 
-static void mat4_mul(float dst[16], const float a[16], const float b[16]) 
+static void mat4_mul(float dst[16], const float a[16], const float b[16])
 {
     for (int c = 0; c < 4; ++c)
-        for (int r = 0; r < 4; ++r) 
+        for (int r = 0; r < 4; ++r)
         {
             dst[c*4+r] = 0.f;
             for (int k = 0; k < 4; ++k)
@@ -382,7 +395,7 @@ int mat4_transpose(float * mat)
 }
 // ── Callbacks required by glx3.c ─────────────────────────────────────────────
 
-extern "C" 
+extern "C"
 {
     // Called by glx3_checkEvents() on key/mouse events.
     int handleUserInput(int key, int x, int y) { (void)key; (void)x; (void)y; return 1; }
@@ -392,7 +405,7 @@ extern "C"
 
 // ── YOLO skeleton joint pairs (COCO 17-joint order) ─────────────────────────
 
-static const int COCO_PAIRS[][2] = 
+static const int COCO_PAIRS[][2] =
 {
     {0,1},{0,2},{1,3},{2,4},                          // head
     {5,6},{5,7},{7,9},{6,8},{8,10},                   // arms
@@ -402,7 +415,7 @@ static const int N_COCO_PAIRS = 17;
 
 static void draw_yolo_skeleton(cv::Mat& img,
                                 const std::vector<float>& kps,
-                                float conf_thresh = 0.3f) 
+                                float conf_thresh = 0.3f)
 {
     if ((int)kps.size() < 51) return;
     // Draw limb lines first, then joint dots on top
@@ -437,8 +450,9 @@ static void save_framebuffer(const std::string& path, int w, int h) {
     cv::Mat img(h, w, CV_8UC3, px.data());
     cv::flip(img, img, 0);
     cv::cvtColor(img, img, cv::COLOR_RGB2BGR);
-    cv::imwrite(path, img);
-    printf("Saved: %s\n", path.c_str());
+    std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 85};
+    cv::imwrite(path, img, params);
+    //printf("Saved: %s\n", path.c_str());
 }
 
 // ── Export the deformed body mesh to a Wavefront .obj ─────────────────────────
@@ -771,6 +785,7 @@ int main(int argc, const char** argv) {
 
     // ── Shaders ───────────────────────────────────────────────────────────────
     GLuint prog_quad = link_program(QUAD_VERT, QUAD_FRAG);
+    if (!prog_quad) { fprintf(stderr, "Failed to link quad program\n"); return 1; }
 
     std::string mesh_vert_src = load_text_file(vert_path.c_str());
     std::string mesh_frag_src = load_text_file(frag_path.c_str());
@@ -897,7 +912,6 @@ int main(int argc, const char** argv) {
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
     // ── Render loop ───────────────────────────────────────────────────────────
-#define NS_NOW() ({ struct timespec _t; clock_gettime(CLOCK_MONOTONIC,&_t); (long long)_t.tv_sec*1000000000LL + _t.tv_nsec; })
     long long t_last_frame    = NS_NOW();
     long long t_last_grab     = NS_NOW();   // wall-clock of the last frame we pulled (live sync)
     long long t_session_start = NS_NOW();   // for measuring the effective live frame rate
@@ -912,7 +926,7 @@ int main(int argc, const char** argv) {
     const int frame_stop   = (max_frames > 0) ? start_frame + max_frames : -1;
 
     cv::Mat frame;
-    while (glx3_checkEvents()) 
+    while (glx3_checkEvents())
     {
         if (is_image)
         {
@@ -938,7 +952,10 @@ int main(int argc, const char** argv) {
             }
             cap >> frame;                 // newest available frame
             t_last_grab = NS_NOW();
-            if (frame.empty()) break;
+            if (frame.empty()) {
+                fprintf(stderr, "\n[cap] end of stream reached at frame %d\n", frame_index);
+                break;
+            }
         }
 
         // Inference
@@ -1004,13 +1021,11 @@ int main(int argc, const char** argv) {
                 draw_yolo_skeleton(vis, r.keypoints_yolo);
         }
 
-        // Upload background.  Failures are non-fatal: skip the background
-        // quad for this frame and let the next frame retry.  Killing the
-        // process here is the regression that produced truncated mp4s
-        // (e.g. matrix_rendered.mp4 stopping at 14s with audio continuing
-        // for the full 90s) — a single bad frame should not take down a
-        // long render.
+        // Upload background.
         bool bg_ok = upload_bg_frame(bg, vis);
+        if (!bg_ok) {
+            fprintf(stderr, "\n[GL] background upload failed at frame %d\n", frame_index);
+        }
 
         glClearColor(0.f, 0.f, 0.f, 1.f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -1236,6 +1251,7 @@ int main(int argc, const char** argv) {
           t_last_frame      = t_now;
           fps_ema = (fps_ema == 0.0) ? (1000.0 / frame_ms)
                                      : (0.9 * fps_ema + 0.1 * (1000.0 / frame_ms));
+
           fprintf(stderr, "\r  FPS: %5.1f  Latency: %4.0f ms  Subjects: %d   ",
                   fps_ema, latency_ms, (int)results.size());
           fflush(stderr);

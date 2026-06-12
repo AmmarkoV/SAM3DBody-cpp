@@ -1,5 +1,39 @@
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef _MSC_VER
+#include <io.h>
+#define read _read
+#define write _write
+#include <BaseTsd.h>
+typedef SSIZE_T ssize_t;
+
+static ssize_t getline(char **lineptr, size_t *n, FILE *stream) {
+    if (lineptr == NULL || n == NULL || stream == NULL) return -1;
+    if (*lineptr == NULL || *n == 0) {
+        *n = 128;
+        *lineptr = (char *)malloc(*n);
+        if (*lineptr == NULL) return -1;
+    }
+    ssize_t count = 0;
+    int ch;
+    while ((ch = fgetc(stream)) != EOF) {
+        if (count + 1 >= (ssize_t)*n) {
+            size_t new_n = *n * 2;
+            char *new_ptr = (char *)realloc(*lineptr, new_n);
+            if (new_ptr == NULL) return -1;
+            *lineptr = new_ptr;
+            *n = new_n;
+        }
+        (*lineptr)[count++] = (char)ch;
+        if (ch == '\n') break;
+    }
+    if (count == 0) return -1;
+    (*lineptr)[count] = '\0';
+    return count;
+}
+#else
+#include <unistd.h>
+#endif
 #include "bvh_to_tri_pose.h"
 
 #include "../../TrajectoryParser/InputParser_C.h"

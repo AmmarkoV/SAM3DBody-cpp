@@ -1,9 +1,9 @@
 project( matmul )
-cmake_minimum_required( VERSION 2.8.7 )
- 
+cmake_minimum_required(VERSION 3.5...4.3)
+
 #Make fast, lean and platform independent binaries..
 set(CMAKE_CXX_FLAGS "-s -O3 -fPIC -march=native -mtune=native")
-set(CMAKE_C_FLAGS "-s -O3 -fPIC -march=native -mtune=native") 
+set(CMAKE_C_FLAGS "-s -O3 -fPIC -march=native -mtune=native")
 
 OPTION(OPENCL_OPTIMIZATIONS OFF)
 
@@ -13,7 +13,7 @@ endif(OPENCL_OPTIMIZATIONS)
 
 set_source_files_properties(mat_mul.cl PROPERTIES HEADER_FILE_ONLY TRUE)
 #add_library(matmul STATIC mat_mul.c)
-add_executable(matmul mat_mul.c )  
+add_executable(matmul mat_mul.c )
 target_link_libraries(matmul m rt OpenCL )
 
 

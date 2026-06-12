@@ -90,18 +90,31 @@ option(SAM3D_TENSORRT
 # ---------------------------------------------------------------------------
 # CUDA  (optional – enables ONNX Runtime CUDA EP and ggml CUDA backend)
 # ---------------------------------------------------------------------------
-find_package(CUDAToolkit QUIET)
-if(CUDAToolkit_FOUND)
-    set(CMAKE_CUDA_ARCHITECTURES "86" CACHE STRING "CUDA architectures" FORCE)
-    enable_language(CUDA)
-    set(GGML_CUDA     ON  CACHE BOOL "" FORCE)
-    set(GGML_CUDA_F16 ON  CACHE BOOL "" FORCE)
-    set(WITH_CUDA     ON)
-    message(STATUS "CUDA ${CUDAToolkit_VERSION} found (sm_${CMAKE_CUDA_ARCHITECTURES})")
+if(WIN32)
+    # On Windows, we avoid enable_language(CUDA) because it's brittle in this environment.
+    # We still check for CUDAToolkit to enable the C++ parts that use it.
+    find_package(CUDAToolkit QUIET)
+    if(CUDAToolkit_FOUND)
+        set(WITH_CUDA ON)
+        set(GGML_CUDA OFF) # GGML CUDA needs enable_language(CUDA)
+        message(STATUS "CUDA ${CUDAToolkit_VERSION} found (NVCC build disabled on Windows)")
+    else()
+        set(WITH_CUDA OFF)
+    endif()
 else()
-    set(GGML_CUDA OFF CACHE BOOL "" FORCE)
-    set(WITH_CUDA OFF)
-    message(STATUS "CUDA not found – CPU-only build")
+    find_package(CUDAToolkit QUIET)
+    if(CUDAToolkit_FOUND)
+        set(CMAKE_CUDA_ARCHITECTURES "86" CACHE STRING "CUDA architectures" FORCE)
+        enable_language(CUDA)
+        set(GGML_CUDA     ON  CACHE BOOL "" FORCE)
+        set(GGML_CUDA_F16 ON  CACHE BOOL "" FORCE)
+        set(WITH_CUDA     ON)
+        message(STATUS "CUDA ${CUDAToolkit_VERSION} found (sm_${CMAKE_CUDA_ARCHITECTURES})")
+    else()
+        set(GGML_CUDA OFF CACHE BOOL "" FORCE)
+        set(WITH_CUDA OFF)
+        message(STATUS "CUDA not found – CPU-only build")
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -168,31 +181,61 @@ if(NOT DEFINED ONNX_RUNTIME_DIR OR ONNX_RUNTIME_DIR STREQUAL "")
             # After extraction + rename, contents live directly in _ORT_DOWNLOAD_DIR
             set(ONNX_RUNTIME_DIR "${_ORT_DOWNLOAD_DIR}")
 
-            if(NOT EXISTS "${_ORT_DOWNLOAD_DIR}")
+            if(NOT EXISTS "${ONNX_RUNTIME_DIR}/include/onnxruntime_cxx_api.h")
                 message(STATUS "Downloading ONNX Runtime ${_ORT_VERSION} (${_ORT_OS}${_ORT_SUFFIX}) …")
                 file(DOWNLOAD "${_ORT_URL}" "${CMAKE_BINARY_DIR}/${_ORT_ARCHIVE}" SHOW_PROGRESS)
+                file(MAKE_DIRECTORY "${ONNX_RUNTIME_DIR}")
                 execute_process(
                     COMMAND ${CMAKE_COMMAND} -E tar xf "${CMAKE_BINARY_DIR}/${_ORT_ARCHIVE}"
-                    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+                    WORKING_DIRECTORY "${ONNX_RUNTIME_DIR}"
                 )
-                file(RENAME
-                    "${CMAKE_BINARY_DIR}/${_ORT_DIRNAME}"
-                    "${_ORT_DOWNLOAD_DIR}"
-                )
+                # Microsoft's zip/tgz extracts into a subdir named exactly as the archive base.
+                if(EXISTS "${ONNX_RUNTIME_DIR}/${_ORT_DIRNAME}")
+                    file(RENAME "${ONNX_RUNTIME_DIR}/${_ORT_DIRNAME}/include" "${ONNX_RUNTIME_DIR}/include")
+                    file(RENAME "${ONNX_RUNTIME_DIR}/${_ORT_DIRNAME}/lib"     "${ONNX_RUNTIME_DIR}/lib")
+                    if(WIN32)
+                         file(RENAME "${ONNX_RUNTIME_DIR}/${_ORT_DIRNAME}/bin"     "${ONNX_RUNTIME_DIR}/bin")
+                    endif()
+                endif()
             endif()
         endif()
     endif()
 endif()
 
 if(NOT TARGET onnxruntime::onnxruntime)
-    set(ORT_INCLUDE_DIRS "${ONNX_RUNTIME_DIR}/include")
-    set(ORT_LIB_DIR      "${ONNX_RUNTIME_DIR}/lib")
-    find_library(ORT_LIB onnxruntime PATHS "${ORT_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
+    if(NOT ORT_INCLUDE_DIRS OR NOT ORT_LIB)
+        set(ORT_INCLUDE_DIRS "${ONNX_RUNTIME_DIR}/include")
+        set(ORT_LIB_DIR      "${ONNX_RUNTIME_DIR}/lib")
+        # Ensure we look in the absolute path, not relative to build dir
+        find_library(ORT_LIB onnxruntime PATHS "${ORT_LIB_DIR}" NO_DEFAULT_PATH)
+        if(WIN32)
+            find_library(ORT_IMPLIB onnxruntime PATHS "${ORT_LIB_DIR}" NO_DEFAULT_PATH)
+        endif()
+    endif()
     add_library(onnxruntime::onnxruntime SHARED IMPORTED)
-    set_target_properties(onnxruntime::onnxruntime PROPERTIES
-        IMPORTED_LOCATION "${ORT_LIB}"
-        INTERFACE_INCLUDE_DIRECTORIES "${ORT_INCLUDE_DIRS}"
-    )
+    if(WIN32)
+        if(ORT_IMPLIB)
+            set_target_properties(onnxruntime::onnxruntime PROPERTIES
+                IMPORTED_LOCATION "${ORT_LIB_DIR}/onnxruntime.dll"
+                IMPORTED_IMPLIB   "${ORT_IMPLIB}"
+                INTERFACE_INCLUDE_DIRECTORIES "${ORT_INCLUDE_DIRS}"
+            )
+        elseif(ORT_LIB)
+             # If we only have one library file on Windows, treat it as both for now to satisfy CMake
+             set_target_properties(onnxruntime::onnxruntime PROPERTIES
+                IMPORTED_LOCATION "${ORT_LIB}"
+                IMPORTED_IMPLIB   "${ORT_LIB}"
+                INTERFACE_INCLUDE_DIRECTORIES "${ORT_INCLUDE_DIRS}"
+            )
+        endif()
+    else()
+        if(ORT_LIB)
+            set_target_properties(onnxruntime::onnxruntime PROPERTIES
+                IMPORTED_LOCATION "${ORT_LIB}"
+                INTERFACE_INCLUDE_DIRECTORIES "${ORT_INCLUDE_DIRS}"
+            )
+        endif()
+    endif()
     set(ORT_LIBS onnxruntime::onnxruntime)
     message(STATUS "ONNX Runtime at ${ONNX_RUNTIME_DIR}")
 endif()
@@ -287,8 +330,13 @@ if(WIN32)
 endif()
 
 if(WITH_CUDA)
-    target_sources(fast_sam_3dbody PRIVATE src/mhr_lbs_cuda.cu)
-    target_compile_definitions(fast_sam_3dbody PUBLIC GGML_USE_CUDA FSB_CUDA)
+    if(NOT WIN32)
+        target_sources(fast_sam_3dbody PRIVATE src/mhr_lbs_cuda.cu)
+    endif()
+    target_compile_definitions(fast_sam_3dbody PUBLIC FSB_CUDA)
+    if(GGML_CUDA)
+        target_compile_definitions(fast_sam_3dbody PUBLIC GGML_USE_CUDA)
+    endif()
     target_link_libraries(fast_sam_3dbody PUBLIC CUDA::cudart)
 endif()
 
@@ -323,67 +371,55 @@ target_compile_options(fast_sam_3dbody_run PRIVATE
 # ---------------------------------------------------------------------------
 # fast_sam_3dbody_render  executable  (OpenGL overlay renderer)
 #
-# Linux-only: it is built on a GLX/X11 OpenGL context (glx3.c) with no Windows
-# (WGL) equivalent in-tree. Windows builds are headless — the renderer is
-# skipped and a notice is printed instead.
+# Built on a GLX/X11 OpenGL context (glx3.c) on Linux, and WGL on Windows.
 # ---------------------------------------------------------------------------
-if(NOT WIN32)
-    find_package(OpenGL REQUIRED)
-    find_package(GLEW   REQUIRED)
+find_package(OpenGL REQUIRED)
 
-    add_executable(fast_sam_3dbody_render
-        render/fast_sam_3dbody_render.cpp
-        ${GRAPHICS_ENGINE_DIR}/System/glx3.c
-        ${GRAPHICS_ENGINE_DIR}/ModelLoader/model_loader_tri.c
-        ${GRAPHICS_ENGINE_DIR}/ModelLoader/model_loader_transform_joints.c
-    )
-
-    target_compile_definitions(fast_sam_3dbody_render PRIVATE USE_GLEW)
-
-    target_include_directories(fast_sam_3dbody_render PRIVATE
-        src
-        ${GRAPHICS_ENGINE_DIR}
-        ${ORT_INCLUDE_DIRS}
-        ${OpenCV_INCLUDE_DIRS}
-        ${GLEW_INCLUDE_DIRS}
-    )
-
-    target_link_libraries(fast_sam_3dbody_render PRIVATE
-        fast_sam_3dbody
-        OpenGL::GL
-        GLEW::GLEW
-        ${OpenCV_LIBS}
-        X11
-        ${RT_LIB}
-        ${MATH_LIB}
-        AmMatrix
-    )
-
-    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-        target_compile_options(fast_sam_3dbody_render PRIVATE
-            $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -g -O0>
-            $<$<COMPILE_LANGUAGE:C>:-Wall -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -g -O0>
-        )
-    else()
-        target_compile_options(fast_sam_3dbody_render PRIVATE
-            $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -O3 -march=native>
-            $<$<COMPILE_LANGUAGE:C>:-Wall -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -O2>
-        )
-    endif()
+if(WIN32)
+    set(RENDERER_SYSTEM_SRC ${GRAPHICS_ENGINE_DIR}/System/win32_gl.c)
+    set(GLEW_INCLUDE_DIRS "C:/MoCap/glew/glew-2.3.1/include")
+    set(GLEW_LIBRARIES "C:/MoCap/glew/glew-2.3.1/lib/Release/x64/glew32.lib")
+    set(RENDERER_LIBS OpenGL::GL ${GLEW_LIBRARIES} ${OpenCV_LIBS} ${MATH_LIB} AmMatrix)
 else()
-    message(STATUS "")
-    message(STATUS "  ┌─────────────────────────────────────────────────────────────────┐")
-    message(STATUS "  │  Windows build: HEADLESS ONLY                                   │")
-    message(STATUS "  │                                                                 │")
-    message(STATUS "  │  Live visualization is NOT supported on Windows. The OpenGL     │")
-    message(STATUS "  │  overlay renderer (fast_sam_3dbody_render) needs GLX/X11 and    │")
-    message(STATUS "  │  will not be built.                                             │")
-    message(STATUS "  │                                                                 │")
-    message(STATUS "  │  Use these instead:                                             │")
-    message(STATUS "  │    fast_sam_3dbody_run        – CLI pose/keypoint output        │")
-    message(STATUS "  │    offline_sam_3dbody_render  – offline BVH extraction          │")
-    message(STATUS "  └─────────────────────────────────────────────────────────────────┘")
-    message(STATUS "")
+    find_package(GLEW   REQUIRED)
+    set(RENDERER_SYSTEM_SRC ${GRAPHICS_ENGINE_DIR}/System/glx3.c)
+    set(RENDERER_LIBS OpenGL::GL GLEW::GLEW ${OpenCV_LIBS} X11 ${RT_LIB} ${MATH_LIB} AmMatrix)
+endif()
+
+add_executable(fast_sam_3dbody_render
+    render/fast_sam_3dbody_render.cpp
+    ${RENDERER_SYSTEM_SRC}
+    ${GRAPHICS_ENGINE_DIR}/ModelLoader/model_loader_tri.c
+    ${GRAPHICS_ENGINE_DIR}/ModelLoader/model_loader_transform_joints.c
+)
+
+target_compile_definitions(fast_sam_3dbody_render PRIVATE USE_GLEW)
+
+target_include_directories(fast_sam_3dbody_render PRIVATE
+    src
+    ${GRAPHICS_ENGINE_DIR}
+    ${ORT_INCLUDE_DIRS}
+    ${OpenCV_INCLUDE_DIRS}
+    ${GLEW_INCLUDE_DIRS}
+)
+
+target_link_libraries(fast_sam_3dbody_render PRIVATE
+    fast_sam_3dbody
+    ${RENDERER_LIBS}
+)
+
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    target_compile_options(fast_sam_3dbody_render PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -g -O0>
+        $<$<COMPILE_LANGUAGE:C>:-Wall -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -g -O0>
+        $<$<CXX_COMPILER_ID:MSVC>:/Zi /Od>
+    )
+else()
+    target_compile_options(fast_sam_3dbody_render PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -O3 -march=native>
+        $<$<COMPILE_LANGUAGE:C>:-Wall -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -O2>
+        $<$<CXX_COMPILER_ID:MSVC>:/O2>
+    )
 endif()
 
 # ---------------------------------------------------------------------------
@@ -471,14 +507,15 @@ add_subdirectory(synchronization)
 # multi-view capture & fusion (MULTIVIEW_PLAN.md) — .calib loader so far
 # ---------------------------------------------------------------------------
 enable_testing()
+add_subdirectory(AmMatrix)
 add_subdirectory(multiview)
 
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 if(WIN32)
-    set(_VIS_STATUS "DISABLED (headless build — Windows not supported)")
-    set(_TARGETS_STATUS "fast_sam_3dbody (lib)  fast_sam_3dbody_run (exe)  offline_sam_3dbody_render (exe)")
+    set(_VIS_STATUS "ENABLED (WGL/win32_gl)")
+    set(_TARGETS_STATUS "fast_sam_3dbody (lib)  fast_sam_3dbody_run (exe)  fast_sam_3dbody_render (exe)  offline_sam_3dbody_render (exe)")
 else()
     set(_VIS_STATUS "enabled (fast_sam_3dbody_render)")
     set(_TARGETS_STATUS "fast_sam_3dbody (lib)  fast_sam_3dbody_run (exe)  fast_sam_3dbody_render (exe)  offline_sam_3dbody_render (exe)")

@@ -22,10 +22,14 @@
 #include <string>
 #include <vector>
 
+#include "export_macros.h"
+
 #include <opencv2/videoio.hpp>      // cv::VideoCapture
 
 #include "fast_sam_3dbody.h"        // fsb::MHRResult, fsb::Pipeline
 #include "cli_common.h"             // CommonConfig
+
+#include "fast_sam_3dbody_capi.h"
 
 namespace offline
 {
@@ -36,7 +40,7 @@ namespace offline
 // at 18439×3 floats per detection it's the bulk of MHRResult's memory cost
 // and we never need the mesh for BVH export.  This keeps memory bounded
 // even on long clips (~1 hour at 30 fps with 3 people ≈ 600 MB).
-struct FrameRecord
+struct FSB_API FrameRecord
 {
     int                          frame_idx = -1;
     std::vector<fsb::MHRResult>  detections;          // pipeline output
@@ -46,7 +50,7 @@ struct FrameRecord
 
 // Identity span across the session: a contiguous block of frames where the
 // same person is tracked, with the mapping back into each FrameRecord.
-struct Track
+struct FSB_API Track
 {
     int                                 id            = -1;
     int                                 first_frame   = INT32_MAX;
@@ -64,7 +68,7 @@ struct Track
 //   --bvh --bvh-template --no-bvh-*-shape-change --bvh-raw-fingers
 //   --bw-cutoff --rot-clamp
 // Offline-specific knobs (smoothing / tracking / scene / gap / jitter) below.
-struct Config : public CommonConfig
+struct FSB_API Config : public CommonConfig
 {
     Config() {
         // Offline-specific default: --rot-clamp's geodesic SLERP clamp is
@@ -152,7 +156,7 @@ struct Config : public CommonConfig
 // Each operates on the shared FrameRecord/Track buffers; call them in order.
 
 // PASS 1 — decode video + run MHR inference + detect scene cuts.
-bool run_inference_pass(fsb::Pipeline& pipeline,
+bool FSB_API run_inference_pass(fsb::Pipeline& pipeline,
                         cv::VideoCapture& cap,
                         std::vector<FrameRecord>& out_frames,
                         std::vector<int>& out_scene_cuts,
@@ -160,36 +164,36 @@ bool run_inference_pass(fsb::Pipeline& pipeline,
                         const Config& cfg);
 
 // PASS 2 — globally-optimal identity tracking across the whole clip.
-std::vector<Track> build_global_tracks(std::vector<FrameRecord>& frames,
+std::vector<Track> FSB_API build_global_tracks(std::vector<FrameRecord>& frames,
                                         const Config& cfg);
 
 // PASS 3 — fill missing frames inside each track (respects scene cuts).
-void gap_interpolation_pass(std::vector<FrameRecord>& frames,
+void FSB_API gap_interpolation_pass(std::vector<FrameRecord>& frames,
                             std::vector<Track>& tracks,
                             const std::vector<int>& scene_cuts,
                             const Config& cfg);
 
 // PASS 4 — replace high-velocity (jitter) frames by interpolation (opt-in).
-void interpolate_jitter_pass(std::vector<FrameRecord>& frames,
+void FSB_API interpolate_jitter_pass(std::vector<FrameRecord>& frames,
                              const std::vector<Track>& tracks,
                              const std::vector<int>& scene_cuts,
                              const Config& cfg);
 
 // PASS 5 — temporal smoothing per scene segment.
-void smoothing_pass(std::vector<FrameRecord>& frames,
+void FSB_API smoothing_pass(std::vector<FrameRecord>& frames,
                     const std::vector<Track>& tracks,
                     const std::vector<int>& scene_cuts,
                     float fs, const Config& cfg);
 
 // PASS 6 — write BVH file(s).
-void export_to_bvh(const std::vector<FrameRecord>& frames,
+void FSB_API export_to_bvh(const std::vector<FrameRecord>& frames,
                    const std::vector<Track>& tracks,
                    const std::vector<int>& scene_cuts,
                    double fps, const Config& cfg);
 
 // Linear/SLERP interpolation of two MHR results (used by Pass 3/4; exposed
 // because the multi-view refit reuses it — see MULTIVIEW_PLAN.md).
-fsb::MHRResult interp_mhr(const fsb::MHRResult& a,
+fsb::MHRResult FSB_API interp_mhr(const fsb::MHRResult& a,
                           const fsb::MHRResult& b,
                           float t);
 
