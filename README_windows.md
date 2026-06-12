@@ -1,8 +1,3 @@
-I have created a comprehensive `README_windows.md` that covers the prerequisites, build process, and usage for the Windows port of `SAM3DBody-cpp`.
-
-### README_windows.md
-
-```markdown
 # SAM3DBody-cpp: Windows Build & Usage Guide
 
 This document provides instructions for building and running **SAM3DBody-cpp** on Windows using Visual Studio and CMake.
