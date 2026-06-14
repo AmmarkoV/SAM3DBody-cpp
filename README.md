@@ -210,19 +210,50 @@ SAM3DBody-cpp/
 
 ## Setup
 
-### 1. Download models
+### One-command setup (recommended)
 
-See the **[Models](#models)** section above. After extracting the zip, `onnx/` should be at the repo root.
+`scripts/setup.sh` handles everything: downloads models from HuggingFace, clones
+required libraries, builds the C++ binaries, and creates a Python venv.
+
+```bash
+git clone https://github.com/AmmarkoV/SAM3DBody-cpp
+cd SAM3DBody-cpp
+bash scripts/setup.sh
+```
+
+For a machine **without a CUDA GPU**, also pass `--cpu-backbone` to fetch the fp32 backbone:
+
+```bash
+bash scripts/setup.sh --cpu-only --cpu-backbone
+```
+
+Common flags:
+
+| Flag | Effect |
+|------|--------|
+| `--cuda-arch 89` | Set CUDA architecture (RTX 4090 = 89, RTX 3090 = 86, RTX 4070 = 89) |
+| `--cpu-only` | Install CPU-only PyTorch in the venv |
+| `--cpu-backbone` | Also download the fp32 backbone for CPU inference |
+| `--skip-models` | Skip model download (models already in `onnx/`) |
+| `--skip-build` | Skip C++ build (Python venv only) |
+| `--skip-venv` | Skip Python venv (build only) |
+| `-j N` | Limit `make` to N parallel jobs |
 
 > To build models from source (requires the original Python training environment), see
 > [Fast-SAM-3D-Body](https://github.com/AmmarkoV/Fast-SAM-3D-Body).
 
-### 2. Build
+### Manual setup
+
+#### 1. Download models
+
+See the **[Models](#models)** section above. After extracting the zip, `onnx/` should be at the repo root.
+
+#### 2. Build
 
 Requirements: CMake ≥ 3.18, C++17 compiler, OpenCV (core/imgproc/videoio/highgui/dnn), optional CUDA Toolkit.
 
 ```bash
-cd fast_sam_3dbody_cpp
+cd SAM3DBody-cpp
 mkdir -p build && cd build
 
 cmake .. -DCMAKE_BUILD_TYPE=Release
