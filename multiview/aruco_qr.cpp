@@ -207,6 +207,10 @@ void ArucoQrDetector::process(const cv::Mat& bgr, FrameDetections& out)
     }
 
     bool any = false;
+    // detectAndDecodeMulti was added in OpenCV 4.3.0; on older OpenCV (e.g. the
+    // 4.2 that ships with ROS Noetic on Ubuntu 22.04) only the single-QR
+    // detectAndDecode below is available.
+#if CV_VERSION_MAJOR > 4 || (CV_VERSION_MAJOR == 4 && CV_VERSION_MINOR >= 3)
     try
     {
         std::vector<std::string> infos;
@@ -215,6 +219,7 @@ void ArucoQrDetector::process(const cv::Mat& bgr, FrameDetections& out)
             if (!s.empty()) { QrDet q; parse_qr_kv(s, q); out.qrs.push_back(q); any = true; }
     }
     catch (const cv::Exception&) { /* fall through to single */ }
+#endif
 
     if (!any)
     {
