@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # fast_sam_3dbody_cpp/setup.sh
 #
-# 1. Download ONNX/GGUF/LBS models from HuggingFace (into onnx/).
-# 2. Build the C++ shared library and CLI (cmake + make).
-# 3. Create a Python venv with the packages required by both Python frontends:
+# 1. Install system dependencies (apt) and NVIDIA/CUDA stack if needed.
+# 2. Download ONNX/GGUF/LBS models from HuggingFace (into onnx/).
+# 3. Build the C++ shared library and CLI (cmake + make).
+# 4. Create a Python venv with the packages required by both Python frontends:
 #      fast_sam_3dbody_frontend.py      – needs only opencv-python + numpy
 #      fast_sam_3dbody_frontend-3D.py   – also needs torch, pyrender, roma, etc.
 #
-# Usage (from repo root or from fast_sam_3dbody_cpp/):
+# Usage (from repo root):
 #   bash scripts/setup.sh
 #   bash scripts/setup.sh --cuda-arch 89        # RTX 4090
 #   bash scripts/setup.sh --ort-dir /opt/onnxruntime
@@ -19,6 +20,18 @@
 #   bash scripts/setup.sh -j 4                  # limit make jobs
 
 set -euo pipefail
+
+# ── Helper: yes/no prompt ──────────────────────────────────────────────────────
+prompt_yn() {
+    local msg="$1"
+    while true; do
+        read -rp "$msg [y/N] " yn
+        case "${yn,,}" in
+            y|yes) return 0 ;;
+            n|no|"") return 1 ;;
+        esac
+    done
+}
 
 # ── System dependency check ────────────────────────────────────────────────────
 # Simple dependency checker that will apt-get stuff if something is missing.
@@ -40,6 +53,78 @@ for REQUIRED_PKG in $SYSTEM_DEPENDENCIES; do
     fi
 done
 
+# ── NVIDIA GPU detection and optional CUDA/cuDNN setup ────────────────────────
+NVIDIA_GPU=$(lspci 2>/dev/null | grep "NVIDIA" || true)
+if [ -n "$NVIDIA_GPU" ]; then
+    echo
+    echo "Detected NVIDIA GPU: $NVIDIA_GPU"
+    echo
+
+    # -- cuDNN 9 (required by ONNX Runtime 1.20.1 CUDA EP) --------------------
+    # libcudnn9-cuda-12 lives in the NVIDIA CUDA apt repo, not the Ubuntu
+    # default repo.  Check whether it is known to apt before trying to install.
+    CUDNN_PKG="libcudnn9-cuda-12"
+    CUDNN_OK=$(dpkg-query -W --showformat='${Status}\n' "$CUDNN_PKG" 2>/dev/null | grep "install ok installed" || true)
+    if [ -n "$CUDNN_OK" ]; then
+        echo "cuDNN 9 already installed — skipping."
+    else
+        CUDNN_AVAILABLE=$(apt-cache show "$CUDNN_PKG" 2>/dev/null | grep "^Package:" || true)
+        if [ -n "$CUDNN_AVAILABLE" ]; then
+            if prompt_yn "Install $CUDNN_PKG (required for GPU inference)?"; then
+                sudo apt-get install -y "$CUDNN_PKG"
+                sudo ldconfig
+            fi
+        else
+            echo "Note: $CUDNN_PKG not found in apt sources."
+            echo "      GPU inference needs cuDNN 9. To add the NVIDIA CUDA repo and"
+            echo "      install it, answer 'y' to the CUDA toolkit prompt below, then"
+            echo "      re-run this script."
+        fi
+    fi
+
+    # -- NVIDIA drivers (optional) --------------------------------------------
+    DRIVER_OK=$(dpkg-query -W --showformat='${Status}\n' nvidia-driver* 2>/dev/null | grep "install ok installed" || true)
+    if [ -n "$DRIVER_OK" ]; then
+        echo "NVIDIA driver already installed — skipping."
+    elif prompt_yn "Install NVIDIA drivers (nvidia-driver, Vulkan, nvtop)?"; then
+        sudo add-apt-repository -y ppa:graphics-drivers/ppa
+        sudo apt-get update
+        sudo apt-get install -y nvidia-driver-595-open libglew-dev nvtop freeglut3-dev \
+            vulkan-tools vulkan-utility-libraries-dev
+        POLKIT_HELPER="/usr/share/screen-resolution-extra/nvidia-polkit"
+        [ -f "$POLKIT_HELPER" ] && sudo chmod u+x "$POLKIT_HELPER"
+    fi
+
+    # -- CUDA toolkit (optional, also adds the repo that provides cuDNN 9) ----
+    CUDA_OK=$(dpkg-query -W --showformat='${Status}\n' cuda-toolkit-12-6 2>/dev/null | grep "install ok installed" || true)
+    if [ -n "$CUDA_OK" ]; then
+        echo "CUDA toolkit already installed — skipping."
+    elif prompt_yn "Install NVIDIA CUDA toolkit 12.6 (adds NVIDIA apt repo, enables cuDNN 9)?"; then
+        CUDA_KEYRING_DEB="cuda-keyring_1.1-1_all.deb"
+        CUDA_KEYRING_URL="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/$CUDA_KEYRING_DEB"
+        CUDA_KEYRING_SHA256="9b9b4df8f29a6e64a0e6ab66e05be48caa4d45a14a2b6b34965dc89f1d0c5cc7"
+
+        wget -q -O "/tmp/$CUDA_KEYRING_DEB" "$CUDA_KEYRING_URL"
+        if echo "$CUDA_KEYRING_SHA256  /tmp/$CUDA_KEYRING_DEB" | sha256sum -c - 2>/dev/null; then
+            sudo dpkg -i "/tmp/$CUDA_KEYRING_DEB"
+            sudo apt-get update
+            sudo apt-get install -y cuda-libraries-dev-12-6 cuda-toolkit-12-6
+            grep -q 'cuda/bin' ~/.bashrc || echo 'export PATH=/usr/local/cuda/bin:$PATH' >> ~/.bashrc
+            grep -q 'cuda/lib64' ~/.bashrc || echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> ~/.bashrc
+            # Now that the NVIDIA repo is registered, offer cuDNN 9 if we skipped it above
+            if [ -z "$CUDNN_OK" ] && apt-cache show "$CUDNN_PKG" &>/dev/null; then
+                if prompt_yn "NVIDIA repo now available — install $CUDNN_PKG?"; then
+                    sudo apt-get install -y "$CUDNN_PKG"
+                    sudo ldconfig
+                fi
+            fi
+        else
+            echo "WARNING: CUDA keyring checksum mismatch — skipping CUDA install." >&2
+        fi
+    fi
+fi
+
+# ── Setup paths ────────────────────────────────────────────────────────────────
 THISDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$THISDIR"
 cd ..
@@ -210,7 +295,8 @@ if [[ "${SKIP_BUILD}" -eq 0 ]]; then
     [[ -n "${ORT_DIR}" ]]   && CMAKE_ARGS+=" -DONNX_RUNTIME_DIR=${ORT_DIR}"
 
     cmake -S "${REPO_ROOT}" -B "${BUILD_DIR}" ${CMAKE_ARGS}
-    cmake --build "${BUILD_DIR}" -- -j"${JOBS}"
+    # nice -n 10: lower CPU priority; -j half-cores: leaves headroom for the rest of the system
+    nice -n 10 cmake --build "${BUILD_DIR}" -- -j"${JOBS}"
 
     echo ""
     echo "Build outputs:"
