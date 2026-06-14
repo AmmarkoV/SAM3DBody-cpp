@@ -3,7 +3,7 @@
 #
 # WHAT IT DOES
 # ------------
-#   1. Creates the tools/.venv and installs TensorRT 10.4 runtime libs
+#   1. Installs TensorRT 10.4 runtime libs into the project venv/
 #      (tensorrt-cu12-libs==10.4.0 — the version ORT 1.20.1 was built against).
 #      These are what tools/trt_env.sh puts on LD_LIBRARY_PATH so the ORT
 #      TensorRT EP can dlopen libnvinfer.so.10 instead of falling back to CUDA.
@@ -34,7 +34,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VENV="$ROOT/tools/.venv"
+VENV="$ROOT/venv"
 ONNX_DIR="$ROOT/onnx"
 TRT_LIBS_PKG="tensorrt-cu12-libs==10.4.0"
 MODELS_URL="https://huggingface.co/AmmarkoV/SAM3DBody-cpp-onnx-models/resolve/main/SAM3DBody-cpp-trt-models.zip"
@@ -57,9 +57,10 @@ ZIP="$ONNX_DIR/SAM3DBody-cpp-trt-models.zip"
 
 # ── 1. venv + TensorRT runtime libs ──────────────────────────────────────────
 if [ "$SKIP_VENV" -eq 0 ]; then
-    echo "=== TensorRT runtime libs (tools/.venv) ==="
+    echo "=== TensorRT runtime libs (venv/) ==="
     if [ ! -x "$VENV/bin/pip" ]; then
-        echo "  Creating venv at $VENV"
+        echo "  Project venv not found at $VENV — run scripts/setup.sh first."
+        echo "  Creating minimal venv now …"
         python3 -m venv --upgrade-deps "$VENV"
     fi
     # Already installed?  tensorrt_libs ships the libnvinfer*.so.10 payload.

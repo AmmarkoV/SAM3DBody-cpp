@@ -349,11 +349,11 @@ fi
 if [ -n "${NVIDIA_GPU:-}" ]; then
     echo ""
     TRT_INSTALLED=0
-    if ls "${REPO_ROOT}/tools/.venv"/lib/python*/site-packages/tensorrt_libs/libnvinfer.so.10 >/dev/null 2>&1; then
+    if ls "${REPO_ROOT}/venv"/lib/python*/site-packages/tensorrt_libs/libnvinfer.so.10 >/dev/null 2>&1; then
         TRT_INSTALLED=1
     fi
     if [ "$TRT_INSTALLED" -eq 1 ]; then
-        echo "TensorRT runtime already set up (tools/.venv) — skipping."
+        echo "TensorRT runtime already set up (venv/) — skipping."
     elif prompt_yn "Set up TensorRT fast path (~2.1 GB libs + ~1.7 GB models, ~1.6× speedup)?"; then
         bash "${REPO_ROOT}/tools/setup_trt.sh" --yes
     else

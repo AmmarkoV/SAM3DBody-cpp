@@ -2,8 +2,8 @@
 #
 # Puts the bundled TensorRT runtime libs on LD_LIBRARY_PATH so ORT 1.20.1's
 # TensorRT EP can dlopen libnvinfer.so.10 / libnvonnxparser.so.10 /
-# libnvinfer_plugin.so.10 (see DEPENDENCIES.md §6).  We ship them inside
-# tools/.venv (pip `tensorrt-cu12-libs==10.4.0`).  No-op if not installed, so
+# libnvinfer_plugin.so.10 (see DEPENDENCIES.md §6).  Libs are installed into
+# the project venv/ by tools/setup_trt.sh.  No-op if not installed, so
 # sourcing it is always safe even when you aren't passing --trt.
 #
 # Usage (from any wrapper script):
@@ -16,7 +16,7 @@
 _trt_root="$( cd "$( dirname "${BASH_SOURCE[0]:-$0}" )/.." && pwd )"
 
 SAM3D_TRT_LIBS=""
-for _trt_d in "$_trt_root"/tools/.venv/lib/python*/site-packages/tensorrt_libs; do
+for _trt_d in "$_trt_root"/venv/lib/python*/site-packages/tensorrt_libs; do
     [ -d "$_trt_d" ] || continue          # glob didn't match → skip the literal pattern
     SAM3D_TRT_LIBS="$_trt_d"
     export LD_LIBRARY_PATH="$_trt_d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
