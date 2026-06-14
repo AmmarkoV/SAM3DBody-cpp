@@ -5,7 +5,11 @@
 // Usage:
 //   fast_sam_3dbody_render --onnx-dir DIR --gguf pipeline.gguf
 //       --yolo yolo.onnx [--mesh body_mesh.tri] [--from 0|path]
-//       [--export-mesh PREFIX] [--export-mesh-stride N]
+//       [--size W H] [--fps Z] [--mjpg] [--export-mesh PREFIX] [--export-mesh-stride N]
+//
+// --mjpg requests motion-JPEG from the webcam so UVC cameras can sustain higher
+//   fps at high resolution (uncompressed YUYV is USB-bandwidth limited); it also
+//   prints the fourcc/resolution/fps the driver actually negotiated.
 //
 // --export-mesh writes the deformed body mesh per frame as
 //   PREFIX_p<person>_<frame>.obj in world Y-up space with the pelvis at the BVH
@@ -598,11 +602,13 @@ int main(int argc, const char** argv) {
     int    cap_w      = 0;   // capture width  (0 = driver default)
     int    cap_h      = 0;   // capture height (0 = driver default)
     double cap_fps    = 0.0; // capture fps    (0 = driver default)
+    bool   use_mjpg   = false; // --mjpg: request MJPG from the camera (lets UVC
+                               // webcams sustain higher fps at high resolution)
     bool   no_drop    = false; // --no-drop: process every captured frame (lockstep),
                                // disabling the live-source stale-frame skipping
 
     // Common flags go through the shared parser; binary-specific flags
-    // (--mesh, --lbs, --save-frames, --render-size, --size, --fps,
+    // (--mesh, --lbs, --save-frames, --render-size, --size, --fps, --mjpg,
     //  --butterworth*, --dev-face, --headless) stay handled inline.
     CommonConfig cc;
     for (int i = 1; i < argc; ++i) {
@@ -641,6 +647,7 @@ int main(int argc, const char** argv) {
             { cap_w = std::stoi(argv[++i]); cap_h = std::stoi(argv[++i]); continue; }
         if (!strcmp(argv[i], "--fps") && i+1 < argc)
             { cap_fps = std::stod(argv[++i]); continue; }
+        if (!strcmp(argv[i], "--mjpg")) { use_mjpg = true; continue; }
         if (!strcmp(argv[i], "--dev-face"))    { zero_face      = false; continue; }
         if (!strcmp(argv[i], "--butterworth"))              { use_butterworth  = true; continue; }
         if (!strcmp(argv[i], "--butterworth-root-rotation")){ filter_root_rot  = true; continue; }
@@ -727,9 +734,31 @@ int main(int argc, const char** argv) {
             }
         }
         if (!is_image && cap.isOpened()) {
+            // --mjpg: ask the camera for motion-JPEG *before* width/height/fps so
+            // the driver re-negotiates the stream format.  Uncompressed YUYV is
+            // bandwidth-capped over USB and drops to lower fps tiers as resolution
+            // climbs; MJPG is compressed on-camera and sustains 30 fps at higher
+            // resolutions.  Harmless if the camera has no MJPG mode (ignored).
+            if (use_mjpg)
+                cap.set(cv::CAP_PROP_FOURCC,
+                        cv::VideoWriter::fourcc('M','J','P','G'));
             if (cap_w > 0) cap.set(cv::CAP_PROP_FRAME_WIDTH,  cap_w);
             if (cap_h > 0) cap.set(cv::CAP_PROP_FRAME_HEIGHT, cap_h);
             if (cap_fps > 0.0) cap.set(cv::CAP_PROP_FPS,      cap_fps);
+            if (use_mjpg) {
+                // Report what the driver actually negotiated (may differ from the
+                // request).  FOURCC is packed little-endian into a double.
+                int fcc = (int)cap.get(cv::CAP_PROP_FOURCC);
+                char tag[5] = { (char)( fcc        & 0xFF),
+                                (char)((fcc >>  8) & 0xFF),
+                                (char)((fcc >> 16) & 0xFF),
+                                (char)((fcc >> 24) & 0xFF), 0 };
+                printf("[mjpg] negotiated fourcc=%s  %gx%g @ %g fps\n",
+                       tag,
+                       cap.get(cv::CAP_PROP_FRAME_WIDTH),
+                       cap.get(cv::CAP_PROP_FRAME_HEIGHT),
+                       cap.get(cv::CAP_PROP_FPS));
+            }
             // Small ring buffer for live sources so the driver overwrites stale
             // frames once we fall behind — bounds latency to a few frames instead
             // of letting an unbounded FIFO accumulate.  Backend-dependent (V4L2
