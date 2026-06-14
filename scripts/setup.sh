@@ -100,12 +100,22 @@ if [ -n "$NVIDIA_GPU" ]; then
     if [ -n "$CUDA_OK" ]; then
         echo "CUDA toolkit already installed — skipping."
     elif prompt_yn "Install NVIDIA CUDA toolkit 12.6 (adds NVIDIA apt repo, enables cuDNN 9)?"; then
+        # Derive the NVIDIA repo dir from the Ubuntu release (e.g. 24.04 -> ubuntu2404).
+        # We don't pin the keyring SHA: NVIDIA re-publishes the deb (so a pin goes
+        # stale) and it's a different file per release. The download is over HTTPS
+        # from developer.download.nvidia.com, and once installed the keyring makes
+        # apt GPG-verify every package pulled from the repo — that's the real trust
+        # anchor, not a checksum on this one bootstrap deb.
+        UBUNTU_VER_ID="$(. /etc/os-release 2>/dev/null && echo "${VERSION_ID:-}")"
+        if [ -z "$UBUNTU_VER_ID" ]; then
+            echo "WARNING: could not detect Ubuntu version — defaulting to 24.04 repo." >&2
+            UBUNTU_VER_ID="24.04"
+        fi
+        CUDA_REPO_DIR="ubuntu${UBUNTU_VER_ID//./}"
         CUDA_KEYRING_DEB="cuda-keyring_1.1-1_all.deb"
-        CUDA_KEYRING_URL="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/$CUDA_KEYRING_DEB"
-        CUDA_KEYRING_SHA256="9b9b4df8f29a6e64a0e6ab66e05be48caa4d45a14a2b6b34965dc89f1d0c5cc7"
+        CUDA_KEYRING_URL="https://developer.download.nvidia.com/compute/cuda/repos/$CUDA_REPO_DIR/x86_64/$CUDA_KEYRING_DEB"
 
-        wget -q -O "/tmp/$CUDA_KEYRING_DEB" "$CUDA_KEYRING_URL"
-        if echo "$CUDA_KEYRING_SHA256  /tmp/$CUDA_KEYRING_DEB" | sha256sum -c - 2>/dev/null; then
+        if wget -q -O "/tmp/$CUDA_KEYRING_DEB" "$CUDA_KEYRING_URL"; then
             sudo dpkg -i "/tmp/$CUDA_KEYRING_DEB"
             sudo apt-get update
             sudo apt-get install -y cuda-libraries-dev-12-6 cuda-toolkit-12-6
@@ -119,7 +129,8 @@ if [ -n "$NVIDIA_GPU" ]; then
                 fi
             fi
         else
-            echo "WARNING: CUDA keyring checksum mismatch — skipping CUDA install." >&2
+            echo "WARNING: could not download CUDA keyring from $CUDA_KEYRING_URL" >&2
+            echo "         (no NVIDIA repo for '$CUDA_REPO_DIR'?) — skipping CUDA install." >&2
         fi
     fi
 fi
