@@ -308,6 +308,14 @@ fi
 # ── Python venv ────────────────────────────────────────────────────────────────
 if [[ "${SKIP_VENV}" -eq 0 ]]; then
     echo ""
+    if [[ -f "${VENV_DIR}/bin/activate" ]]; then
+        echo "=== Python venv already exists at ${VENV_DIR} — skipping creation. ==="
+        echo "    Delete the venv directory and re-run to recreate it."
+        SKIP_VENV=1
+    fi
+fi
+
+if [[ "${SKIP_VENV}" -eq 0 ]]; then
     echo "=== Creating Python venv at ${VENV_DIR} ==="
 
     python3 -m venv "${VENV_DIR}"
@@ -335,6 +343,22 @@ if [[ "${SKIP_VENV}" -eq 0 ]]; then
 
     echo ""
     echo "Venv ready: ${VENV_DIR}"
+fi
+
+# ── Optional: TensorRT fast path ──────────────────────────────────────────────
+if [ -n "${NVIDIA_GPU:-}" ]; then
+    echo ""
+    TRT_INSTALLED=0
+    if ls "${REPO_ROOT}/tools/.venv"/lib/python*/site-packages/tensorrt_libs/libnvinfer.so.10 >/dev/null 2>&1; then
+        TRT_INSTALLED=1
+    fi
+    if [ "$TRT_INSTALLED" -eq 1 ]; then
+        echo "TensorRT runtime already set up (tools/.venv) — skipping."
+    elif prompt_yn "Set up TensorRT fast path (~2.1 GB libs + ~1.7 GB models, ~1.6× speedup)?"; then
+        bash "${REPO_ROOT}/tools/setup_trt.sh" --yes
+    else
+        echo "Skipped. Run 'tools/setup_trt.sh' later to enable --trt."
+    fi
 fi
 
 # ── Done ───────────────────────────────────────────────────────────────────────

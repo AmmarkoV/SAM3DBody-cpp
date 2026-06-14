@@ -60,8 +60,7 @@ if [ "$SKIP_VENV" -eq 0 ]; then
     echo "=== TensorRT runtime libs (tools/.venv) ==="
     if [ ! -x "$VENV/bin/pip" ]; then
         echo "  Creating venv at $VENV"
-        python3 -m venv "$VENV"
-        "$VENV/bin/pip" install --upgrade pip --quiet
+        python3 -m venv --upgrade-deps "$VENV"
     fi
     # Already installed?  tensorrt_libs ships the libnvinfer*.so.10 payload.
     if ls "$VENV"/lib/python*/site-packages/tensorrt_libs/libnvinfer.so.10 >/dev/null 2>&1; then
