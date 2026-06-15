@@ -162,6 +162,10 @@ BGR image
 | `kps_3d` | [210] | 70 joints × 3, metres (when native C LBS runs) |
 | `kps_2d` | [140] | 70 joints × 2 projected (when native C LBS runs) |
 
+> 📄 See **[OUTPUT.md](OUTPUT.md)** for the full reference on every 2D/3D point
+> set and its labels — the COCO-17, MHR-70 and MHR-127 keypoint name tables,
+> coordinate spaces, and the `.joints` / `.obj` / `.csv` / `.bvh` file formats.
+
 ---
 
 ## Directory layout
