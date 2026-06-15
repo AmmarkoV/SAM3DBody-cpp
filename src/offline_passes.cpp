@@ -547,7 +547,7 @@ build_global_tracks(std::vector<FrameRecord>& frames, const Config& cfg)
 
         // Retire any track we haven't seen in too long.
         live.erase(std::remove_if(live.begin(), live.end(),
-            [F](const LiveTrack& t){ return (F - t.last_frame) > MAX_MISSING; }),
+            [F, MAX_MISSING](const LiveTrack& t){ return (F - t.last_frame) > MAX_MISSING; }),
             live.end());
     }
 

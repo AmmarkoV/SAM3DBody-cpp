@@ -79,10 +79,24 @@ enum mat4x4EItem
     12  13  14  15
 */
 
+#ifdef _MSC_VER
+  #ifdef __cplusplus
+    alignas(16) const float identityMatrix4x4[16]={1.0,0.0,0.0,0.0,
+                                                   0.0,1.0,0.0,0.0,
+                                                   0.0,0.0,1.0,0.0,
+                                                   0.0,0.0,0.0,1.0};
+  #else
+    __declspec(align(16)) const float identityMatrix4x4[16]={1.0,0.0,0.0,0.0,
+                                                             0.0,1.0,0.0,0.0,
+                                                             0.0,0.0,1.0,0.0,
+                                                             0.0,0.0,0.0,1.0};
+  #endif
+#else
 const float __attribute__((aligned(16))) identityMatrix4x4[16]={1.0,0.0,0.0,0.0,
                                                                 0.0,1.0,0.0,0.0,
                                                                 0.0,0.0,1.0,0.0,
                                                                 0.0,0.0,0.0,1.0};
+#endif
 
 void print4x4FMatrix(const char * str , float * matrix4x4,int forcePrint)
 {

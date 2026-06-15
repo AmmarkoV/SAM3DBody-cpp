@@ -11,6 +11,13 @@
 
 #define FSB_HAS_OPENCV_MAT  1
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 #include "fast_sam_3dbody.h"
 #include "preprocess.hpp"
 
@@ -45,7 +52,9 @@
 
 // ── LBS ──────────────────────────────────────────────────────────────────────
 #include "../GraphicsEngine/ModelLoader/model_loader_transform_joints.h"
+#ifndef _WIN32
 #include "mhr_lbs_cuda.cuh"
+#endif
 
 // ── STL ──────────────────────────────────────────────────────────────────────
 #include <algorithm>
@@ -241,6 +250,8 @@ struct OrtSession
             const EP ep = ladder[a];
             const bool last = (a + 1 == ladder.size());
             Ort::SessionOptions opts;
+            // Silence potential performance warnings about Memcpy nodes if level is high
+            opts.SetLogSeverityLevel(3); // 3 = Error, 4 = Fatal. Silences Warning(2).
             opts.SetIntraOpNumThreads(1);
             opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
             try
@@ -287,7 +298,17 @@ struct OrtSession
                 }
                 // EP_CPU: append nothing — the default CPU EP runs.
 
+#ifdef _WIN32
+                std::wstring wpath;
+                int len = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, NULL, 0);
+                if (len > 0) {
+                    wpath.resize(len);
+                    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &wpath[0], len);
+                }
+                session = new Ort::Session(e, wpath.c_str(), opts);
+#else
                 session = new Ort::Session(e, path.c_str(), opts);
+#endif
                 if (ep == EP_CPU && cuda)
                     fprintf(stderr, "[ORT] WARNING: '%s' running on CPU (GPU EPs unavailable)\n",
                             path.c_str());
@@ -381,7 +402,9 @@ struct Pipeline::Impl
 
     // Native C LBS (body_model.lbs) — loaded when body_model.onnx is unavailable
     struct MHR_LBS_Data* lbs_data = nullptr;
+#if defined(FSB_CUDA) && !defined(_WIN32)
     MHR_LBS_CUDACtx*    lbs_cuda = nullptr;   // GPU-accelerated path; null on CPU builds
+#endif
 
     // ── per-stage timing accumulators ──────────────────────────────────────────
     // Wall time (ms) spent in each pipeline stage, summed across every
@@ -478,8 +501,12 @@ struct Pipeline::Impl
                 {
                     printf("OK (%d joints, %d vertices)\n", lbs_data->n_joints, lbs_data->n_verts);
 #ifdef FSB_CUDA
+            #ifndef _WIN32
                     lbs_cuda = mhr_lbs_cuda_init(lbs_data);
+            #endif
+#if defined(FSB_CUDA) && !defined(_WIN32)
                     if (lbs_cuda) printf("[FSB] LBS CUDA accelerated (GPU shape blend + scatter)\n");
+#endif
 #endif
 
                     // Load keypoint mapping even with LBS
@@ -774,7 +801,6 @@ struct Pipeline::Impl
 
         // ── backbone ─────────────────────────────────────────────────────────
         t0 = Clock::now();
-        const int FEAT_HW = CROP_SIZE / 16;   // 32
         const int BACKBONE_DIM = 1280;
         const size_t feat_elems = (size_t)B * BACKBONE_DIM * FEAT_HW * FEAT_HW;
 
@@ -957,7 +983,7 @@ struct Pipeline::Impl
                 float* joints_out = all_skel.data() + (size_t)i * 127 * 3;
 
                 static const float zero_face[72] = {};
-#ifdef FSB_CUDA
+#if defined(FSB_CUDA) && !defined(_WIN32)
                 if (lbs_cuda) {
                     mhr_lbs_cuda_compute(lbs_cuda, lbs_data, mp.data,
                                          raw_i + 266,
@@ -1221,7 +1247,9 @@ struct Pipeline::Impl
         sess_decoder.free();
         sess_body.free();
         sess_yolo.free();
+#if defined(FSB_CUDA) && !defined(_WIN32)
         if (lbs_cuda) { mhr_lbs_cuda_free(lbs_cuda); lbs_cuda = nullptr; }
+#endif
         if (lbs_data)
         {
             mhr_lbs_free(lbs_data);

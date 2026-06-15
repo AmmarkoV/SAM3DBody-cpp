@@ -16,11 +16,15 @@
 #include <unordered_map>
 #include <vector>
 
+#include "export_macros.h"
+
+#include "fast_sam_3dbody_capi.h"
+
 struct MHR_LBS_Data;
 struct BVH_MotionCapture;
 namespace fsb { struct MHRResult; }
 
-class BVHWriter
+class FSB_API BVHWriter
 {
 public:
     // Public because the static NAME_MAP table in bvh_writer.cpp tags each entry

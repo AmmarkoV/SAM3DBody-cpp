@@ -77,14 +77,28 @@ class FsbResult(ctypes.Structure):
 
 
 def load_library(lib_dir: str) -> ctypes.CDLL:
-    lib_path = os.path.join(lib_dir, "libfast_sam_3dbody.so")
+    is_windows = os.name == 'nt'
+    lib_name = "fast_sam_3dbody.dll" if is_windows else "libfast_sam_3dbody.so"
+    lib_path = os.path.join(lib_dir, lib_name)
     if not os.path.exists(lib_path):
         sys.exit(f"Library not found: {lib_path}\nBuild the project first.")
 
-    # Add the lib directory to LD_LIBRARY_PATH so transitive .so deps are found
-    prev = os.environ.get("LD_LIBRARY_PATH", "")
-    ort_lib = os.path.join(lib_dir, "onnxruntime_dl", "lib")
-    os.environ["LD_LIBRARY_PATH"] = ":".join(filter(None, [lib_dir, ort_lib, prev]))
+    # Add the lib directory and dependencies to PATH/LD_LIBRARY_PATH
+    if is_windows:
+        abs_lib_dir = os.path.abspath(lib_dir)
+        # On Windows, we need to add paths to the DLL search path
+        os.environ["PATH"] = abs_lib_dir + os.pathsep + os.environ.get("PATH", "")
+        # Also try AddDllDirectory for Python 3.8+ if available
+        if hasattr(os, 'add_dll_directory'):
+            try:
+                os.add_dll_directory(abs_lib_dir)
+            except Exception as e:
+                print(f"Warning: could not add DLL directory {abs_lib_dir}: {e}")
+            # Add ONNX Runtime and OpenCV if we know where they are (they were copied to Release)
+    else:
+        prev = os.environ.get("LD_LIBRARY_PATH", "")
+        ort_lib = os.path.join(lib_dir, "onnxruntime_dl", "lib")
+        os.environ["LD_LIBRARY_PATH"] = ":".join(filter(None, [lib_dir, ort_lib, prev]))
 
     lib = ctypes.CDLL(lib_path)
 

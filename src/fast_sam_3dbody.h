@@ -19,6 +19,8 @@
 #include <vector>
 #include <cstdint>
 
+#include "export_macros.h"
+
 namespace fsb {
 
 // ─── Output per detected person ──────────────────────────────────────────────
@@ -110,7 +112,7 @@ struct PipelineConfig {
 };
 
 // ─── Pipeline class ───────────────────────────────────────────────────────────
-class Pipeline {
+class FSB_API Pipeline {
 public:
     Pipeline();
     ~Pipeline();
