@@ -305,10 +305,37 @@ _make_symlink "${REPO_ROOT}/AmMatrix" \
     "${_RGBDA_DIR}/tools/AmMatrix"
 
 
+# ── Helper: drop a stale build cache when CUDA availability changed ────────────
+# CMake caches the CUDA-compiler probe. If a previous configure ran without nvcc
+# on PATH (failed/absent probe) and nvcc is available now — or vice-versa, or the
+# cached nvcc path no longer exists — the cache is stale and a reconfigure won't
+# re-detect CUDA. Wipe it in that case so the next cmake run probes fresh.
+_wipe_stale_cuda_cache() {
+    local cache="${BUILD_DIR}/CMakeCache.txt"
+    [[ -f "${cache}" ]] || return 0
+
+    # What the cache recorded as the CUDA compiler (empty / *NOTFOUND if none).
+    local cached_cc
+    cached_cc="$(grep -E '^CMAKE_CUDA_COMPILER(:[A-Za-z]+)?=' "${cache}" 2>/dev/null | head -1 | cut -d= -f2-)"
+    local cached_have=0
+    [[ -n "${cached_cc}" && "${cached_cc}" != *NOTFOUND && -x "${cached_cc}" ]] && cached_have=1
+
+    # Whether a usable nvcc is on PATH now (PATH was fixed up at the top).
+    local now_have=0
+    command -v nvcc &>/dev/null && now_have=1
+
+    if [[ "${cached_have}" -ne "${now_have}" ]]; then
+        echo "  CUDA availability changed since last configure "
+        echo "  (cache nvcc=${cached_have}, now nvcc=${now_have}) — wiping stale ${cache}."
+        rm -f "${cache}"
+    fi
+}
+
 # ── C++ build ──────────────────────────────────────────────────────────────────
 if [[ "${SKIP_BUILD}" -eq 0 ]]; then
     echo ""
     echo "=== Building C++ library and CLI ==="
+    _wipe_stale_cuda_cache
     mkdir -p "${BUILD_DIR}"
 
     CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release"
