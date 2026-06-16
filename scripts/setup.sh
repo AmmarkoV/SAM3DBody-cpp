@@ -41,7 +41,7 @@ prompt_yn() {
 # scripts/ that shell out directly (downloadPretrained.sh etc.) keep working.
 SYSTEM_DEPENDENCIES="python3-pip python3-venv build-essential cmake git wget unzip \
     libjpeg-dev libpng-dev libzstd-dev liblz4-dev libpthread-stubs0-dev \
-    libopencv-dev libgl1-mesa-dev"
+    libopencv-dev libgl1-mesa-dev libglew-dev"
 
 for REQUIRED_PKG in $SYSTEM_DEPENDENCIES; do
     PKG_OK=$(dpkg-query -W --showformat='${Status}\n' "$REQUIRED_PKG" 2>/dev/null | grep "install ok installed" || true)
