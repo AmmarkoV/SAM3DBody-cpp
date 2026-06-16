@@ -21,6 +21,16 @@
 
 set -euo pipefail
 
+# ── Local environment fixups ───────────────────────────────────────────────────
+# Some machines have CUDA / pip-installed binaries that aren't on PATH for this
+# shell (e.g. a fresh login, or .bashrc not sourced). Prepend the usual locations
+# so cmake/nvcc and pip-installed tools resolve even on an incorrectly set-up env.
+# Non-existent dirs on PATH/LD_LIBRARY_PATH are harmless (the shell and ld.so just
+# skip them). ${LD_LIBRARY_PATH:-} guards against `set -u` aborting when unset.
+export PATH=/usr/local/cuda/bin:$PATH
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
+export PATH="$HOME/.local/bin:$PATH"
+
 # ── Helper: yes/no prompt ──────────────────────────────────────────────────────
 prompt_yn() {
     local msg="$1"
