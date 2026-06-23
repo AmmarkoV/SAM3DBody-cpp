@@ -4,7 +4,8 @@ THISDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$THISDIR"
 cd ..
 
-# Put the bundled TensorRT libs on LD_LIBRARY_PATH so --trt works (no-op otherwise).
+# Activate project venv and put TensorRT libs on LD_LIBRARY_PATH (both no-op if not set up).
+source "$THISDIR/../tools/project_env.sh"
 source "$THISDIR/../tools/trt_env.sh"
 
 ./build/fast_sam_3dbody_run --onnx-dir ./onnx --gguf ./onnx/pipeline.gguf --yolo ./onnx/yolo.onnx --from /dev/video0 $@ # > /tmp/render_raw.txt 

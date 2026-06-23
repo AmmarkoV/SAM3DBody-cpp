@@ -91,7 +91,17 @@ option(SAM3D_TENSORRT
 # CUDA  (optional – enables ONNX Runtime CUDA EP and ggml CUDA backend)
 # ---------------------------------------------------------------------------
 find_package(CUDAToolkit QUIET)
-if(CUDAToolkit_FOUND)
+# CUDAToolkit can report FOUND on just the runtime libs while nvcc is missing
+# from PATH; enable_language(CUDA) would then hard-error with "No
+# CMAKE_CUDA_COMPILER could be found". So feed it the nvcc that ships with the
+# toolkit we found, then probe with check_language() and only enable CUDA if a
+# working compiler is actually present — otherwise degrade to a CPU-only build.
+include(CheckLanguage)
+if(CUDAToolkit_FOUND AND NOT CMAKE_CUDA_COMPILER AND CUDAToolkit_NVCC_EXECUTABLE)
+    set(CMAKE_CUDA_COMPILER "${CUDAToolkit_NVCC_EXECUTABLE}")
+endif()
+check_language(CUDA)
+if(CUDAToolkit_FOUND AND CMAKE_CUDA_COMPILER)
     set(CMAKE_CUDA_ARCHITECTURES "86" CACHE STRING "CUDA architectures" FORCE)
     enable_language(CUDA)
     set(GGML_CUDA     ON  CACHE BOOL "" FORCE)
@@ -101,7 +111,12 @@ if(CUDAToolkit_FOUND)
 else()
     set(GGML_CUDA OFF CACHE BOOL "" FORCE)
     set(WITH_CUDA OFF)
-    message(STATUS "CUDA not found – CPU-only build")
+    if(CUDAToolkit_FOUND)
+        message(STATUS "CUDA toolkit found but no nvcc compiler – CPU-only build "
+                       "(put /usr/local/cuda/bin on PATH and re-run to enable CUDA)")
+    else()
+        message(STATUS "CUDA not found – CPU-only build")
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------

@@ -1,39 +1,174 @@
 #!/usr/bin/env bash
 # fast_sam_3dbody_cpp/setup.sh
 #
-# 1. Build the C++ shared library and CLI (cmake + make).
-# 2. Create a Python venv with the packages required by both Python frontends:
+# 1. Install system dependencies (apt) and NVIDIA/CUDA stack if needed.
+# 2. Download ONNX/GGUF/LBS models from HuggingFace (into onnx/).
+# 3. Build the C++ shared library and CLI (cmake + make).
+# 4. Create a Python venv with the packages required by both Python frontends:
 #      fast_sam_3dbody_frontend.py      – needs only opencv-python + numpy
 #      fast_sam_3dbody_frontend-3D.py   – also needs torch, pyrender, roma, etc.
 #
-# Usage (from repo root or from fast_sam_3dbody_cpp/):
-#   bash fast_sam_3dbody_cpp/setup.sh
-#   bash fast_sam_3dbody_cpp/setup.sh --cuda-arch 89        # RTX 4090
-#   bash fast_sam_3dbody_cpp/setup.sh --ort-dir /opt/onnxruntime
-#   bash fast_sam_3dbody_cpp/setup.sh --cpu-only            # no CUDA torch
-#   bash fast_sam_3dbody_cpp/setup.sh --skip-build          # venv only
-#   bash fast_sam_3dbody_cpp/setup.sh --skip-venv           # build only
-#   bash fast_sam_3dbody_cpp/setup.sh -j 4                  # limit make jobs
+# Usage (from repo root):
+#   bash scripts/setup.sh
+#   bash scripts/setup.sh --cuda-arch 89        # RTX 4090
+#   bash scripts/setup.sh --ort-dir /opt/onnxruntime
+#   bash scripts/setup.sh --cpu-only            # no CUDA torch
+#   bash scripts/setup.sh --cpu-backbone        # download fp32 backbone (CPU inference)
+#   bash scripts/setup.sh --skip-models         # skip model download
+#   bash scripts/setup.sh --skip-build          # venv only
+#   bash scripts/setup.sh --skip-venv           # build only
+#   bash scripts/setup.sh -j 4                  # limit make jobs
 
 set -euo pipefail
 
+# ── Local environment fixups ───────────────────────────────────────────────────
+# Some machines have CUDA / pip-installed binaries that aren't on PATH for this
+# shell (e.g. a fresh login, or .bashrc not sourced). Prepend the usual locations
+# so cmake/nvcc and pip-installed tools resolve even on an incorrectly set-up env.
+# Non-existent dirs on PATH/LD_LIBRARY_PATH are harmless (the shell and ld.so just
+# skip them). ${LD_LIBRARY_PATH:-} guards against `set -u` aborting when unset.
+export PATH=/usr/local/cuda/bin:$PATH
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
+export PATH="$HOME/.local/bin:$PATH"
 
+# ── Helper: yes/no prompt ──────────────────────────────────────────────────────
+prompt_yn() {
+    local msg="$1"
+    while true; do
+        read -rp "$msg [y/N] " yn
+        case "${yn,,}" in
+            y|yes) return 0 ;;
+            n|no|"") return 1 ;;
+        esac
+    done
+}
+
+# ── System dependency check ────────────────────────────────────────────────────
+# Simple dependency checker that will apt-get stuff if something is missing.
+# Note: wget and unzip are now OPTIONAL — the new tools.py wrappers use the
+# Python stdlib (urllib + zipfile) first and only fall back to these binaries
+# if the stdlib path fails. They remain in the list so existing scripts under
+# scripts/ that shell out directly (downloadPretrained.sh etc.) keep working.
+SYSTEM_DEPENDENCIES="python3-pip python3-venv build-essential cmake git wget unzip \
+    libjpeg-dev libpng-dev libzstd-dev liblz4-dev libpthread-stubs0-dev \
+    libopencv-dev libgl1-mesa-dev libglew-dev"
+
+for REQUIRED_PKG in $SYSTEM_DEPENDENCIES; do
+    PKG_OK=$(dpkg-query -W --showformat='${Status}\n' "$REQUIRED_PKG" 2>/dev/null | grep "install ok installed" || true)
+    echo "Checking for $REQUIRED_PKG: ${PKG_OK:-missing}"
+    if [ "" = "$PKG_OK" ]; then
+        echo "No $REQUIRED_PKG. Installing all missing dependencies now …"
+        sudo apt-get install -y $SYSTEM_DEPENDENCIES
+        break
+    fi
+done
+
+# ── NVIDIA GPU detection and optional CUDA/cuDNN setup ────────────────────────
+NVIDIA_GPU=$(lspci 2>/dev/null | grep "NVIDIA" || true)
+if [ -n "$NVIDIA_GPU" ]; then
+    echo
+    echo "Detected NVIDIA GPU: $NVIDIA_GPU"
+    echo
+
+    # -- cuDNN 9 (required by ONNX Runtime 1.20.1 CUDA EP) --------------------
+    # libcudnn9-cuda-12 lives in the NVIDIA CUDA apt repo, not the Ubuntu
+    # default repo.  Check whether it is known to apt before trying to install.
+    CUDNN_PKG="libcudnn9-cuda-12"
+    CUDNN_OK=$(dpkg-query -W --showformat='${Status}\n' "$CUDNN_PKG" 2>/dev/null | grep "install ok installed" || true)
+    if [ -n "$CUDNN_OK" ]; then
+        echo "cuDNN 9 already installed — skipping."
+    else
+        CUDNN_AVAILABLE=$(apt-cache show "$CUDNN_PKG" 2>/dev/null | grep "^Package:" || true)
+        if [ -n "$CUDNN_AVAILABLE" ]; then
+            if prompt_yn "Install $CUDNN_PKG (required for GPU inference)?"; then
+                sudo apt-get install -y "$CUDNN_PKG"
+                sudo ldconfig
+            fi
+        else
+            echo "Note: $CUDNN_PKG not found in apt sources."
+            echo "      GPU inference needs cuDNN 9. To add the NVIDIA CUDA repo and"
+            echo "      install it, answer 'y' to the CUDA toolkit prompt below, then"
+            echo "      re-run this script."
+        fi
+    fi
+
+    # -- NVIDIA drivers (optional) --------------------------------------------
+    DRIVER_OK=$(dpkg-query -W --showformat='${Status}\n' nvidia-driver* 2>/dev/null | grep "install ok installed" || true)
+    if [ -n "$DRIVER_OK" ]; then
+        echo "NVIDIA driver already installed — skipping."
+    elif prompt_yn "Install NVIDIA drivers (nvidia-driver, Vulkan, nvtop)?"; then
+        sudo add-apt-repository -y ppa:graphics-drivers/ppa
+        sudo apt-get update
+        sudo apt-get install -y nvidia-driver-595-open libglew-dev nvtop freeglut3-dev \
+            vulkan-tools vulkan-utility-libraries-dev
+        POLKIT_HELPER="/usr/share/screen-resolution-extra/nvidia-polkit"
+        [ -f "$POLKIT_HELPER" ] && sudo chmod u+x "$POLKIT_HELPER"
+    fi
+
+    # -- CUDA toolkit (optional, also adds the repo that provides cuDNN 9) ----
+    CUDA_OK=$(dpkg-query -W --showformat='${Status}\n' cuda-toolkit-12-6 2>/dev/null | grep "install ok installed" || true)
+    if [ -n "$CUDA_OK" ]; then
+        echo "CUDA toolkit already installed — skipping."
+    elif prompt_yn "Install NVIDIA CUDA toolkit 12.6 (adds NVIDIA apt repo, enables cuDNN 9)?"; then
+        # Derive the NVIDIA repo dir from the Ubuntu release (e.g. 24.04 -> ubuntu2404).
+        # We don't pin the keyring SHA: NVIDIA re-publishes the deb (so a pin goes
+        # stale) and it's a different file per release. The download is over HTTPS
+        # from developer.download.nvidia.com, and once installed the keyring makes
+        # apt GPG-verify every package pulled from the repo — that's the real trust
+        # anchor, not a checksum on this one bootstrap deb.
+        UBUNTU_VER_ID="$(. /etc/os-release 2>/dev/null && echo "${VERSION_ID:-}")"
+        if [ -z "$UBUNTU_VER_ID" ]; then
+            echo "WARNING: could not detect Ubuntu version — defaulting to 24.04 repo." >&2
+            UBUNTU_VER_ID="24.04"
+        fi
+        CUDA_REPO_DIR="ubuntu${UBUNTU_VER_ID//./}"
+        CUDA_KEYRING_DEB="cuda-keyring_1.1-1_all.deb"
+        CUDA_KEYRING_URL="https://developer.download.nvidia.com/compute/cuda/repos/$CUDA_REPO_DIR/x86_64/$CUDA_KEYRING_DEB"
+
+        if wget -q -O "/tmp/$CUDA_KEYRING_DEB" "$CUDA_KEYRING_URL"; then
+            sudo dpkg -i "/tmp/$CUDA_KEYRING_DEB"
+            sudo apt-get update
+            sudo apt-get install -y cuda-libraries-dev-12-6 cuda-toolkit-12-6
+            grep -q 'cuda/bin' ~/.bashrc || echo 'export PATH=/usr/local/cuda/bin:$PATH' >> ~/.bashrc
+            grep -q 'cuda/lib64' ~/.bashrc || echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> ~/.bashrc
+            # Now that the NVIDIA repo is registered, offer cuDNN 9 if we skipped it above
+            if [ -z "$CUDNN_OK" ] && apt-cache show "$CUDNN_PKG" &>/dev/null; then
+                if prompt_yn "NVIDIA repo now available — install $CUDNN_PKG?"; then
+                    sudo apt-get install -y "$CUDNN_PKG"
+                    sudo ldconfig
+                fi
+            fi
+        else
+            echo "WARNING: could not download CUDA keyring from $CUDA_KEYRING_URL" >&2
+            echo "         (no NVIDIA repo for '$CUDA_REPO_DIR'?) — skipping CUDA install." >&2
+        fi
+    fi
+fi
+
+# ── Setup paths ────────────────────────────────────────────────────────────────
 THISDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$THISDIR"
 cd ..
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../" && pwd)"
-BUILD_DIR="${SCRIPT_DIR}/../build"
-VENV_DIR="${SCRIPT_DIR}/../venv"
+REPO_ROOT="$(pwd)"
+BUILD_DIR="${REPO_ROOT}/build"
+VENV_DIR="${REPO_ROOT}/venv"
+ONNX_DIR="${REPO_ROOT}/onnx"
+
+HF_BASE="https://huggingface.co/AmmarkoV/SAM3DBody-cpp-onnx-models/resolve/main"
+HF_ZIP_NAME="SAM3DBody-cpp-onnx-models.zip"
+HF_ZIP_URL="${HF_BASE}/${HF_ZIP_NAME}"
 
 # ── Defaults ───────────────────────────────────────────────────────────────────
 CUDA_ARCH=""
 ORT_DIR=""
 TORCH_INDEX="https://download.pytorch.org/whl/cu124"
-JOBS=$(nproc 2>/dev/null || echo 4)
+JOBS=$(( ($(nproc 2>/dev/null || echo 4) + 1) / 2 ))   # half the cores to keep system responsive
 SKIP_BUILD=0
 SKIP_VENV=0
+SKIP_MODELS=0
+CPU_BACKBONE=0
 
 # ── Parse args ─────────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -43,23 +178,102 @@ while [[ $# -gt 0 ]]; do
         --ort-dir)      ORT_DIR="$2";              shift 2 ;;
         --ort-dir=*)    ORT_DIR="${1#*=}";         shift ;;
         --cpu-only)     TORCH_INDEX="https://download.pytorch.org/whl/cpu"; shift ;;
+        --cpu-backbone) CPU_BACKBONE=1;            shift ;;
+        --skip-models)  SKIP_MODELS=1;             shift ;;
         --skip-build)   SKIP_BUILD=1;              shift ;;
         --skip-venv)    SKIP_VENV=1;               shift ;;
         -j)             JOBS="$2";                 shift 2 ;;
         -j*)            JOBS="${1#-j}";            shift ;;
         -h|--help)
-            grep '^#' "${BASH_SOURCE[0]}" | head -20 | sed 's/^# \?//'
+            sed -n '2,/^[^#]/{ /^[^#]/q; s/^# \?//p }' "${BASH_SOURCE[0]}"
             exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
 
+# ── Helper: download with resume support ───────────────────────────────────────
+_download() {
+    local url="$1" dest="$2" desc="${3:-}"
+    [[ -n "$desc" ]] && echo "  Downloading ${desc} …"
+    if command -v wget &>/dev/null; then
+        wget --continue --show-progress -q -O "${dest}" "${url}"
+    elif command -v curl &>/dev/null; then
+        curl -L --continue-at - --progress-bar -o "${dest}" "${url}"
+    else
+        echo "ERROR: neither wget nor curl found. Install one and retry." >&2
+        exit 1
+    fi
+}
 
+# ── Check for required model files ────────────────────────────────────────────
+_models_present() {
+    local required=( backbone.onnx decoder.onnx yolo.onnx pipeline.gguf body_model.lbs )
+    for f in "${required[@]}"; do
+        [[ -f "${ONNX_DIR}/${f}" ]] || return 1
+    done
+    return 0
+}
+
+# ── Model download ─────────────────────────────────────────────────────────────
+if [[ "${SKIP_MODELS}" -eq 0 ]]; then
+    echo "=== Checking models in ${ONNX_DIR} ==="
+    if _models_present; then
+        echo "  All required model files found — skipping download."
+        echo "  (Pass --skip-models to suppress this check, or delete onnx/ to re-download.)"
+    else
+        echo "  Models not found. Downloading from HuggingFace (~5 GB)…"
+        echo "  Source: ${HF_ZIP_URL}"
+        echo ""
+
+        mkdir -p "${ONNX_DIR}"
+        _ZIP_TMP="${REPO_ROOT}/${HF_ZIP_NAME}"
+
+        if [[ -f "${_ZIP_TMP}" ]]; then
+            echo "  Found existing partial/complete zip at ${_ZIP_TMP} — attempting resume."
+        fi
+
+        _download "${HF_ZIP_URL}" "${_ZIP_TMP}" "${HF_ZIP_NAME}"
+
+        echo "  Extracting ${HF_ZIP_NAME} …"
+        if command -v unzip &>/dev/null; then
+            unzip -o "${_ZIP_TMP}" -d "${REPO_ROOT}"
+        else
+            echo "ERROR: unzip not found. Install it (e.g. sudo apt install unzip) and retry." >&2
+            exit 1
+        fi
+
+        # The zip extracts to onnx/ at repo root
+        if _models_present; then
+            echo "  Extraction OK. Removing zip archive …"
+            rm -f "${_ZIP_TMP}"
+        else
+            echo "WARNING: Extraction finished but some model files are still missing." >&2
+            echo "         Zip kept at ${_ZIP_TMP} for inspection." >&2
+        fi
+    fi
+
+    # Optional: CPU-compatible fp32 backbone (for machines without CUDA)
+    if [[ "${CPU_BACKBONE}" -eq 1 ]]; then
+        echo ""
+        echo "=== Downloading fp32 backbone (CPU inference) ==="
+        for _f in backbone_fp32.onnx "backbone_fp32.onnx.data"; do
+            if [[ -f "${ONNX_DIR}/${_f}" ]]; then
+                echo "  ${_f} already present — skipping."
+            else
+                _download "${HF_BASE}/${_f}" "${ONNX_DIR}/${_f}" "${_f}"
+            fi
+        done
+        echo ""
+        echo "  To use the CPU backbone, run:"
+        echo "    ./build/fast_sam_3dbody_run --onnx-dir ./onnx --backbone backbone_fp32.onnx --cuda -1 --from <input>"
+    fi
+fi
 
 # ── External dependency: RGBDAcquisition ───────────────────────────────────────
 _RGBDA_REPO="https://github.com/AmmarkoV/RGBDAcquisition"
-_RGBDA_DIR="RGBDAcquisition"
+_RGBDA_DIR="${REPO_ROOT}/RGBDAcquisition"
 
+echo ""
 echo "=== Setting up RGBDAcquisition ==="
 if [[ -d "${_RGBDA_DIR}/.git" ]]; then
     echo "  Repository already exists — pulling latest …"
@@ -85,25 +299,52 @@ _make_symlink() {
     fi
 }
 
-_make_symlink "GraphicsEngine" \
+_make_symlink "${REPO_ROOT}/GraphicsEngine" \
     "${_RGBDA_DIR}/opengl_acquisition_shared_library/opengl_depth_and_color_renderer/src/Library"
-_make_symlink "AmMatrix" \
+_make_symlink "${REPO_ROOT}/AmMatrix" \
     "${_RGBDA_DIR}/tools/AmMatrix"
 
 
+# ── Helper: drop a stale build cache when CUDA availability changed ────────────
+# CMake caches the CUDA-compiler probe. If a previous configure ran without nvcc
+# on PATH (failed/absent probe) and nvcc is available now — or vice-versa, or the
+# cached nvcc path no longer exists — the cache is stale and a reconfigure won't
+# re-detect CUDA. Wipe it in that case so the next cmake run probes fresh.
+_wipe_stale_cuda_cache() {
+    local cache="${BUILD_DIR}/CMakeCache.txt"
+    [[ -f "${cache}" ]] || return 0
 
+    # What the cache recorded as the CUDA compiler (empty / *NOTFOUND if none).
+    local cached_cc
+    cached_cc="$(grep -E '^CMAKE_CUDA_COMPILER(:[A-Za-z]+)?=' "${cache}" 2>/dev/null | head -1 | cut -d= -f2-)"
+    local cached_have=0
+    [[ -n "${cached_cc}" && "${cached_cc}" != *NOTFOUND && -x "${cached_cc}" ]] && cached_have=1
+
+    # Whether a usable nvcc is on PATH now (PATH was fixed up at the top).
+    local now_have=0
+    command -v nvcc &>/dev/null && now_have=1
+
+    if [[ "${cached_have}" -ne "${now_have}" ]]; then
+        echo "  CUDA availability changed since last configure "
+        echo "  (cache nvcc=${cached_have}, now nvcc=${now_have}) — wiping stale ${cache}."
+        rm -f "${cache}"
+    fi
+}
 
 # ── C++ build ──────────────────────────────────────────────────────────────────
 if [[ "${SKIP_BUILD}" -eq 0 ]]; then
+    echo ""
     echo "=== Building C++ library and CLI ==="
+    _wipe_stale_cuda_cache
     mkdir -p "${BUILD_DIR}"
 
     CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release"
     [[ -n "${CUDA_ARCH}" ]] && CMAKE_ARGS+=" -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH}"
     [[ -n "${ORT_DIR}" ]]   && CMAKE_ARGS+=" -DONNX_RUNTIME_DIR=${ORT_DIR}"
 
-    cmake -S "${SCRIPT_DIR}" -B "${BUILD_DIR}" ${CMAKE_ARGS}
-    cmake --build "${BUILD_DIR}" -- -j"${JOBS}"
+    cmake -S "${REPO_ROOT}" -B "${BUILD_DIR}" ${CMAKE_ARGS}
+    # nice -n 10: lower CPU priority; -j half-cores: leaves headroom for the rest of the system
+    nice -n 10 cmake --build "${BUILD_DIR}" -- -j"${JOBS}"
 
     echo ""
     echo "Build outputs:"
@@ -115,6 +356,14 @@ fi
 # ── Python venv ────────────────────────────────────────────────────────────────
 if [[ "${SKIP_VENV}" -eq 0 ]]; then
     echo ""
+    if [[ -f "${VENV_DIR}/bin/activate" ]]; then
+        echo "=== Python venv already exists at ${VENV_DIR} — skipping creation. ==="
+        echo "    Delete the venv directory and re-run to recreate it."
+        SKIP_VENV=1
+    fi
+fi
+
+if [[ "${SKIP_VENV}" -eq 0 ]]; then
     echo "=== Creating Python venv at ${VENV_DIR} ==="
 
     python3 -m venv "${VENV_DIR}"
@@ -144,19 +393,39 @@ if [[ "${SKIP_VENV}" -eq 0 ]]; then
     echo "Venv ready: ${VENV_DIR}"
 fi
 
+# ── Optional: TensorRT fast path ──────────────────────────────────────────────
+if [ -n "${NVIDIA_GPU:-}" ]; then
+    echo ""
+    TRT_INSTALLED=0
+    if ls "${REPO_ROOT}/venv"/lib/python*/site-packages/tensorrt_libs/libnvinfer.so.10 >/dev/null 2>&1; then
+        TRT_INSTALLED=1
+    fi
+    if [ "$TRT_INSTALLED" -eq 1 ]; then
+        echo "TensorRT runtime already set up (venv/) — skipping."
+    elif prompt_yn "Set up TensorRT fast path (~2.1 GB libs + ~1.7 GB models, ~1.6× speedup)?"; then
+        bash "${REPO_ROOT}/tools/setup_trt.sh" --yes
+    else
+        echo "Skipped. Run 'tools/setup_trt.sh' later to enable --trt."
+    fi
+fi
+
 # ── Done ───────────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Setup complete ==="
 echo ""
-echo "Activate the venv, then run from the repo root:"
+echo "Quick start:"
+echo ""
+echo "  # Live webcam (CUDA):"
+echo "  ./scripts/webcam.sh"
+echo ""
+echo "  # Process a video file:"
+echo "  ./scripts/video.sh --from your_video.mp4"
+echo ""
+echo "  # Activate the venv for Python frontends:"
 echo "  source ${VENV_DIR}/bin/activate"
-echo "  cd ${REPO_ROOT}"
 echo ""
 echo "  # Lightweight frontend (2D skeleton only):"
-echo "  python fast_sam_3dbody_cpp/fast_sam_3dbody_frontend.py --from assets/teaser.png"
+echo "  python fast_sam_3dbody_frontend.py --from assets/teaser.png"
 echo ""
 echo "  # 3D frontend (full mesh rendering):"
-echo "  python fast_sam_3dbody_cpp/fast_sam_3dbody_frontend-3D.py --from assets/teaser.png"
-echo ""
-echo "Models must be prepared first (once, from the repo root with the original venv active):"
-echo "  python fast_sam_3dbody_cpp/prepare_models.py --checkpoint ./checkpoints/sam-3d-body-dinov3"
+echo "  python fast_sam_3dbody_frontend-3D.py --from assets/teaser.png"

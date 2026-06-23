@@ -18,6 +18,16 @@
 #include <map>
 #include <unordered_map>
 
+// cv::QRCodeDetector's decode API (detectAndDecode / detectAndDecodeMulti) is
+// only present when OpenCV was built with the bundled "quirc" QR decoder.  Some
+// distro/source builds ship a QRCodeDetector stripped of those members, which
+// fails to compile with "QRCodeDetector has no member named detectAndDecode".
+// Build with -DSAM_HAVE_OPENCV_QR=0 on such an OpenCV: ArUco markers still work,
+// only the optional QR timecode payload is skipped.
+#ifndef SAM_HAVE_OPENCV_QR
+#  define SAM_HAVE_OPENCV_QR 1
+#endif
+
 namespace mv
 {
 
@@ -71,7 +81,9 @@ struct ArucoQrDetector::Impl
 {
     cv::Ptr<cv::aruco::Dictionary>        dict;
     cv::Ptr<cv::aruco::DetectorParameters> params;
+#if SAM_HAVE_OPENCV_QR
     cv::QRCodeDetector                    qr;
+#endif
 
     double                 default_len;
     std::map<int,double>   len_by_id;
@@ -168,9 +180,11 @@ void ArucoQrDetector::process(const cv::Mat& bgr, FrameDetections& out)
     }
     cv::Mat gray;
     cv::cvtColor(*aruco_bgr, gray, cv::COLOR_BGR2GRAY);
+#if SAM_HAVE_OPENCV_QR
     cv::Mat raw_gray;
     if (impl_->rectify) cv::cvtColor(bgr, raw_gray, cv::COLOR_BGR2GRAY);
     else                raw_gray = gray;
+#endif
 
     // ── ArUco markers + per-id pose ──────────────────────────────────────────
     std::vector<int>                       ids;
@@ -193,6 +207,7 @@ void ArucoQrDetector::process(const cv::Mat& bgr, FrameDetections& out)
         out.markers.push_back(m);
     }
 
+#if SAM_HAVE_OPENCV_QR
     // ── QR codes (multi first, then single fallback; swallow OpenCV errors) ──
     // We only need the decoded payload, not the QR's geometry, so detect on a
     // downscaled gray — QRCodeDetector is the per-frame bottleneck on high-res
@@ -207,6 +222,10 @@ void ArucoQrDetector::process(const cv::Mat& bgr, FrameDetections& out)
     }
 
     bool any = false;
+    // detectAndDecodeMulti was added in OpenCV 4.3.0; on older OpenCV (e.g. the
+    // 4.2 that ships with ROS Noetic on Ubuntu 22.04) only the single-QR
+    // detectAndDecode below is available.
+#if CV_VERSION_MAJOR > 4 || (CV_VERSION_MAJOR == 4 && CV_VERSION_MINOR >= 3)
     try
     {
         std::vector<std::string> infos;
@@ -215,6 +234,7 @@ void ArucoQrDetector::process(const cv::Mat& bgr, FrameDetections& out)
             if (!s.empty()) { QrDet q; parse_qr_kv(s, q); out.qrs.push_back(q); any = true; }
     }
     catch (const cv::Exception&) { /* fall through to single */ }
+#endif
 
     if (!any)
     {
@@ -225,6 +245,7 @@ void ArucoQrDetector::process(const cv::Mat& bgr, FrameDetections& out)
         }
         catch (const cv::Exception&) { /* skip QR this frame */ }
     }
+#endif // SAM_HAVE_OPENCV_QR
 }
 
 } // namespace mv

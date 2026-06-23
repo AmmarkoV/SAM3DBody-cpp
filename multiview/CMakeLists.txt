@@ -42,6 +42,31 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# Probe whether cv::QRCodeDetector actually exposes its decode API.  It is only
+# compiled in when OpenCV was built with the bundled "quirc" decoder; some
+# distro/source builds ship a QRCodeDetector without detectAndDecode, which
+# breaks the QR-timecode path.  Auto-detect so aruco_qr.cpp degrades to ArUco-
+# only on such OpenCV instead of failing to compile.
+# ---------------------------------------------------------------------------
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_INCLUDES ${OpenCV_INCLUDE_DIRS})
+set(CMAKE_REQUIRED_LIBRARIES ${OpenCV_LIBS})
+check_cxx_source_compiles("
+    #include <opencv2/objdetect.hpp>
+    int main() {
+        cv::QRCodeDetector qr;
+        cv::Mat img;
+        (void)qr.detectAndDecode(img);
+        return 0;
+    }" SAM_HAVE_OPENCV_QR)
+unset(CMAKE_REQUIRED_INCLUDES)
+unset(CMAKE_REQUIRED_LIBRARIES)
+if(NOT SAM_HAVE_OPENCV_QR)
+    message(STATUS "  multiview: cv::QRCodeDetector lacks decode API (OpenCV built without quirc) — "
+                   "QR timecode detection disabled; ArUco pose still works.")
+endif()
+
+# ---------------------------------------------------------------------------
 # aruco_qr — ArUco pose + QR timecode detection (needs the opencv_contrib aruco
 # module).  Gated on MULTIVIEW_HAVE_ARUCO; every tool that links it is gated too.
 # ---------------------------------------------------------------------------
@@ -49,6 +74,7 @@ if(MULTIVIEW_HAVE_ARUCO)
     add_library(multiview_aruco_qr STATIC aruco_qr.cpp)
     target_include_directories(multiview_aruco_qr PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${OpenCV_INCLUDE_DIRS})
     target_link_libraries(multiview_aruco_qr PUBLIC multiview_calib ${OpenCV_LIBS})
+    target_compile_definitions(multiview_aruco_qr PRIVATE SAM_HAVE_OPENCV_QR=$<BOOL:${SAM_HAVE_OPENCV_QR}>)
     target_compile_options(multiview_aruco_qr PRIVATE
         $<$<CXX_COMPILER_ID:GNU,Clang>:-O2 -Wall -Wextra>
     )
