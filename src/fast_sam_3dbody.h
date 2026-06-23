@@ -58,6 +58,10 @@ struct MHRResult {
     std::vector<float> keypoints_3d;   // [70 × 3]     3-D joints
     std::vector<float> keypoints_2d;   // [70 × 2]     projected 2-D
 
+    // Full MHR skeleton joint positions (see src/mhr_joint_table.h for names/order)
+    // [127 × 3], same camera coordinate system as keypoints_3d (y,z negated, metres).
+    std::vector<float> skeleton_3d;    // [127 × 3]
+
     // 2-D YOLO keypoints: 17 COCO joints × [x, y, confidence], image pixel coords
     std::vector<float> keypoints_yolo; // [17 × 3]   always populated if YOLO ran
 

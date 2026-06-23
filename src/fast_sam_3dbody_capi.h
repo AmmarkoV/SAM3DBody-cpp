@@ -75,6 +75,14 @@ typedef struct {
     // Layout: [0:3]=global_trans*10, [3:6]=global_rot ZYX, [6:136]=body_pose[:130],
     //         [136:204]=scale_out.  Mirrors Python mhr_forward(..., return_model_params=True).
     float mhr_model_params[204];
+
+    // ── Full MHR skeleton (appended at END to preserve older ctypes layouts) ────
+    // 127 joint world positions in the same coordinate frame as kps_3d (y,z
+    // negated, metres).  Joint names/order are in src/mhr_joint_table.h.  This
+    // exposes joints absent from the 70 keypoints — notably root (≈pelvis) and
+    // c_spine0..c_spine3.  All zero and has_skel=0 when skip_body_model=1.
+    float skel_3d[381];     // [127 × 3]
+    int   has_skel;
 } FsbResult;
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────

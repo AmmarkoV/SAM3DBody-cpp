@@ -1109,6 +1109,10 @@ struct Pipeline::Impl
                         }
                     }
 
+                    // Keep the full 127-joint skeleton (incl. root / c_spine0..3)
+                    // for consumers that need joints absent from the 70 keypoints.
+                    r.skeleton_3d = joint_coords;
+
                     // Apply keypoint_mapping: sparse matrix-vector multiply
                     // [vertices(18439*3) + joints(127*3)] → keypoints_3d[70*3]
                     const float* verts_ptr = r.pred_vertices.data();

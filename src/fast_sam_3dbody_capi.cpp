@@ -99,6 +99,12 @@ extern "C" {
                 out.has_kps = 1;
             }
 
+            if (!r.skeleton_3d.empty())
+            {
+                copy_vec(out.skel_3d, r.skeleton_3d, 381);
+                out.has_skel = 1;
+            }
+
             // ── Second-pass raw fields ─────────────────────────────────────────
             // pred_pose_raw[266]: global_rot_6d[6] + body_cont[260], needed by
             // the Python second-pass to reconstruct prev_estimate for forward_decoder.
