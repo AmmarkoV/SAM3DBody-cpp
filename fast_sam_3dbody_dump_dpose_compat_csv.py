@@ -322,6 +322,144 @@ def write_skeleton_rows_to_csv(rows: list, csv_path: str) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Legacy CSV writers  (mirror D-PoSE tools.py, single skeleton-0 per frame)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def get_azure_kinect_skeleton() -> list:
+    """Joint order for the Azure-Kinect-style legacy CSV (D-PoSE tools.py)."""
+    return [
+        "pelvis", "spine1", "spine2", "neck",
+        "left_collar", "left_shoulder", "left_elbow", "left_wrist",
+        "left_hand_middle1", "left_hand_middle4", "left_hand_thumb4",
+        "right_collar", "right_shoulder", "right_elbow", "right_wrist",
+        "right_hand_middle1", "right_hand_middle4", "right_hand_thumb4",
+        "left_hip", "left_knee", "left_ankle", "left_foot",
+        "right_hip", "right_knee", "right_ankle", "right_foot",
+        "head_jaw", "head", "head_left_eye", "head_left_ear",
+        "head_right_eye", "head_right_ear",
+    ]
+
+
+def save_csv_list_of_dicts(filename: str, history: list) -> None:
+    """Legacy 3DPoints.csv format: header <joint>_3DX,_3DY,_3DZ, one frame/row."""
+    labels = []
+    for frame in history:
+        for label in frame:
+            if label not in labels:
+                labels.append(label)
+
+    directory = os.path.dirname(filename)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    with open(filename, "w") as f:
+        for col, label in enumerate(labels):
+            if col > 0:
+                f.write(",")
+            f.write(f"{label}_3DX,{label}_3DY,{label}_3DZ")
+        f.write("\n")
+        for frame in history:
+            for col, label in enumerate(labels):
+                if col > 0:
+                    f.write(",")
+                if label in frame:
+                    x, y, z = frame[label][:3]
+                    f.write(f"{x:f},{y:f},{z:f}")
+                else:
+                    f.write("0,0,0")
+            f.write("\n")
+    print(f"[INFO] Legacy CSV saved to {filename}  ({len(history)} frame(s))")
+
+
+def save_csv_skeleton_order(filename: str, history: list, skeleton: list) -> None:
+    """Legacy CSV with joint columns in a fixed skeleton order (missing → 0,0,0)."""
+    directory = os.path.dirname(filename)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    with open(filename, "w") as f:
+        for i, joint in enumerate(skeleton):
+            if i > 0:
+                f.write(",")
+            f.write(f"{joint}_3DX,{joint}_3DY,{joint}_3DZ")
+        f.write("\n")
+        for frame in history:
+            for i, joint in enumerate(skeleton):
+                if i > 0:
+                    f.write(",")
+                if joint in frame:
+                    c = frame[joint]
+                    f.write(f"{c[0]:.6f},{c[1]:.6f},{c[2]:.6f}")
+                else:
+                    f.write("0,0,0")
+            f.write("\n")
+    print(f"[INFO] Legacy skeleton-order CSV saved to {filename}  ({len(history)} frame(s))")
+
+
+def save_json(obj, filename: str) -> None:
+    import json
+    directory = os.path.dirname(filename)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(filename, "w") as f:
+        json.dump(obj, f, indent=4)
+    print(f"[INFO] JSON saved to {filename}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Frame helpers  (mirror D-PoSE scale_and_embed_frame + a 2-D overlay)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def scale_and_embed_frame(frame, target_w=1280, target_h=720):
+    """Resize + letterbox-pad a frame into a fixed target_w×target_h canvas."""
+    h, w = frame.shape[:2]
+    scale = min(target_w / w, target_h / h)
+    new_w, new_h = int(w * scale), int(h * scale)
+    resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+    pad_x, pad_y = (target_w - new_w) // 2, (target_h - new_h) // 2
+    canvas[pad_y:pad_y + new_h, pad_x:pad_x + new_w] = resized
+    return canvas
+
+
+def draw_overlay(frame, results, n, hud):
+    """Draw projected 2-D keypoints + bbox + HUD on a copy of the frame."""
+    vis = frame.copy()
+    for i in range(n):
+        r = results[i]
+        x1, y1, x2, y2 = (int(v) for v in r.bbox)
+        cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 200, 0), 1, cv2.LINE_AA)
+        if r.has_kps:
+            kps = np.array(r.kps_2d, dtype=np.float32).reshape(70, 2)
+            for px, py in kps:
+                cv2.circle(vis, (int(px), int(py)), 2, (0, 0, 255), -1, cv2.LINE_AA)
+    cv2.putText(vis, hud, (10, 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2, cv2.LINE_AA)
+    return vis
+
+
+def encode_video_from_jpgs(folder, framerate, width, height):
+    """ffmpeg the saved colorFrame_0_*.jpg into livelastRun3DHiRes.mp4, then delete them."""
+    import glob
+    import subprocess
+    out_mp4 = os.path.join(folder, "livelastRun3DHiRes.mp4")
+    cmd = [
+        "ffmpeg", "-framerate", str(framerate), "-start_number", "1",
+        "-i", os.path.join(folder, "colorFrame_0_%05d.jpg"),
+        "-s", f"{width}x{height}", "-y", "-r", str(framerate),
+        "-pix_fmt", "yuv420p", "-threads", "8", out_mp4,
+    ]
+    try:
+        subprocess.run(cmd, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for jpg in glob.glob(os.path.join(folder, "colorFrame_0_*.jpg")):
+            os.remove(jpg)
+        print(f"[INFO] Video saved to {out_mp4}")
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        print(f"[WARN] ffmpeg encode failed ({e}); leaving jpgs in {folder}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Capture helper (mirror D-PoSE getCaptureDeviceFromPath for /dev/videoX, files)
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -356,9 +494,15 @@ def parse_args():
     p.add_argument("--output_folder", type=str, default="demo_images/results",
                    help="Folder where 3DPoints.csv is written")
     p.add_argument("--save", action=argparse.BooleanOptionalAction,
-                   help="Also write per-frame CSVs (skeleton_XXXXX.csv)")
+                   help="Also write per-frame CSV+JSON, save colorFrame jpgs and "
+                        "ffmpeg them into livelastRun3DHiRes.mp4")
     p.add_argument("--display", action="store_true",
                    help="Show the video window while processing")
+    p.add_argument("--no-letterbox", dest="letterbox", action="store_false",
+                   help="Disable the D-PoSE 1280x720 letterbox; run at native size")
+    p.add_argument("--width",     type=int, default=1280, help="Letterbox canvas width")
+    p.add_argument("--height",    type=int, default=720,  help="Letterbox canvas height")
+    p.add_argument("--framerate", type=int, default=30,   help="ffmpeg output fps for --save")
 
     # SAM-3D-Body specific paths / params
     p.add_argument("--lib-dir",       default=build)
@@ -408,6 +552,8 @@ def main():
         sys.exit("Pipeline load failed")
     print("Pipeline ready.\n")
 
+    os.makedirs(args.output_folder, exist_ok=True)
+
     MAX_RESULTS = max(args.max_skeletons if args.max_skeletons > 0 else 32, 32)
     ResultArray = FsbResult * MAX_RESULTS
     results_buf = ResultArray()
@@ -418,6 +564,7 @@ def main():
         sys.exit(f"Cannot open input: {args.input}")
 
     skeleton_rows = []     # all (frame, skeleton) rows across the run
+    history       = []     # skeleton-0 joint dict per frame (legacy CSV / JSON)
     frame_number  = 0
     fps_ema       = 0.0
     prev_t        = time.perf_counter()
@@ -435,6 +582,12 @@ def main():
                 break
         frame_number += 1
 
+        # D-PoSE-style letterbox to a fixed canvas before inference.
+        if args.letterbox:
+            frame = scale_and_embed_frame(frame, args.width, args.height)
+
+        # fsb_process_bgr requires a contiguous buffer.
+        frame   = np.ascontiguousarray(frame)
         H, W    = frame.shape[:2]
         bgr_ptr = frame.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
 
@@ -449,21 +602,27 @@ def main():
                 row = _skeleton_dict_to_csv_row(joint_dict, frame_number, i)
                 skeleton_rows.append(row)
                 frame_rows.append(row)
-
-        if args.save and frame_rows:
-            write_skeleton_rows_to_csv(
-                frame_rows, os.path.join(args.output_folder, "skeleton_%05u.csv" % frame_number))
+                if i == 0:
+                    history.append(joint_dict)
 
         now     = time.perf_counter()
         fps_ema = 0.1 / (now - prev_t) + 0.9 * fps_ema
         prev_t  = now
 
+        hud = f"FPS {fps_ema:.1f} | {inf_ms:.0f} ms | {n} person(s) | frame {frame_number}"
+
+        if args.save:
+            if frame_rows:
+                write_skeleton_rows_to_csv(
+                    frame_rows, os.path.join(args.output_folder, "skeleton_%05u.csv" % frame_number))
+                save_json(history[-1] if history else {},
+                          os.path.join(args.output_folder, "skeleton_%05u.json" % frame_number))
+            # colorFrame jpg (with overlay) for the output video.
+            cv2.imwrite(os.path.join(args.output_folder, "colorFrame_0_%05d.jpg" % frame_number),
+                        draw_overlay(frame, results_buf, n, hud))
+
         if args.display:
-            vis = frame.copy()
-            hud = f"FPS {fps_ema:.1f} | {inf_ms:.0f} ms | {n} person(s) | frame {frame_number}"
-            cv2.putText(vis, hud, (10, 28),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2, cv2.LINE_AA)
-            cv2.imshow("SAM-3D-Body → D-PoSE CSV", vis)
+            cv2.imshow("SAM-3D-Body → D-PoSE CSV", draw_overlay(frame, results_buf, n, hud))
             if (cv2.waitKey(1 if not is_image else 0) & 0xFF) in (ord("q"), 27):
                 break
 
@@ -482,6 +641,17 @@ def main():
 
     out_csv = os.path.join(args.output_folder, "3DPoints.csv")
     write_skeleton_rows_to_csv(skeleton_rows, out_csv)
+
+    # Legacy CSV variants + history JSON (mirror D-PoSE demo_webcam.py outputs).
+    save_csv_list_of_dicts(os.path.join(args.output_folder, "3DPoints_legacy.csv"), history)
+    save_csv_skeleton_order(os.path.join(args.output_folder, "3DPointsAzureKinect_legacy.csv"),
+                            history, get_azure_kinect_skeleton())
+    save_json(history, os.path.join(args.output_folder, "mhr_history.json"))
+
+    # Encode the saved colorFrame jpgs into a video, then remove them.
+    if args.save:
+        encode_video_from_jpgs(args.output_folder, args.framerate, W, H)
+
     print(f"\nDone. {frame_number} frame(s) processed, {len(skeleton_rows)} skeleton row(s).")
 
 
