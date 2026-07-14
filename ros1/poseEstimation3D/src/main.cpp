@@ -56,6 +56,11 @@ static double      g_camRollDeg  = -90.0;
 static double      g_camPitchDeg =   0.0;
 static double      g_camYawDeg   = -90.0;
 
+// Frame counters + the topic we subscribed to, shared with the watchdog timer:
+// they turn "nothing is happening" into a statement about which half is stuck.
+static std::string   g_rgbTopic;
+static unsigned long g_framesIn = 0, g_framesOK = 0, g_framesFailed = 0;
+
 static AmmClient_Instance* g_client = 0;
 static ros::Publisher      g_skelPub;   // Float32MultiArray (numeric)
 static ros::Publisher      g_rawPub;    // String (lossless SAM3D text)
@@ -111,9 +116,25 @@ static char* recvHttpResponse(AmmClient_Instance* inst,
     return 0;
 }
 
+// Without this, a node that never receives an image logs nothing at all and is
+// indistinguishable from one that is working: every message below lives inside
+// the callback.  Note it shares the spin thread with rgbCallback, so if it goes
+// quiet *after* the POST line, the callback itself is blocked.
+static void watchdogCallback(const ros::TimerEvent&)
+{
+    if (g_framesIn == 0) {
+        ROS_WARN("[poseEstimation3D] no images received on '%s' yet — check: rostopic hz %s "
+                 "(nothing published? wrong topic name? publisher on another machine with ROS_IP unset?)",
+                 g_rgbTopic.c_str(), g_rgbTopic.c_str());
+    }
+}
+
 // ── Main per-frame callback ──────────────────────────────────────────────────
 static void rgbCallback(const sensor_msgs::ImageConstPtr& msg)
 {
+    ++g_framesIn;
+    ROS_INFO_ONCE("[poseEstimation3D] first image received — subscription is live");
+
     // 1. ROS image -> BGR cv::Mat
     cv::Mat bgr;
     try {
@@ -132,9 +153,18 @@ static void rgbCallback(const sensor_msgs::ImageConstPtr& msg)
         return;
     }
 
-    // 3. POST to the server, read the SAM3D text response
+    // 3. POST to the server, read the SAM3D text response.
+    //    This round trip is synchronous and the socket is blocking: connect()
+    //    ignores SO_SNDTIMEO, so an unreachable server can stall this callback
+    //    (and with it ros::spin()) for ~2min with nothing logged.  Announce the
+    //    attempt first, so a freeze is attributable instead of looking like idle.
+    ROS_INFO_ONCE("[poseEstimation3D] POSTing first frame (%u KB) to %s:%d …",
+                  (unsigned int)(jpeg.size() / 1024), g_serverHost.c_str(), g_serverPort);
+    const ros::WallTime tSend = ros::WallTime::now();
+
     if (!AmmClient_SendFile(g_client, "/infer", "uploadedfile", "f.jpg", "image/jpeg",
                             (const char*)jpeg.data(), (unsigned int)jpeg.size(), /*keepAlive=*/1)) {
+        ++g_framesFailed;
         ROS_WARN_THROTTLE(5.0, "[poseEstimation3D] send to %s:%d failed",
                           g_serverHost.c_str(), g_serverPort);
         return;
@@ -142,7 +172,18 @@ static void rgbCallback(const sensor_msgs::ImageConstPtr& msg)
     static std::vector<char> rbuf(1 << 20);
     unsigned int bodyLen = 0;
     char* body = recvHttpResponse(g_client, rbuf, &bodyLen);
-    if (!body) { ROS_WARN_THROTTLE(5.0, "[poseEstimation3D] no response body"); return; }
+    if (!body) {
+        ++g_framesFailed;
+        ROS_WARN_THROTTLE(5.0, "[poseEstimation3D] no response body");
+        return;
+    }
+
+    ++g_framesOK;
+    const double rttMs = (ros::WallTime::now() - tSend).toSec() * 1000.0;
+    ROS_INFO_ONCE("[poseEstimation3D] first response OK (%u bytes, %.0f ms) — pipeline is working",
+                  bodyLen, rttMs);
+    ROS_INFO_THROTTLE(5.0, "[poseEstimation3D] images in=%lu  posted OK=%lu  failed=%lu  rtt=%.0f ms",
+                      g_framesIn, g_framesOK, g_framesFailed, rttMs);
 
     const ros::Time stamp = msg->header.stamp.isZero() ? ros::Time::now() : msg->header.stamp;
 
@@ -262,12 +303,30 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    // AmmClient_Initialize hands back an instance even when its TCP connect
+    // failed, so connectionOK is the only way to tell whether we actually
+    // reached the server.  Say so out loud: AmmClient itself only reports this
+    // on raw stderr, which is easy to miss under roslaunch.
+    if (g_client->connectionOK) {
+        ROS_INFO("[poseEstimation3D] TCP connect to %s:%d OK",
+                 g_serverHost.c_str(), g_serverPort);
+    } else {
+        ROS_ERROR("[poseEstimation3D] TCP connect to %s:%d FAILED — server not running, "
+                  "or the port is not reachable from this host. Check from here with: "
+                  "nc -vz %s %d  (instant 'refused' = wrong host/port or server down; "
+                  "a long hang = firewall DROP, which also blocks each frame ~2min)",
+                  g_serverHost.c_str(), g_serverPort, g_serverHost.c_str(), g_serverPort);
+    }
+
     g_skelPub = nh.advertise<std_msgs::Float32MultiArray>(g_nodeName + "/skeleton", 10);
     g_rawPub  = nh.advertise<std_msgs::String>(g_nodeName + "/raw", 10);
 
     // queue size 1 = drop-latest: while we block on the synchronous HTTP round
     // trip, intermediate camera frames are dropped so we stay real-time.
     ros::Subscriber sub = nh.subscribe(fromRGBTopic, 1, rgbCallback);
+
+    g_rgbTopic = fromRGBTopic;
+    ros::Timer watchdog = nh.createTimer(ros::Duration(5.0), watchdogCallback);
 
     ROS_INFO("[poseEstimation3D] server=%s:%d  image=%s  mode=%s  tfRoot=%s camera=%s",
              g_serverHost.c_str(), g_serverPort, fromRGBTopic.c_str(),
