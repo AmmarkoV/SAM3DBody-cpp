@@ -3,20 +3,34 @@
   poseEstimation3D — stream an RGB topic to a remote sam_3dbody_net server and
   republish the skeleton as TF + Float32MultiArray.
 
-  On the GPU box, start the server first (note: --jlocal for the oriented TF tree):
-      ./build/sam_3dbody_net --server --port 8080 --jlocal
+  On the GPU box, start the server first; it needs the jlocal flag for the
+  oriented TF tree.  See this package's README.md for the exact command line
+  (it cannot be spelled out here: a double hyphen is illegal inside an XML
+  comment and makes roslaunch fail to parse the whole file).
 -->
 <launch>
+  <!-- Set from the command line, e.g.
+         ./run_it.sh serverHost:=10.160.50.175 serverPort:=8085 fromRGBTopic:=/head_front_camera/color/image_raw
+       A <param value="..."> cannot be set this way: roslaunch only feeds
+       name:=value into args, so these have to be declared to be settable.
+       serverHost/serverPort have no default on purpose: there is no address
+       that is right on every machine, and a wrong one fails silently (the node
+       dials it, the real server never sees a connection).  Omitting either now
+       stops roslaunch instead. -->
+  <arg name="serverHost"   doc="IP of the machine running sam_3dbody_net (required)" />
+  <arg name="serverPort"   doc="port sam_3dbody_net was started with (required)" />
+  <arg name="fromRGBTopic" default="/camera/rgb/image_raw" />
+
   <node name="poseEstimation3D" pkg="poseEstimation3D" type="poseEstimation3D" output="screen" respawn="true">
 
     <!-- Where the GPU pose server is -->
-    <param name="serverHost"        value="127.0.0.1" />
-    <param name="serverPort"        value="8080" />
+    <param name="serverHost"        value="$(arg serverHost)" />
+    <param name="serverPort"        value="$(arg serverPort)" />
     <param name="socketTimeout"     value="10" />
     <param name="jpegQuality"       value="80" />
 
     <!-- Robot camera image topic (sensor_msgs/Image, BGR/RGB) -->
-    <param name="fromRGBTopic"      value="/camera/rgb/image_raw" />
+    <param name="fromRGBTopic"      value="$(arg fromRGBTopic)" />
 
     <!-- TF frames -->
     <param name="tfRoot"            value="map" />
@@ -24,7 +38,7 @@
     <param name="personFramePrefix" value="p" />          <!-- p0/&lt;joint&gt;, p1/&lt;joint&gt; -->
     <param name="publishCameraTF"   value="1" />
 
-    <!-- 0 = full oriented tree from JLOCAL (server needs --jlocal)
+    <!-- 0 = full oriented tree from JLOCAL (server needs the jlocal flag)
          1 = positions-only frames from KP3D (server needs the body model) -->
     <param name="useSimple3DPointTF" value="0" />
 

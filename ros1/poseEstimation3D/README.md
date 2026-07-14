@@ -45,10 +45,10 @@ cd ~/catkin_ws && catkin_make && source devel/setup.bash
 ## Run
 
 ```bash
-# uses launch/poseEstimation3D.launch defaults; override any param with name:=value
+# serverHost and serverPort are required; roslaunch stops if either is missing.
 roslaunch poseEstimation3D poseEstimation3D.launch \
-    serverHost:=192.168.1.50 fromRGBTopic:=/xtion/rgb/image_raw
-# or:  ./run_it.sh serverHost:=192.168.1.50
+    serverHost:=192.168.1.50 serverPort:=8080 fromRGBTopic:=/xtion/rgb/image_raw
+# or:  ./run_it.sh serverHost:=192.168.1.50 serverPort:=8080
 rviz   # add a TF display to see the skeleton(s)
 ```
 
@@ -56,7 +56,7 @@ rviz   # add a TF display to see the skeleton(s)
 
 | Param | Default | Meaning |
 |---|---|---|
-| `serverHost` / `serverPort` | `127.0.0.1` / `8080` | GPU pose server address |
+| `serverHost` / `serverPort` | *(required)* | GPU pose server address |
 | `fromRGBTopic` | `/camera/rgb/image_raw` | input `sensor_msgs/Image` topic |
 | `jpegQuality` | `80` | upload JPEG quality |
 | `tfRoot` | `map` | parent of the camera frame |
