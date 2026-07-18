@@ -94,13 +94,14 @@ def segment(image_path, server, prompt, max_side):
     return encoded[:, :, 2], scale   # OpenCV is BGR, so [:, :, 2] is the id channel
 
 
-def boxes_from_json(instances, scale, min_box_px, pad_frac, img_w, img_h):
+def boxes_from_json(instances, scale, min_box_px, pad_frac, img_w, img_h, min_fill):
     """One box per instance from the server's JSON, in full-resolution pixels."""
-    raw = [(i["bbox"][0], i["bbox"][1], i["bbox"][2], i["bbox"][3]) for i in instances]
-    return _finish_boxes(raw, scale, min_box_px, pad_frac, img_w, img_h)
+    raw = [(i["bbox"][0], i["bbox"][1], i["bbox"][2], i["bbox"][3], i.get("area", 0))
+           for i in instances]
+    return _finish_boxes(raw, scale, min_box_px, pad_frac, img_w, img_h, min_fill)
 
 
-def boxes_from_id_channel(ids, scale, min_box_px, pad_frac, img_w, img_h):
+def boxes_from_id_channel(ids, scale, min_box_px, pad_frac, img_w, img_h, min_fill):
     """One box per instance id, mapped back to full-resolution pixels.
 
     The server hands back a *lossy WebP*, so the id channel arrives corrupted:
@@ -128,18 +129,30 @@ def boxes_from_id_channel(ids, scale, min_box_px, pad_frac, img_w, img_h):
             dropped += 1
             continue
         bx, by, bw_, bh_ = stats[big, :4]
-        boxes.append((bx, by, bx + bw_, by + bh_))
+        boxes.append((bx, by, bx + bw_, by + bh_, int(stats[big, cv2.CC_STAT_AREA])))
 
     if dropped:
         print(f"[sam3] dropped {dropped} speckle-only instances")
-    return _finish_boxes(boxes, scale, min_box_px, pad_frac, img_w, img_h)
+    return _finish_boxes(boxes, scale, min_box_px, pad_frac, img_w, img_h, min_fill)
 
 
-def _finish_boxes(raw, scale, min_box_px, pad_frac, img_w, img_h):
+def _finish_boxes(raw, scale, min_box_px, pad_frac, img_w, img_h, min_fill):
     """Scale segmentation-space boxes to full resolution, pad, clip, filter."""
     boxes = []
     dropped = 0
-    for bx1, by1, bx2, by2 in raw:
+    degenerate = 0
+    for bx1, by1, bx2, by2, area in raw:
+        # Drop masks that cover only a sliver of their own bounding box.  SAM3
+        # occasionally returns a degenerate instance — on DSC_2856 a 1873x110
+        # strip across 92% of the frame at 2% fill.  The crop step squares the
+        # box up, so that one becomes a crop of the entire crowd and the model
+        # fits a single giant body to it.  Real people fill >= 0.12 of their box
+        # even when heavily occluded, so this separates cleanly.
+        box_area = (bx2 - bx1 + 1) * (by2 - by1 + 1)
+        if box_area > 0 and area > 0 and area / box_area < min_fill:
+            degenerate += 1
+            continue
+
         x1, x2 = bx1 / scale, bx2 / scale
         y1, y2 = by1 / scale, by2 / scale
 
@@ -158,6 +171,8 @@ def _finish_boxes(raw, scale, min_box_px, pad_frac, img_w, img_h):
             continue
         boxes.append((x1, y1, x2, y2))
 
+    if degenerate:
+        print(f"[sam3] dropped {degenerate} degenerate masks (fill < {min_fill})")
     if dropped:
         print(f"[sam3] dropped {dropped} instances smaller than {min_box_px}px")
     return boxes
@@ -174,6 +189,11 @@ def main():
                     help="Skip instances whose padded box is smaller than this")
     ap.add_argument("--pad-frac", type=float, default=0.08,
                     help="Grow each mask-tight box by this fraction per side")
+    ap.add_argument("--min-fill", type=float, default=0.10,
+                    help="Drop instances whose mask fills less than this fraction of "
+                         "its own bounding box. Catches degenerate SAM3 masks (wide "
+                         "thin strips) that would otherwise be cropped as one giant "
+                         "person. 0 disables.")
     ap.add_argument("--batch", type=int, default=8,
                     help="Solve at most N people per renderer pass (0 = all at once). "
                          "The backbone puts every crop into a single ONNX run, so a "
@@ -192,9 +212,11 @@ def main():
 
     seg, scale = segment(args.image, args.server, args.prompt, args.max_side)
     if isinstance(seg, list):
-        boxes = boxes_from_json(seg, scale, args.min_box_px, args.pad_frac, img_w, img_h)
+        boxes = boxes_from_json(seg, scale, args.min_box_px, args.pad_frac,
+                                img_w, img_h, args.min_fill)
     else:
-        boxes = boxes_from_id_channel(seg, scale, args.min_box_px, args.pad_frac, img_w, img_h)
+        boxes = boxes_from_id_channel(seg, scale, args.min_box_px, args.pad_frac,
+                                      img_w, img_h, args.min_fill)
     print(f"[sam3] {len(boxes)} person boxes")
     if not boxes:
         sys.exit("No person instances returned — nothing to solve.")
