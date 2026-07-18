@@ -597,6 +597,9 @@ int main(int argc, const char** argv) {
     bool use_trt      = false;
     bool fp16         = true;
     bool zero_face    = true;
+    std::string boxes_path;  // --boxes: external person boxes, one "x1 y1 x2 y2" per line
+    float  focal_x    = 0.f; // --fx: camera focal x in pixels (0 = pipeline default)
+    float  focal_y    = 0.f; // --fy: camera focal y in pixels (0 = pipeline default)
     int    render_w   = 0;   // GL window width  (0 = match input)
     int    render_h   = 0;   // GL window height (0 = match input)
     int    cap_w      = 0;   // capture width  (0 = driver default)
@@ -622,6 +625,9 @@ int main(int argc, const char** argv) {
         A1("--lbs",         lbs_path,           std::string)
         A1("--save-frames", save_frames_prefix, std::string)
         A1("--export-mesh", export_mesh_prefix, std::string)
+        A1("--fx",          focal_x,            std::stof)
+        A1("--fy",          focal_y,            std::stof)
+        A1("--boxes",       boxes_path,         std::string)
 #undef A1
         if (!strcmp(argv[i], "--export-mesh-stride") && i+1 < argc) {
             export_mesh_stride = std::stoi(argv[++i]);
@@ -703,6 +709,29 @@ int main(int argc, const char** argv) {
         cfg.detector        = detector;
         cfg.person_thresh   = cc.person_thresh;   // honour --detector-threshold / per-detector default
         cfg.person_nms_iou  = cc.person_nms_iou;
+        // Left at 0 the pipeline uses the image diagonal, which is the focal the
+        // decoder/FFN was trained against.  Overriding with a real camera focal
+        // (e.g. from EXIF) changes condition_info, so it is opt-in only.
+        cfg.focal_x         = focal_x;
+        cfg.focal_y         = focal_y;
+        // --boxes: plain text, one "x1 y1 x2 y2" per line, original image pixels.
+        // Blank lines and '#' comments are skipped.  Deliberately not JSON —
+        // there is no JSON dependency in the C++ tree and this is written by a
+        // single producer (scripts/sam3_solve.py).
+        if (!boxes_path.empty()) {
+            FILE* bf = fopen(boxes_path.c_str(), "r");
+            if (!bf) { fprintf(stderr, "Cannot open --boxes file: %s\n", boxes_path.c_str()); return 1; }
+            char line[256];
+            while (fgets(line, sizeof(line), bf)) {
+                if (line[0] == '#' || line[0] == '\n') continue;
+                float b[4];
+                if (sscanf(line, "%f %f %f %f", &b[0], &b[1], &b[2], &b[3]) == 4)
+                    cfg.external_boxes.push_back({b[0], b[1], b[2], b[3]});
+            }
+            fclose(bf);
+            printf("[boxes] loaded %zu external person boxes from %s\n",
+                   cfg.external_boxes.size(), boxes_path.c_str());
+        }
         cfg.skip_body_model = true;    // LBS runs natively in C; skip body_model.onnx
         if (!pipeline.load(cfg)) {
             fprintf(stderr, "Failed to load pipeline\n"); return 1;

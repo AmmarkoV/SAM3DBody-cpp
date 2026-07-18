@@ -103,6 +103,14 @@ struct PipelineConfig {
     enum DetectorKind { DET_YOLO_POSE = 0, DET_LIBREYOLO = 1 /*, DET_YMAPNET = 2 */ };
     int  detector        = DET_YOLO_POSE; // 0 = YOLO11-pose (default), 1 = LibreYOLO (YOLOv9 bbox)
 
+    // Externally-supplied person boxes (x1,y1,x2,y2 in original image pixels).
+    // When non-empty the internal detector is skipped entirely and these are
+    // used verbatim.  Lets a stronger external segmenter (e.g. SAM3) drive the
+    // pipeline on crowded frames where YOLO's 640x640 letterbox loses small
+    // people.  No keypoints come with them, which is the same has_kps = false
+    // path DET_LIBREYOLO already takes.
+    std::vector<std::array<float,4>> external_boxes;
+
     // Camera intrinsics – set to 0 to use default (fx = image_width)
     float focal_x = 0.f;
     float focal_y = 0.f;

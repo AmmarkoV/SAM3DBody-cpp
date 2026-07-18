@@ -617,7 +617,19 @@ struct Pipeline::Impl
         auto t0 = Clock::now();
         std::vector<PersonDet> dets;
 
-        if (sess_yolo.session)
+        if (!cfg.external_boxes.empty())
+        {
+            // External boxes replace detection outright; they are already in
+            // original-image pixels so no letterbox reversal is needed.
+            for (const auto& b : cfg.external_boxes)
+            {
+                PersonDet d;
+                d.x1 = b[0]; d.y1 = b[1]; d.x2 = b[2]; d.y2 = b[3];
+                d.conf = 1.f;
+                dets.push_back(d);
+            }
+        }
+        else if (sess_yolo.session)
         {
             // YOLO11 input: 640×640.
             // We must match Ultralytics YOLO's default preprocessing (LetterBox):
