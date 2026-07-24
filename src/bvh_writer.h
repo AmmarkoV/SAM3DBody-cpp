@@ -42,6 +42,17 @@ public:
 
     void write_frame(const std::vector<fsb::MHRResult>& results);
 
+    // ── Live streaming (webcam → robot; see GMR.md / scripts/webcam_gmr.sh) ──
+    // Emit ONE BVH motion line for a single tracked person, using the exact same
+    // per-joint rotation decomposition as write_frame (fill_motion_row) — but
+    // without buffering, the close-time OFFSET rewrite, or the foot-contact pass
+    // (all whole-clip operations).  `out` receives space-separated channel values
+    // in the template's channel order (root translation in cm + per-joint Euler
+    // degrees), i.e. exactly one BVH MOTION frame line.  The caller assembles
+    // header + line into a 1-frame BVH for GMR's loader.  Requires the writer to
+    // be open() with a valid lbs_path; returns false otherwise.
+    bool stream_frame_line(const fsb::MHRResult& r, std::string& out);
+
     // Same as write_frame, but the caller supplies the track IDs (e.g. from an
     // offline globally-optimal tracker) instead of relying on the internal
     // greedy IoU tracker.
@@ -208,6 +219,10 @@ private:
     std::vector<float> s_global_mhr_;   // per-joint accumulated scale (matches mhr_lbs_compute)
     std::vector<float> q_global_mhr_rest_;
 
+    // Live streaming scratch (stream_frame_line): current + previous motion row.
+    std::vector<float> stream_row_;
+    std::vector<float> stream_prev_row_;
+
     // Helpers
     bool  build_slots();
     void  compute_per_frame_mhr_state(const fsb::MHRResult& r);
@@ -215,6 +230,15 @@ private:
     // Append a row using the CURRENT q_global_mhr_ (assumes it is already
     // populated); only r.pred_cam_t is read.  append_frame_for = compute + this.
     void  append_row_from_state(PerPerson& p, const fsb::MHRResult& r);
+    // Fill one motion row (total_channels_ floats) from the CURRENT q_global_mhr_
+    // state into `row`.  prev_row is the previous frame (for sticky-hand mode;
+    // nullptr = none).  bone_samples, when non-null, receives per-slot live bone
+    // vectors for the close-time OFFSET rewrite (null for the streaming path,
+    // which never rewrites offsets).  Shared by append_row_from_state (buffered)
+    // and stream_frame_line (live).
+    void  fill_motion_row(float* row, const fsb::MHRResult& r,
+                          const float* prev_row,
+                          std::vector<std::vector<float>>* bone_samples);
     void  pad_continuation_frame(PerPerson& p);
     void  rewrite_offsets_for(PerPerson& p);
     void  foot_contact_pass(PerPerson& p);

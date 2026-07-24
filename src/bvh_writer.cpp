@@ -1168,6 +1168,19 @@ void BVHWriter::append_row_from_state(PerPerson& p, const fsb::MHRResult& r)
     p.motion.insert(p.motion.end(), total_channels_, 0.f);
     float* row = p.motion.data() + (size_t)p.frame_count * total_channels_;
 
+    // Previous frame row (for sticky hand mode).
+    const float* prev_row = (p.frame_count > 0)
+        ? p.motion.data() + (size_t)(p.frame_count - 1) * total_channels_
+        : nullptr;
+
+    fill_motion_row(row, r, prev_row, &p.bone_samples);
+    ++p.frame_count;
+}
+
+void BVHWriter::fill_motion_row(float* row, const fsb::MHRResult& r,
+                                const float* prev_row,
+                                std::vector<std::vector<float>>* bone_samples)
+{
     unsigned int saved_frames = mc_->numberOfFrames;
     float*       saved_buf    = mc_->motionValues;
     unsigned int saved_size   = mc_->motionValuesSize;
@@ -1181,11 +1194,6 @@ void BVHWriter::append_row_from_state(PerPerson& p, const fsb::MHRResult& r)
         qconj(inv_rest, &q_global_mhr_rest_[m * 4]);
         qmul(out, &q_global_mhr_[m * 4], inv_rest);
     };
-
-    // Previous frame row (for sticky hand mode).
-    const float* prev_row = (p.frame_count > 0)
-        ? p.motion.data() + (size_t)(p.frame_count - 1) * total_channels_
-        : nullptr;
 
     for (size_t i = 0; i < slots_.size(); ++i)
     {
@@ -1343,7 +1351,8 @@ void BVHWriter::append_row_from_state(PerPerson& p, const fsb::MHRResult& r)
         }
 
         // Sample live bone vector for the OFFSET rewrite (length-only at close).
-        if (!s.is_root && s.ancestor_mhr_idx >= 0)
+        // Streaming skips this (bone_samples == nullptr): no close-time rewrite.
+        if (bone_samples && !s.is_root && s.ancestor_mhr_idx >= 0)
         {
             const int mp = s.ancestor_mhr_idx;
             float dv_world[3] =
@@ -1358,7 +1367,7 @@ void BVHWriter::append_row_from_state(PerPerson& p, const fsb::MHRResult& r)
             qrot(dv_local, inv_cur, dv_world);
             float dv_rest[3];
             qrot(dv_rest, &q_global_mhr_rest_[mp*4], dv_local);
-            auto& vec = p.bone_samples[i];
+            auto& vec = (*bone_samples)[i];
             vec.push_back(dv_rest[0]);
             vec.push_back(dv_rest[1]);
             vec.push_back(dv_rest[2]);
@@ -1368,7 +1377,36 @@ void BVHWriter::append_row_from_state(PerPerson& p, const fsb::MHRResult& r)
     mc_->numberOfFrames   = saved_frames;
     mc_->motionValues     = saved_buf;
     mc_->motionValuesSize = saved_size;
-    ++p.frame_count;
+}
+
+// ── Live streaming: one MOTION line for a single tracked person ─────────────
+// Reuses compute_per_frame_mhr_state + fill_motion_row (the exact write_frame
+// decomposition).  No buffering, no OFFSET rewrite, no foot-contact pass — those
+// are whole-clip operations the live path deliberately skips (see GMR.md §5:
+// lafan_mhr.bvh OFFSETs already equal the MHR rest skeleton, and GMR height-
+// auto-scales).  stream_prev_row_ carries the previous row so sticky-hand mode
+// still works frame-to-frame.
+bool BVHWriter::stream_frame_line(const fsb::MHRResult& r, std::string& out)
+{
+    if (!is_open()) return false;
+
+    compute_per_frame_mhr_state(r);
+
+    stream_row_.assign((size_t)total_channels_, 0.0f);
+    const float* prev = stream_prev_row_.empty() ? nullptr : stream_prev_row_.data();
+    fill_motion_row(stream_row_.data(), r, prev, nullptr);
+
+    out.clear();
+    char buf[32];
+    for (int c = 0; c < total_channels_; ++c)
+    {
+        int n = snprintf(buf, sizeof(buf), c ? " %.4f" : "%.4f", stream_row_[c]);
+        out.append(buf, (size_t)n);
+    }
+
+    stream_prev_row_ = stream_row_;   // seed next frame's sticky-hand reference
+    ++session_frames_;
+    return true;
 }
 
 void BVHWriter::pad_continuation_frame(PerPerson& p)

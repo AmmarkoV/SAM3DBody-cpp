@@ -864,6 +864,18 @@ Outputs land in `gmr_out/<videoname>/`. Needs an X display (wrap with `xvfb-run`
 if headless). See **[GMR.md](GMR.md)** for the design, tuning, and the calibration
 tools in `tools/gmr_*.py`.
 
+For a **live** webcam → robot loop (causal, no disk), stream per-frame instead:
+
+```bash
+# webcam → live retargeted G1 in a MuJoCo viewer (Ctrl-C to stop)
+scripts/webcam_gmr.sh 0 unitree_g1
+```
+
+The live binary emits one BVH frame per tick (`--bvh-stream`) into
+`tools/gmr_stream.py`, which retargets each frame and drives a pluggable sink
+(MuJoCo viewer now; a Unitree-DDS sink stub for `unitree_mujoco` / real G1). See
+**[GMR.md](GMR.md)** → "Live webcam → robot (streaming)".
+
 ---
 
 ![SAM3DBody-cpp](doc/screen.jpg)

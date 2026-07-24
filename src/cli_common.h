@@ -119,6 +119,11 @@ struct CommonConfig
     bool        bvh_dump_rest_dirs             = false;   // --dump-rest-dirs
     bool        bvh_foot_contact               = false;   // --foot-contact
     bool        bvh_static_root                = false;   // --bvh-static-root
+    // Live streaming target: emit one BVH MOTION line per frame (single person)
+    // to this path ("-" = stdout).  Consumed by scripts/webcam_gmr.sh →
+    // tools/gmr_stream.py for the live webcam→robot pipeline.  Live binary only;
+    // the offline binary ignores it.
+    std::string bvh_stream_path;                          // --bvh-stream
 
     // ── Filtering knobs ─────────────────────────────────────────────────────
     // Defaults match the live binaries; the offline binary overrides
@@ -195,6 +200,7 @@ inline bool parse_common_arg(int argc, const char* const* argv, int& i,
     CLI_BOOL("--dump-rest-dirs",           bvh_dump_rest_dirs,             true)
     CLI_BOOL("--foot-contact",             bvh_foot_contact,               true)
     CLI_BOOL("--bvh-static-root",          bvh_static_root,                true)
+    CLI_STR ("--bvh-stream",               bvh_stream_path)
 
     // Filters
     CLI_FLT ("--bw-cutoff",            bw_cutoff)

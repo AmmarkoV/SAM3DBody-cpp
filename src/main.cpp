@@ -119,6 +119,9 @@ static void print_usage(const char* prog)
     printf("  --no-enforce-hand-limits    Disable the default finger-angle anatomical clamp\n");
     printf("  --no-sticky-hand-pose       Disable the default 'inherit previous frame's hand pose'\n");
     printf("  --bvh-static-root           Zero the root position and rotation each frame (in-place motion)\n");
+    printf("  --bvh-stream PATH           Live-stream one BVH MOTION line per frame to PATH ('-' = stdout,\n");
+    printf("                              prefixed '@F ') for the webcam->robot pipeline (scripts/webcam_gmr.sh).\n");
+    printf("                              Use with --bvh-template lafan_mhr.bvh --max-persons 1.\n");
     printf("  --headless        Do not open display windows\n");
     printf("  --info            Print pipeline info and exit\n");
     printf("  --butterworth              Apply Butterworth low-pass filter to MHR output vectors\n");
@@ -597,12 +600,33 @@ int main(int argc, char** argv)
     // -----------------------------------------------------------------------
     // Optional BVH output (deferred from above so the frame time matches FPS)
     // -----------------------------------------------------------------------
-    if (!c.bvh_path.empty())
+    // Live streaming target (webcam→robot).  Opened alongside / instead of a
+    // per-person BVH file: the writer is shared, but write_frame (buffered, one
+    // file per person) is only called when --bvh is set, and stream_frame_line
+    // only when --bvh-stream is set.  "-" streams to stdout (motion lines are
+    // prefixed "@F " so they are unambiguous against the diagnostic prints).
+    FILE* bvh_stream_fp = nullptr;
+    if (!c.bvh_stream_path.empty())
+    {
+        bvh_stream_fp = (c.bvh_stream_path == "-")
+                      ? stdout
+                      : fopen(c.bvh_stream_path.c_str(), "w");
+        if (!bvh_stream_fp)
+            fprintf(stderr, "[main] --bvh-stream: cannot open %s (streaming disabled).\n",
+                    c.bvh_stream_path.c_str());
+    }
+
+    if (!c.bvh_path.empty() || bvh_stream_fp)
     {
         // Auto-detect body_model.lbs from the onnx directory for finger animation
         std::string lbs_path = c.onnx_dir + "/body_model.lbs";
 
-        if (!bvh_writer.open(c.bvh_template, c.bvh_path,
+        // For a pure-streaming run --bvh may be empty; open() needs an out path
+        // for its buffered/close-time path but that path is never written when
+        // --bvh is unset (write_frame is gated below).  Pass bvh_path as-is.
+        const std::string out_path = c.bvh_path;
+
+        if (!bvh_writer.open(c.bvh_template, out_path,
                              1.0f / (float)source_fps,
                              lbs_path,
                              c.bvh_body_shape_change,
@@ -615,13 +639,19 @@ int main(int argc, char** argv)
                              c.bvh_dump_rest_dirs))
         {
             fprintf(stderr, "[main] BVH writer failed to open (continuing without BVH output).\n");
+            if (bvh_stream_fp && bvh_stream_fp != stdout) fclose(bvh_stream_fp);
+            bvh_stream_fp = nullptr;
         }
         else
         {
             bvh_writer.set_foot_contact(c.bvh_foot_contact);
             bvh_writer.set_static_root(c.bvh_static_root);
-            printf("[main] Writing BVH to: %s  (template: %s)\n",
-                   c.bvh_path.c_str(), c.bvh_template.c_str());
+            if (!c.bvh_path.empty())
+                printf("[main] Writing BVH to: %s  (template: %s)\n",
+                       c.bvh_path.c_str(), c.bvh_template.c_str());
+            if (bvh_stream_fp)
+                fprintf(stderr, "[main] Streaming BVH frames to: %s  (template: %s)\n",
+                        c.bvh_stream_path.c_str(), c.bvh_template.c_str());
         }
     }
 
@@ -801,9 +831,22 @@ int main(int argc, char** argv)
         if (csv_out.is_open())
             write_csv_rows(csv_out, frame_count, results);
 
-        // BVH
-        if (bvh_writer.is_open())
+        // BVH (buffered, one file per person at close) — only when --bvh is set.
+        if (bvh_writer.is_open() && !c.bvh_path.empty())
             bvh_writer.write_frame(results);
+
+        // BVH live stream (webcam→robot): one MOTION line for the top person,
+        // prefixed "@F " so it is unambiguous against stdout diagnostics.  When
+        // no one is detected we emit nothing — the consumer holds the last pose.
+        if (bvh_stream_fp && !results.empty())
+        {
+            std::string line;
+            if (bvh_writer.stream_frame_line(results[0], line))
+            {
+                fprintf(bvh_stream_fp, "@F %s\n", line.c_str());
+                fflush(bvh_stream_fp);
+            }
+        }
 
         // Visualization
         if (!c.headless)
@@ -852,6 +895,9 @@ int main(int argc, char** argv)
 
     if (bvh_writer.is_open())
         bvh_writer.close();
+
+    if (bvh_stream_fp && bvh_stream_fp != stdout)
+        fclose(bvh_stream_fp);
 
     pipeline.free();
     return 0;
