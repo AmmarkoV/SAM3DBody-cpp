@@ -75,6 +75,39 @@ TORCH_ARGS=()
     "imageio[ffmpeg]"
 "$PIP" install torch "${TORCH_ARGS[@]}"
 
+# ── SharedMemoryVideoBuffers: the live webcam→robot zero-copy transport ──────
+# scripts/webcam_gmr.sh can hand each frame's BVH channels to gmr_stream.py over
+# POSIX shared memory instead of an ASCII stdout pipe + per-frame temp .bvh file.
+# The C++ binary links this library's C source at build time (CMake picks it up
+# automatically when this checkout exists — Linux only); gmr_stream.py dlopens
+# the .so we build here via ctypes.  Clone + build are best-effort: if either
+# fails the pipeline silently falls back to the stdout/tempfile path.
+SHM_DIR="$REPO/SharedMemoryVideoBuffers"
+SHM_REPO="${SHM_REPO:-https://github.com/AmmarkoV/SharedMemoryVideoBuffers}"
+if [ "$(uname -s)" = "Linux" ]; then
+    if [ ! -f "$SHM_DIR/src/c/sharedMemoryVideoBuffers.c" ]; then
+        if [ -e "$SHM_DIR" ]; then
+            echo "[setup_gmr] WARN: $SHM_DIR exists but isn't a SharedMemoryVideoBuffers checkout — skipping shm setup" >&2
+        else
+            echo "[setup_gmr] cloning SharedMemoryVideoBuffers (live shm transport) — $SHM_REPO"
+            git clone --depth 1 "$SHM_REPO" "$SHM_DIR" || \
+                echo "[setup_gmr] WARN: clone failed — webcam_gmr.sh will use the stdout/tempfile fallback" >&2
+        fi
+    fi
+    if [ -f "$SHM_DIR/src/c/sharedMemoryVideoBuffers.c" ]; then
+        echo "[setup_gmr] building libSharedMemoryVideoBuffers.so"
+        if make -C "$SHM_DIR" libSharedMemoryVideoBuffers.so >/dev/null 2>&1 \
+           || make -C "$SHM_DIR" >/dev/null 2>&1; then
+            echo "[setup_gmr] shm library ready: $SHM_DIR/libSharedMemoryVideoBuffers.so"
+            echo "[setup_gmr] NOTE: (re)build the C++ binary after this so it picks up shm support (scripts/build.sh)"
+        else
+            echo "[setup_gmr] WARN: shm library build failed — webcam_gmr.sh will use the stdout/tempfile fallback" >&2
+        fi
+    fi
+else
+    echo "[setup_gmr] non-Linux host — skipping SharedMemoryVideoBuffers (shm transport is Linux-only)"
+fi
+
 # ── generate the LAFAN template with the MHR rest pose ───────────────────────
 # video_gmr.sh retargets onto lafan_mhr.bvh — a LAFAN1-named template whose REST
 # pose equals the MHR rest skeleton (so the BVH writer's q_bone_align is identity

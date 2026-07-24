@@ -16,6 +16,9 @@ __pycache__/
 venv/
 .venv/
 
+# Fetched deps (cloned by tools/setup_gmr.sh, like GMR/)
+SharedMemoryVideoBuffers/
+
 # Editor / IDE
 .vscode/
 .idea/

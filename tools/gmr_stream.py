@@ -18,7 +18,7 @@
 # Usage (normally via scripts/webcam_gmr.sh):
 #   fast_sam_3dbody_run ... --bvh-template lafan_mhr.bvh --bvh-stream - \
 #     | gmr_stream.py --robot unitree_g1 --config <pos_config.json> --flip-depth
-import argparse, copy, sys, tempfile
+import argparse, copy, sys
 import numpy as np
 from pathlib import Path
 
@@ -32,6 +32,16 @@ ap.add_argument("--template", default=str(REPO / "lafan_mhr.bvh"),
 ap.add_argument("--sink", choices=["viewer", "dds"], default="viewer",
                 help="viewer = live MuJoCo RobotMotionViewer; dds = Unitree DDS (unitree_mujoco / real G1) [stub]")
 ap.add_argument("--fps", type=int, default=30)
+# Live shared-memory transport (SharedMemoryVideoBuffers).  When --bvh-shm names
+# a POSIX shm descriptor, frames are read from it instead of "@F" lines on stdin
+# (no ASCII pipe).  Empty = the stdin fallback.  Either way the disk-free FK below
+# is used, so no per-frame temp .bvh is ever written.
+ap.add_argument("--bvh-shm", default="",
+                help="POSIX shm descriptor to read frames from (SharedMemoryVideoBuffers); "
+                     "empty = read @F lines from stdin")
+ap.add_argument("--shm-stream", default="bvh", help="feed name within --bvh-shm")
+ap.add_argument("--shm-lib", default="", help="path to libSharedMemoryVideoBuffers.so "
+                "(default: <repo>/SharedMemoryVideoBuffers/libSharedMemoryVideoBuffers.so)")
 ap.add_argument("--flip-depth", action="store_true",
                 help="reverse global front/back drift (MHR camera-space depth sign is opposite to "
                      "GMR's Y-up->Z-up convention). Rigid per-frame depth-axis shift about frame 0.")
@@ -57,8 +67,8 @@ from general_motion_retargeting import params
 params.IK_CONFIG_DICT["bvh_lafan1"][a.robot] = Path(a.config)
 
 from general_motion_retargeting import GeneralMotionRetargeting as GMR, RobotMotionViewer
-from general_motion_retargeting.utils.lafan1 import load_bvh_file
 from scipy.spatial.transform import Rotation as R
+from lafan_fk import LafanFK   # disk-free equivalent of load_bvh_file (tools/)
 
 
 # ── helpers lifted from tools/gmr_retarget.py (kept identical) ───────────────
@@ -149,32 +159,32 @@ class DDSSink:
     def close(self): ...
 
 
-# ── template header: everything up to & including the 'Frame Time:' line ─────
-header = []
-with open(a.template) as f:
-    for line in f:
-        s = line.rstrip("\n")
-        header.append("Frames: 1" if s.startswith("Frames:") else s)
-        if s.startswith("Frame Time:"):
-            break
-HEADER = "\n".join(header) + "\n"
+# ── disk-free frame decode ───────────────────────────────────────────────────
+# Parse the template HIERARCHY ONCE, then turn each frame's channel floats
+# straight into GMR's {joint:(pos,quat)} dict via GMR's own quat_fk.  This is
+# byte-for-byte what load_bvh_file(format="lafan1") returned, but with no temp
+# .bvh and no per-frame HIERARCHY re-parse (tools/lafan_fk.py).
+fk = LafanFK(a.template, fmt="lafan1")
 
-_tmp = tempfile.NamedTemporaryFile("w", suffix=".bvh", delete=False)
-TMP_PATH = _tmp.name
-_tmp.close()
-
-def frame_from_line(motion_line):
-    with open(TMP_PATH, "w") as fh:
-        fh.write(HEADER)
-        fh.write(motion_line)
-        fh.write("\n")
-    frames, _ = load_bvh_file(TMP_PATH, format="lafan1")
-    return frames[0]
+def channels_from_line(motion_line):
+    return np.array(motion_line.split(), dtype=np.float64)
 
 
 # ── main streaming loop ──────────────────────────────────────────────────────
 def make_sink():
     return DDSSink(a.robot, a.fps) if a.sink == "dds" else ViewerSink(a.robot, a.fps)
+
+# ── frame sources: shared memory (fast path) or @F lines on stdin (fallback) ──
+def _stdin_channels():
+    """Yield channel arrays from '@F' lines on stdin; forward diagnostics."""
+    for raw in sys.stdin:
+        raw = raw.rstrip("\n")
+        if not raw.startswith("@F "):
+            if raw:                           # forward the binary's diagnostics
+                print(raw, file=sys.stderr)
+            continue
+        yield channels_from_line(raw[3:])
+
 
 def main():
     rt = None
@@ -182,15 +192,25 @@ def main():
     prev_q = None
     y0 = 0.0
     nclamp = 0
-    try:
-        for raw in sys.stdin:
-            raw = raw.rstrip("\n")
-            if not raw.startswith("@F "):
-                if raw:                       # forward the binary's diagnostics
-                    print(raw, file=sys.stderr)
-                continue
+    reader = None
 
-            fr = frame_from_line(raw[3:])
+    if a.bvh_shm:
+        from shm_bvh_reader import ShmBvhReader
+        lib = a.shm_lib or str(REPO / "SharedMemoryVideoBuffers" / "libSharedMemoryVideoBuffers.so")
+        reader = ShmBvhReader(lib, a.bvh_shm, a.shm_stream)
+        print(f"[gmr_stream] reading frames from shm '{a.bvh_shm}:{a.shm_stream}'", file=sys.stderr)
+        def source():
+            while True:
+                arr = reader.read()
+                if arr is not None:
+                    yield arr
+        channels = source()
+    else:
+        channels = _stdin_channels()
+
+    try:
+        for arr in channels:
+            fr = fk.frame_from_channels(arr)
 
             if rt is None:                    # lazy init on the first real frame
                 if a.human_height > 0:
@@ -220,6 +240,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        if reader is not None:
+            reader.close()
         if sink is not None:
             sink.close()
         if nclamp:

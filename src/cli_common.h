@@ -125,6 +125,14 @@ struct CommonConfig
     // the offline binary ignores it.
     std::string bvh_stream_path;                          // --bvh-stream
 
+    // Live shm transport (Linux/FSB_SHM only): publish each frame's BVH channels
+    // into a SharedMemoryVideoBuffers generic buffer instead of (or besides) the
+    // "@F" stdout line — no ASCII pipe, no per-frame temp .bvh on the consumer.
+    // scripts/webcam_gmr.sh sets these automatically when the shm lib is present;
+    // ignored by a binary built without FSB_SHM (falls back to --bvh-stream).
+    std::string bvh_shm_descriptor;                       // --bvh-shm  (POSIX shm object name)
+    std::string bvh_shm_stream = "bvh";                   // --bvh-shm-stream (feed name within it)
+
     // ── Filtering knobs ─────────────────────────────────────────────────────
     // Defaults match the live binaries; the offline binary overrides
     // rot_clamp_deg to 30.0 before invoking the parser (see comment in
@@ -201,6 +209,8 @@ inline bool parse_common_arg(int argc, const char* const* argv, int& i,
     CLI_BOOL("--foot-contact",             bvh_foot_contact,               true)
     CLI_BOOL("--bvh-static-root",          bvh_static_root,                true)
     CLI_STR ("--bvh-stream",               bvh_stream_path)
+    CLI_STR ("--bvh-shm",                  bvh_shm_descriptor)
+    CLI_STR ("--bvh-shm-stream",           bvh_shm_stream)
 
     // Filters
     CLI_FLT ("--bw-cutoff",            bw_cutoff)

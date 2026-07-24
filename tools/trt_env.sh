@@ -11,12 +11,17 @@
 #
 # Auto-detects the venv's python<ver> directory via a glob, so it is not pinned
 # to one Python version.  Exports SAM3D_TRT_LIBS = the resolved dir ("" if none).
+#
+# Searches both the project venv/ (setup_trt.sh's target) and tools/.venv/
+# (where run_trt.sh's one-time `pip install tensorrt-cu12-libs` puts them), so a
+# stack set up either way resolves the same.
 
 # Resolve repo root from THIS file's location (independent of the caller's CWD).
 _trt_root="$( cd "$( dirname "${BASH_SOURCE[0]:-$0}" )/.." && pwd )"
 
 SAM3D_TRT_LIBS=""
-for _trt_d in "$_trt_root"/venv/lib/python*/site-packages/tensorrt_libs; do
+for _trt_d in "$_trt_root"/venv/lib/python*/site-packages/tensorrt_libs \
+              "$_trt_root"/tools/.venv/lib/python*/site-packages/tensorrt_libs; do
     [ -d "$_trt_d" ] || continue          # glob didn't match → skip the literal pattern
     SAM3D_TRT_LIBS="$_trt_d"
     export LD_LIBRARY_PATH="$_trt_d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"

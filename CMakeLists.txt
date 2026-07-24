@@ -260,6 +260,7 @@ add_library(fast_sam_3dbody SHARED
     src/fast_sam_3dbody.cpp
     src/fast_sam_3dbody_capi.cpp
     src/bvh_writer.cpp
+    src/bvh_shm.cpp
     src/offline_passes.cpp
     ${GRAPHICS_ENGINE_DIR}/ModelLoader/model_loader_tri.c
     ${GRAPHICS_ENGINE_DIR}/ModelLoader/model_loader_transform_joints.c
@@ -316,6 +317,27 @@ endif()
 if(SAM3D_TENSORRT AND WITH_CUDA)
     target_compile_definitions(fast_sam_3dbody PRIVATE USE_TENSORRT_EP)
     message(STATUS "SAM3D_TENSORRT=ON — TensorRT EP compiled in (enable at runtime with --trt)")
+endif()
+
+# ---------------------------------------------------------------------------
+# SharedMemoryVideoBuffers  (live webcam→robot zero-copy transport, Linux only)
+# ---------------------------------------------------------------------------
+# tools/setup_gmr.sh clones this into ${SHM_DIR} and builds its .so for the
+# Python consumer.  Here we compile its single C source straight into our core
+# library (POSIX shm/rt — Linux only) and define FSB_SHM so main.cpp's --bvh-shm
+# publisher is active.  Absent (setup_gmr.sh not run / non-Linux) → FSB_SHM off,
+# and the webcam pipeline transparently uses the stdout/tempfile path instead.
+set(_SHM_DIR ${CMAKE_CURRENT_SOURCE_DIR}/SharedMemoryVideoBuffers)
+set(_SHM_SRC ${_SHM_DIR}/src/c/sharedMemoryVideoBuffers.c)
+if(UNIX AND NOT APPLE AND EXISTS "${_SHM_SRC}")
+    target_sources(fast_sam_3dbody PRIVATE ${_SHM_SRC})
+    target_include_directories(fast_sam_3dbody PUBLIC ${_SHM_DIR}/src/c)
+    target_compile_definitions(fast_sam_3dbody PUBLIC FSB_SHM)
+    target_link_libraries(fast_sam_3dbody PUBLIC ${RT_LIB} pthread)
+    message(STATUS "SharedMemoryVideoBuffers found — live shm transport compiled in (FSB_SHM)")
+else()
+    message(STATUS "SharedMemoryVideoBuffers not found — webcam→robot uses the stdout/tempfile fallback "
+                   "(run tools/setup_gmr.sh to enable the faster shm transport)")
 endif()
 
 target_compile_options(fast_sam_3dbody PRIVATE

@@ -1,5 +1,6 @@
 #include "fast_sam_3dbody.h"
 #include "bvh_writer.h"
+#include "bvh_shm.h"
 #include "outputFiltering.h"
 #include "cli_common.h"
 
@@ -10,10 +11,12 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <vector>
 
 // Monotonic nanosecond timestamp (portable; std::chrono steady clock)
 static uint64_t get_mono_ns()
@@ -122,6 +125,11 @@ static void print_usage(const char* prog)
     printf("  --bvh-stream PATH           Live-stream one BVH MOTION line per frame to PATH ('-' = stdout,\n");
     printf("                              prefixed '@F ') for the webcam->robot pipeline (scripts/webcam_gmr.sh).\n");
     printf("                              Use with --bvh-template lafan_mhr.bvh --max-persons 1.\n");
+    printf("  --bvh-shm NAME              Publish per-frame BVH channels into POSIX shared memory object NAME\n");
+    printf("                              (SharedMemoryVideoBuffers) instead of the '@F' ASCII pipe — Linux\n");
+    printf("                              builds with FSB_SHM only; no-op otherwise. scripts/webcam_gmr.sh\n");
+    printf("                              sets this automatically when the shm library is present.\n");
+    printf("  --bvh-shm-stream NAME       Feed name within the --bvh-shm object (default 'bvh').\n");
     printf("  --headless        Do not open display windows\n");
     printf("  --info            Print pipeline info and exit\n");
     printf("  --butterworth              Apply Butterworth low-pass filter to MHR output vectors\n");
@@ -616,7 +624,19 @@ int main(int argc, char** argv)
                     c.bvh_stream_path.c_str());
     }
 
-    if (!c.bvh_path.empty() || bvh_stream_fp)
+    // Live shm transport (webcam→robot): zero-copy alternative to the "@F" line.
+    // Opening needs the same bvh_writer, so it is treated like another stream
+    // sink below.  A binary built without FSB_SHM never opens (open() → false),
+    // so the pipeline transparently keeps using --bvh-stream.
+    BvhShmPublisher bvh_shm;
+    if (!c.bvh_shm_descriptor.empty())
+    {
+        if (!bvh_shm.open(c.bvh_shm_descriptor, c.bvh_shm_stream))
+            fprintf(stderr, "[main] --bvh-shm: shm transport unavailable "
+                            "(is this build FSB_SHM/Linux?) — falling back to --bvh-stream.\n");
+    }
+
+    if (!c.bvh_path.empty() || bvh_stream_fp || bvh_shm.is_open())
     {
         // Auto-detect body_model.lbs from the onnx directory for finger animation
         std::string lbs_path = c.onnx_dir + "/body_model.lbs";
@@ -641,6 +661,7 @@ int main(int argc, char** argv)
             fprintf(stderr, "[main] BVH writer failed to open (continuing without BVH output).\n");
             if (bvh_stream_fp && bvh_stream_fp != stdout) fclose(bvh_stream_fp);
             bvh_stream_fp = nullptr;
+            bvh_shm.close();
         }
         else
         {
@@ -838,13 +859,32 @@ int main(int argc, char** argv)
         // BVH live stream (webcam→robot): one MOTION line for the top person,
         // prefixed "@F " so it is unambiguous against stdout diagnostics.  When
         // no one is detected we emit nothing — the consumer holds the last pose.
-        if (bvh_stream_fp && !results.empty())
+        if ((bvh_stream_fp || bvh_shm.is_open()) && !results.empty())
         {
             std::string line;
             if (bvh_writer.stream_frame_line(results[0], line))
             {
-                fprintf(bvh_stream_fp, "@F %s\n", line.c_str());
-                fflush(bvh_stream_fp);
+                if (bvh_stream_fp)
+                {
+                    fprintf(bvh_stream_fp, "@F %s\n", line.c_str());
+                    fflush(bvh_stream_fp);
+                }
+                if (bvh_shm.is_open())
+                {
+                    // Same channels as the "@F" line, as raw float32 — parse the
+                    // string once (cheap vs. the consumer's old temp-file reparse).
+                    std::vector<float> vals;
+                    vals.reserve(256);
+                    const char* p = line.c_str();
+                    char* endp = nullptr;
+                    for (float v = std::strtof(p, &endp); endp != p;
+                         v = std::strtof(p, &endp))
+                    {
+                        vals.push_back(v);
+                        p = endp;
+                    }
+                    bvh_shm.publish(vals);
+                }
             }
         }
 
