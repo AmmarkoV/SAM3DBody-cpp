@@ -24,6 +24,11 @@
 #       scripts/webcam_gmr.sh 2 unitree_g1          # webcam 2
 #       scripts/webcam_gmr.sh clean_sample.mp4      # a file, as if it were live
 #       SINK=dds scripts/webcam_gmr.sh 0 unitree_g1 # DDS sink (stub; see gmr_stream.py)
+#       HEADLESS=1 scripts/webcam_gmr.sh 0          # no input overlay window (robot only)
+#
+#  Two windows open by default: the input RGB frame with the 2D skeleton overlaid
+#  (the binary's own live view), plus the retargeted robot (the sink's viewer).
+#  HEADLESS=1 suppresses the input overlay (e.g. on a server / under xvfb).
 #
 #  Prerequisites:
 #    - the C++ binary is built (build/fast_sam_3dbody_run)
@@ -43,6 +48,13 @@ ROBOT="${2:-unitree_g1}"
 EXTRA=()
 if [ "${3:-}" = "--" ]; then shift 3 || true; EXTRA=("$@"); fi
 SINK="${SINK:-viewer}"
+
+# Show the input RGB frame with the 2D skeleton overlaid (the binary's own live
+# window) alongside the robot viewer.  Set HEADLESS=1 to suppress it (servers /
+# xvfb, or when you only want the robot).
+HEADLESS="${HEADLESS:-0}"
+HEADLESS_ARG=()
+[ "$HEADLESS" != "0" ] && HEADLESS_ARG=(--headless)
 
 # ── env: project venv + TensorRT libs on LD_LIBRARY_PATH (both no-op if unset) ─
 # shellcheck source=/dev/null
@@ -64,8 +76,9 @@ for f in "$BIN" "$GMR_PY" "$TEMPLATE" "$POS_CONFIG"; do
     fi
 done
 
-echo "[webcam_gmr] source=$SOURCE robot=$ROBOT sink=$SINK"
+echo "[webcam_gmr] source=$SOURCE robot=$ROBOT sink=$SINK headless=$HEADLESS"
 echo "[webcam_gmr] webcam -> BVH stream -> GMR retarget -> $SINK  (Ctrl-C to stop)"
+[ "$HEADLESS" = "0" ] && echo "[webcam_gmr] input overlay window on (press q in it to stop; HEADLESS=1 to disable)"
 
 # --max-persons 1: one actor drives the robot. --butterworth (+ root rotation):
 # the live binary's causal smoothing, so the robot isn't fed raw per-frame jitter.
@@ -81,7 +94,7 @@ echo "[webcam_gmr] webcam -> BVH stream -> GMR retarget -> $SINK  (Ctrl-C to sto
     --bvh-template "$TEMPLATE" \
     --bvh-stream   - \
     --butterworth --butterworth-root-rotation \
-    --headless \
+    "${HEADLESS_ARG[@]}" \
     "${EXTRA[@]}" \
   | "$GMR_PY" "$REPO/tools/gmr_stream.py" \
         --robot    "$ROBOT" \
