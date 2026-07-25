@@ -18,14 +18,6 @@
 #include <string>
 #include <vector>
 
-// Monotonic nanosecond timestamp (portable; std::chrono steady clock)
-static uint64_t get_mono_ns()
-{
-    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-               std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-}
-
 using Clock = std::chrono::steady_clock;
 static double ms_since(Clock::time_point t0)
 {
@@ -565,6 +557,10 @@ int main(int argc, char** argv)
         if (c.cap_w > 0) cap.set(cv::CAP_PROP_FRAME_WIDTH,  c.cap_w);
         if (c.cap_h > 0) cap.set(cv::CAP_PROP_FRAME_HEIGHT, c.cap_h);
         if (c.cap_fps > 0.0) cap.set(cv::CAP_PROP_FPS,      c.cap_fps);
+        // Minimise capture latency: keep only the newest frame in the driver
+        // queue so cap.read() returns a current frame instead of a backlog.
+        // Webcams only — for video files we must read every frame.
+        if (is_webcam) cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
         if (c.start_frame > 0) {
             cap.set(cv::CAP_PROP_POS_FRAMES, (double)c.start_frame);
             printf("[start] seeking to frame %d\n", c.start_frame);
@@ -732,7 +728,6 @@ int main(int argc, char** argv)
     int      frame_count  = 0;
     double   total_inf_ms = 0.0;
     auto     loop_start   = Clock::now();
-    uint64_t t_capture_start_ns = 0;   // set on first webcam grab
 
     while (true)
     {
@@ -747,36 +742,12 @@ int main(int argc, char** argv)
         }
         else
         {
-            // ---- webcam frame-sync: drain stale frames from the driver buffer ----
-            // The camera keeps capturing at cam_fps regardless of how fast we process.
-            // We use a monotonic clock to see how many camera frames have been produced
-            // since we started, then skip (grab without decode) any we haven't consumed
-            // so the next cap.read() returns a frame that is current right now.
-            if (is_webcam && cam_fps > 0.0)
-            {
-                uint64_t now_ns = get_mono_ns();
-                if (t_capture_start_ns == 0)
-                {
-                    // Pin the clock to the very first frame we're about to grab.
-                    t_capture_start_ns = now_ns;
-                }
-                else
-                {
-                    uint64_t elapsed_ns = now_ns - t_capture_start_ns;
-                    // How many frames the camera has produced since we began.
-                    int64_t expected = (int64_t)((double)elapsed_ns * cam_fps / 1e9);
-                    // Frames we still owe the camera — skip them (grab only, no decode).
-                    int skip = (int)(expected - (int64_t)frame_count);
-                    if (skip > 0)
-                    {
-                        // Cap to a reasonable window; we only need the *latest* frame,
-                        // so skip at most what fits in ~1 second of camera output.
-                        if (skip > (int)cam_fps) skip = (int)cam_fps;
-                        for (int s = 0; s < skip; ++s)
-                            if (!cap.grab()) break;
-                    }
-                }
-            }
+            // Capture latency is kept low by CAP_PROP_BUFFERSIZE=1 (set at open):
+            // the driver holds only the newest frame, so cap.read() returns a
+            // current frame without a growing backlog.  A previous wall-clock
+            // drain here called cap.grab() up to cam_fps times per iteration, but
+            // grabs past the tiny driver queue BLOCK at the camera rate, which
+            // throttled the whole pipeline to ~1 fps.  Removed.
             if (!cap.read(frame) || frame.empty()) break;
         }
 
