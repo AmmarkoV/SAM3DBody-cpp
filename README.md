@@ -864,17 +864,56 @@ Outputs land in `gmr_out/<videoname>/`. Needs an X display (wrap with `xvfb-run`
 if headless). See **[GMR.md](GMR.md)** for the design, tuning, and the calibration
 tools in `tools/gmr_*.py`.
 
-For a **live** webcam → robot loop (causal, no disk), stream per-frame instead:
+### Live webcam → robot (`scripts/webcam_gmr.sh`)
+
+For a **live** loop (causal, no disk), stream per-frame instead of the offline
+whole-clip pass:
 
 ```bash
-# webcam → live retargeted G1 in a MuJoCo viewer (Ctrl-C to stop)
-scripts/webcam_gmr.sh 0 unitree_g1
+# webcam 0 → live retargeted G1 in a MuJoCo viewer (Ctrl-C to stop)
+scripts/webcam_gmr.sh
+
+# pick a device / robot; a video file works too (played as if it were live)
+scripts/webcam_gmr.sh 2 unitree_g1
+scripts/webcam_gmr.sh clean_sample.mp4
+
+# pass extra flags through to the C++ binary after --
+scripts/webcam_gmr.sh 0 unitree_g1 -- --size 1280 720
 ```
 
-The live binary emits one BVH frame per tick (`--bvh-stream`) into
-`tools/gmr_stream.py`, which retargets each frame and drives a pluggable sink
-(MuJoCo viewer now; a Unitree-DDS sink stub for `unitree_mujoco` / real G1). See
-**[GMR.md](GMR.md)** → "Live webcam → robot (streaming)".
+```
+scripts/webcam_gmr.sh [SOURCE] [RobotType] [-- extra binary flags]
+
+  SOURCE     webcam index / /dev/videoN / a video-file path   (default 0)
+  RobotType  a robot with a LAFAN IK config in GMR            (default unitree_g1)
+```
+
+Two windows open by default: the input RGB frame with the 2D skeleton overlaid
+(the binary's own live view) and the retargeted robot (the sink's MuJoCo viewer).
+
+**Environment overrides:**
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `SINK` | `viewer` | `viewer` = live MuJoCo; `dds` = Unitree DDS (`unitree_mujoco` / real G1) — **stub**, needs a whole-body tracking policy + safety layer first. |
+| `HEADLESS` | `0` | `1` suppresses the input overlay window (servers / `xvfb`; the robot viewer still opens). |
+| `TRT` | `auto` | TensorRT fp16 fast path (~1.6× the CUDA EP). `auto` enables it when the TRT libs + models + a GPU are present; `0` forces the default backend, `1` forces it on. |
+| `SHM` | `auto` | Transport. `auto` uses zero-copy POSIX shared memory when available, else falls back to a stdout `@F`-line pipe; `0` forces the pipe. |
+
+**How it works:** the C++ binary emits one LAFAN BVH frame per tick into
+`tools/gmr_stream.py`, which reassembles + retargets each frame causally (single
+pass, no look-ahead) and drives the pluggable sink. Frames travel over
+[SharedMemoryVideoBuffers](https://github.com/AmmarkoV/SharedMemoryVideoBuffers)
+(a single-slot buffer — the consumer always gets the freshest frame, so latency
+stays at a few frames instead of a growing queue), with a stdout pipe as
+fallback. The shm fast path needs the binary compiled with `FSB_SHM`, which
+`tools/setup_gmr.sh` sets up (it clones + builds the shm library **and rebuilds
+the C++ binary** so it picks up the transport).
+
+**Prerequisites:** the C++ binary is built (`scripts/build.sh`), `tools/setup_gmr.sh`
+has been run, a CUDA GPU, and an X display for the MuJoCo viewer (wrap with
+`xvfb-run` if headless). See **[GMR.md](GMR.md)** → "Live webcam → robot (streaming)"
+for the design and the causal despike/safety details.
 
 ---
 
