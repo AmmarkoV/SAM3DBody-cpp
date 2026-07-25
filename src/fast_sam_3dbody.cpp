@@ -737,8 +737,13 @@ struct Pipeline::Impl
             }
         }
 
-        // Fallback: full image as single detection
-        if (dets.empty())
+        // Fallback: full image as single detection.
+        // Only when no detector ran at all — i.e. no YOLO model loaded and no
+        // external boxes — which is the image-only "assume a single centred
+        // person" usage.  When a detector *did* run and returned nothing, the
+        // frame genuinely contains no person; feeding the whole image would
+        // make the regressor hallucinate a body in the middle of the frame.
+        if (dets.empty() && !sess_yolo.session && cfg.external_boxes.empty())
         {
             dets.push_back({ 0.f, 0.f, float(W), float(H), 1.f });
         }
@@ -748,6 +753,14 @@ struct Pipeline::Impl
         double dt_detect = ms(t0);
         timers.detection += dt_detect;
         printf("[FSB] detection: %.1f ms  persons: %zu\n", dt_detect, dets.size());
+
+        // Nothing detected – no crops to regress.  Returning early also keeps
+        // the ONNX sessions from being run with a zero-sized batch.
+        if (dets.empty())
+        {
+            timers.frames += 1;
+            return {};
+        }
 
         // ── per-person crops ──────────────────────────────────────────────────
         const int B = (int)dets.size();
