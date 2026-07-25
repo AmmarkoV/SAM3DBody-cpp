@@ -99,7 +99,24 @@ if [ "$(uname -s)" = "Linux" ]; then
         if make -C "$SHM_DIR" libSharedMemoryVideoBuffers.so >/dev/null 2>&1 \
            || make -C "$SHM_DIR" >/dev/null 2>&1; then
             echo "[setup_gmr] shm library ready: $SHM_DIR/libSharedMemoryVideoBuffers.so"
-            echo "[setup_gmr] NOTE: (re)build the C++ binary after this so it picks up shm support (scripts/build.sh)"
+            # (Re)build the C++ binary so CMake reconfigures and compiles in the shm
+            # publisher (FSB_SHM).  A build/ configured BEFORE this checkout existed
+            # keeps FSB_SHM off and won't self-heal — the dir appearing on disk isn't
+            # a tracked CMake input — so webcam_gmr.sh would pick the shm path yet the
+            # binary would silently fall back to stdout and gmr_stream.py would hang
+            # waiting for a descriptor that never appears.  Re-running build.sh forces
+            # the reconfigure (make is incremental, so this is cheap on an up-to-date
+            # tree).  Best-effort: a build failure must not abort env setup.
+            if [ -x "$REPO/scripts/build.sh" ]; then
+                echo "[setup_gmr] rebuilding C++ binary so it picks up shm support (FSB_SHM) ..."
+                if "$REPO/scripts/build.sh"; then
+                    echo "[setup_gmr] C++ binary rebuilt with shm support"
+                else
+                    echo "[setup_gmr] WARN: rebuild failed — run scripts/build.sh manually to enable shm transport" >&2
+                fi
+            else
+                echo "[setup_gmr] NOTE: (re)build the C++ binary after this so it picks up shm support (scripts/build.sh)"
+            fi
         else
             echo "[setup_gmr] WARN: shm library build failed — webcam_gmr.sh will use the stdout/tempfile fallback" >&2
         fi
