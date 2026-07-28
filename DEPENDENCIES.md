@@ -92,17 +92,23 @@ The correct response is to **fix the CUDA provider (§2)**, not to chase the
 
 1. **Get the CUDA EP loading** (recommended — see §2), then use the standard
    `backbone.onnx`.
-2. **Run on CPU with the float32 backbone** — a separate download that has no
-   BF16 ops. This is slow (≈ 5–15 s per backbone pass; video is impractical):
+2. **Run on CPU with the fp32 backbone and fp16 decoder** — separate downloads
+   with no BF16 ops. Note that `decoder.onnx` is BF16 too, so the fp32 backbone
+   alone is not enough: it moves the failure from `Expand(13)` in the backbone to
+   `MatMul(13)` in the decoder. This is slow (≈ 5–15 s per backbone pass; video is
+   impractical):
 
    ```bash
-   # Download the fp32 backbone alongside the other models in onnx/
-   wget -P onnx/ https://huggingface.co/AmmarkoV/SAM3DBody-cpp-onnx-models/resolve/main/backbone_fp32.onnx
-   wget -P onnx/ https://huggingface.co/AmmarkoV/SAM3DBody-cpp-onnx-models/resolve/main/backbone_fp32.onnx.data
+   # Download the CPU-runnable models alongside the other models in onnx/
+   HF=https://huggingface.co/AmmarkoV/SAM3DBody-cpp-onnx-models/resolve/main
+   wget -P onnx/ $HF/backbone_fp32.onnx
+   wget -P onnx/ $HF/backbone_fp32.onnx.data
+   wget -P onnx/ $HF/decoder_fp16.onnx
+   wget -P onnx/ $HF/decoder_fp16.onnx.data
 
+   # --cuda -1 picks both up automatically once they are in onnx/
    ./build/fast_sam_3dbody_run \
        --onnx-dir ./onnx \
-       --backbone backbone_fp32.onnx \
        --cuda     -1 \
        --from     your_image.png
    ```
@@ -242,5 +248,6 @@ path (see Requirements above).
 | You see… | Root cause | Do this |
 |----------|-----------|---------|
 | `Failed to load library libonnxruntime_providers_cuda.so` | cuDNN 9 / CUDA 12 lib missing | §2 — `ldd … \| grep "not found"`, then install cuDNN 9 |
-| `Could not find an implementation for Expand(13)` | CPU fallback hit the BF16 backbone | Fix the CUDA EP (§2), or use `backbone_fp32.onnx --cuda -1` (§3) |
+| `Could not find an implementation for Expand(13)` | CPU fallback hit the BF16 backbone | Fix the CUDA EP (§2), or fetch the CPU models — `setup.sh --cpu-backbone` (§3) |
+| `Could not find an implementation for MatMul(13) … '/init_to_token/MatMul'` | CPU fallback hit the BF16 decoder | Same: fix the CUDA EP (§2), or fetch the CPU models — `setup.sh --cpu-backbone` (§3) |
 | `Failed to load library libonnxruntime_providers_tensorrt.so … libnvinfer.so.10` | `--trt` used but TensorRT 10 not installed | Install TensorRT 10 (§6), or drop `--trt` — it auto-falls back to CUDA |

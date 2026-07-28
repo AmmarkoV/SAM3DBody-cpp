@@ -55,23 +55,23 @@ unzip SAM3DBody-cpp-onnx-models.zip
 
 ### Without a CUDA GPU (CPU-only)
 
-The standard `backbone.onnx` is exported in BFloat16 and **requires a CUDA GPU** — it will not load on the ORT CPU execution provider.
-A float32 CPU-compatible backbone is available as a separate download from the same HuggingFace repo.
- 
+The standard `backbone.onnx` **and** `decoder.onnx` are both exported in BFloat16 and **require a CUDA GPU** — the ORT CPU execution provider has no BF16 kernels, so it refuses to load either one (`Could not find an implementation for Expand(13) …` / `MatMul(13) …`).
+CPU-runnable replacements for both are separate downloads from the same HuggingFace repo.
 
-Download these two files and place them alongside the rest of the models in `onnx/`:
+Download these four files and place them alongside the rest of the models in `onnx/`:
 
 | File | Size | Description | Links |
 |------|------|-------------| ---- |
 | `backbone_fp32.onnx` | ~1 MB | Graph (references external data) | [Link](https://huggingface.co/AmmarkoV/SAM3DBody-cpp-onnx-models/blob/main/backbone_fp32.onnx) |
 | `backbone_fp32.onnx.data` | ~3.2 GB | Float32 weights — no BF16, CPU EP compatible | [Link](https://huggingface.co/AmmarkoV/SAM3DBody-cpp-onnx-models/blob/main/backbone_fp32.onnx.data) |
+| `decoder_fp16.onnx` | ~275 KB | Graph (references external data) | [Link](https://huggingface.co/AmmarkoV/SAM3DBody-cpp-onnx-models/blob/main/decoder_fp16.onnx) |
+| `decoder_fp16.onnx.data` | ~97 MB | Float16 weights — no BF16, CPU EP compatible | [Link](https://huggingface.co/AmmarkoV/SAM3DBody-cpp-onnx-models/blob/main/decoder_fp16.onnx.data) |
 
-Then run with `--backbone backbone_fp32.onnx --cuda -1`:
+Once they are in `onnx/`, `--cuda -1` picks both up by itself — no extra flags:
 
 ```bash
 ./build/fast_sam_3dbody_run \
     --onnx-dir ./onnx \
-    --backbone backbone_fp32.onnx \
     --cuda     -1 \
     --from     your_video.mp4
 ```
@@ -225,7 +225,7 @@ cd SAM3DBody-cpp
 bash scripts/setup.sh
 ```
 
-For a machine **without a CUDA GPU**, also pass `--cpu-backbone` to fetch the fp32 backbone:
+For a machine **without a CUDA GPU**, also pass `--cpu-backbone` to fetch the CPU-runnable models (fp32 backbone + fp16 decoder — the stock ones are BF16 and will not load on the CPU):
 
 ```bash
 bash scripts/setup.sh --cpu-only --cpu-backbone
@@ -237,7 +237,7 @@ Common flags:
 |------|--------|
 | `--cuda-arch 89` | Set CUDA architecture (RTX 4090 = 89, RTX 3090 = 86, RTX 4070 = 89) |
 | `--cpu-only` | Install CPU-only PyTorch in the venv |
-| `--cpu-backbone` | Also download the fp32 backbone for CPU inference |
+| `--cpu-backbone` | Also download the CPU-runnable models (fp32 backbone + fp16 decoder) |
 | `--skip-models` | Skip model download (models already in `onnx/`) |
 | `--skip-build` | Skip C++ build (Python venv only) |
 | `--skip-venv` | Skip Python venv (build only) |

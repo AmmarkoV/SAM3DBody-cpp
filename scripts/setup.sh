@@ -13,7 +13,7 @@
 #   bash scripts/setup.sh --cuda-arch 89        # RTX 4090
 #   bash scripts/setup.sh --ort-dir /opt/onnxruntime
 #   bash scripts/setup.sh --cpu-only            # no CUDA torch
-#   bash scripts/setup.sh --cpu-backbone        # download fp32 backbone (CPU inference)
+#   bash scripts/setup.sh --cpu-backbone        # download CPU-runnable models (CPU inference)
 #   bash scripts/setup.sh --skip-models         # skip model download
 #   bash scripts/setup.sh --skip-build          # venv only
 #   bash scripts/setup.sh --skip-venv           # build only
@@ -252,11 +252,17 @@ if [[ "${SKIP_MODELS}" -eq 0 ]]; then
         fi
     fi
 
-    # Optional: CPU-compatible fp32 backbone (for machines without CUDA)
+    # Optional: CPU-compatible models (for machines without CUDA).
+    # The stock backbone.onnx and decoder.onnx are both bfloat16 exports.  ORT's
+    # CUDA EP has bf16 kernels, the CPU EP has none, so on --cuda -1 they fail to
+    # load outright ("Could not find an implementation for MatMul(13) …").  Grab
+    # the fp32 backbone and the fp16 decoder, which the CPU EP does run — the
+    # binary picks both up automatically once they're in onnx/.
     if [[ "${CPU_BACKBONE}" -eq 1 ]]; then
         echo ""
-        echo "=== Downloading fp32 backbone (CPU inference) ==="
-        for _f in backbone_fp32.onnx "backbone_fp32.onnx.data"; do
+        echo "=== Downloading CPU-runnable models (fp32 backbone + fp16 decoder) ==="
+        for _f in backbone_fp32.onnx "backbone_fp32.onnx.data" \
+                  decoder_fp16.onnx  "decoder_fp16.onnx.data"; do
             if [[ -f "${ONNX_DIR}/${_f}" ]]; then
                 echo "  ${_f} already present — skipping."
             else
@@ -264,8 +270,8 @@ if [[ "${SKIP_MODELS}" -eq 0 ]]; then
             fi
         done
         echo ""
-        echo "  To use the CPU backbone, run:"
-        echo "    ./build/fast_sam_3dbody_run --onnx-dir ./onnx --backbone backbone_fp32.onnx --cuda -1 --from <input>"
+        echo "  To run on the CPU:"
+        echo "    ./build/fast_sam_3dbody_run --onnx-dir ./onnx --cuda -1 --from <input>"
     fi
 fi
 

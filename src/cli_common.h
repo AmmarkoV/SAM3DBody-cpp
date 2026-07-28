@@ -78,7 +78,7 @@ struct CommonConfig
 #else
     std::string backbone_name  = "backbone.onnx";
 #endif
-    std::string decoder_name   = "decoder.onnx";  // resolved to decoder_fp16.onnx under --trt
+    std::string decoder_name   = "decoder.onnx";  // → decoder_fp16.onnx under --trt and on CPU
     int         cuda_device    = 0;       // -1 = CPU
     bool        use_trt        = false;
     bool        fp16           = true;    // can be disabled with --no-fp16
@@ -378,17 +378,63 @@ inline void ensure_trt_models(const CommonConfig& c)
 //     baked-in quant default (SAM3D_BACKBONE_QUANT → backbone_int8.onnx) wins, and
 //   * we are running on a CUDA device (FP16 on the CPU EP is not a win), and
 //   * <onnx_dir>/backbone_fp16.onnx actually exists.
+//
+// On CPU (--cuda -1) the swaps are a different story — see the block at the top of
+// the body: there the bf16 stock models don't just run slower, they don't load at
+// all, so the fp32 backbone / fp16 decoder are picked up as a correctness fix.
 inline void resolve_backbone_defaults(CommonConfig& c)
 {
-    if (c.cuda_device < 0)             return;   // CPU EP: FP16 offers no benefit
+    auto exists = [&](const std::string& name) {
+        return std::ifstream(c.onnx_dir + "/" + name).good();
+    };
+
+    // ── CPU EP: neither stock model may be bfloat16 ────────────────────────────
+    // backbone.onnx (355 bf16 tensors) and decoder.onnx (130) both ship as bf16
+    // exports.  ORT's CUDA EP has bf16 kernels; the CPU EP has none, so it refuses
+    // to even load the graph:
+    //   "Could not find an implementation for MatMul(13) node with name
+    //    '/init_to_token/MatMul'"
+    // The fp32 backbone / fp16 decoder are the CPU-runnable remaps (the fp16
+    // decoder matches fp32 to ~0.005% and is no slower on the CPU EP, so there is
+    // no fp32 decoder), and scripts/setup.sh --cpu-backbone fetches both.  Prefer
+    // them here so --cuda -1 works without the user having to name them, and say
+    // exactly how to get them when they're absent instead of leaving the user with
+    // ORT's cryptic MatMul error.
+    if (c.cuda_device < 0) {
+        if (c.decoder_name == "decoder.onnx") {
+            if (exists("decoder_fp16.onnx")) {
+                c.decoder_name = "decoder_fp16.onnx";
+                std::fprintf(stderr,
+                    "[cli] CPU: using 'decoder_fp16.onnx' (bf16 decoder.onnx has no CPU kernels).\n");
+            } else {
+                std::fprintf(stderr,
+                    "[cli] CPU: '%s/decoder_fp16.onnx' is missing and the bf16 "
+                    "decoder.onnx cannot load on the CPU EP.\n"
+                    "      Fetch the CPU models with:  bash scripts/setup.sh --cpu-backbone\n",
+                    c.onnx_dir.c_str());
+            }
+        }
+        // Same story for the backbone, unless the user pinned one or a build-time
+        // quant default (backbone_int8.onnx, which runs on CPU) is in play.
+        if (!c.backbone_name_set && c.backbone_name == "backbone.onnx") {
+            if (exists("backbone_fp32.onnx")) {
+                c.backbone_name = "backbone_fp32.onnx";
+                std::fprintf(stderr,
+                    "[cli] CPU: using 'backbone_fp32.onnx' (bf16 backbone.onnx has no CPU kernels).\n");
+            } else {
+                std::fprintf(stderr,
+                    "[cli] CPU: '%s/backbone_fp32.onnx' is missing and the bf16 "
+                    "backbone.onnx cannot load on the CPU EP.\n"
+                    "      Fetch the CPU models with:  bash scripts/setup.sh --cpu-backbone\n",
+                    c.onnx_dir.c_str());
+            }
+        }
+        return;   // the TRT / fp16-backbone swaps below are CUDA-only
+    }
 
     // Under --trt, fetch the TRT-ready models on the fly if they're not on disk
     // yet, so the swaps below can engage instead of falling back to the CUDA EP.
     ensure_trt_models(c);
-
-    auto exists = [&](const std::string& name) {
-        return std::ifstream(c.onnx_dir + "/" + name).good();
-    };
 
     // ── Decoder ────────────────────────────────────────────────────────────────
     // The stock decoder.onnx is bfloat16.  ORT's CUDA EP runs it fine, but the
