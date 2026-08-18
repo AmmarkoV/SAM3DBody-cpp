@@ -24,28 +24,38 @@ endif()
 # Model files check
 # ---------------------------------------------------------------------------
 set(_ONNX_DIR  "${CMAKE_CURRENT_SOURCE_DIR}/onnx")
-set(_ONNX_ZIP  "${CMAKE_CURRENT_SOURCE_DIR}/SAM3DBody-cpp-onnx-models.zip")
 set(_SENTINEL  "${_ONNX_DIR}/pipeline.gguf")   # representative file
 
+# Opt-in only.  A configure step that silently starts a multi-GB download would
+# break CI and packagers, so by default we just warn; the binaries themselves
+# recover at runtime via ensure_models() -> tools/fetch_model.sh.
+option(SAM3D_FETCH_MODELS "Download the model files at configure time" OFF)
+
 if(NOT EXISTS "${_SENTINEL}")
-    if(EXISTS "${_ONNX_ZIP}")
-        message(STATUS "")
-        message(STATUS "  *** Model zip found: ${_ONNX_ZIP}")
-        message(STATUS "  *** Extract it before running: unzip SAM3DBody-cpp-onnx-models.zip")
-        message(STATUS "")
+    if(SAM3D_FETCH_MODELS)
+        message(STATUS "SAM3D_FETCH_MODELS=ON — fetching models into ${_ONNX_DIR} …")
+        execute_process(
+            COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tools/fetch_model.sh"
+                    shared cuda --onnx-dir "${_ONNX_DIR}" --yes
+            RESULT_VARIABLE _FETCH_RC)
+        if(NOT _FETCH_RC EQUAL 0)
+            message(WARNING "Model fetch failed (exit ${_FETCH_RC}) — "
+                            "run 'bash tools/fetch_model.sh' by hand.")
+        endif()
     else()
         message(WARNING
             "\n"
             "  ┌─────────────────────────────────────────────────────────────────┐\n"
             "  │  Model files not found!                                         │\n"
             "  │                                                                 │\n"
-            "  │  Download SAM3DBody-cpp-onnx-models.zip from HuggingFace:       │\n"
-            "  │  https://huggingface.co/AmmarkoV/SAM3DBody-cpp-onnx-models      │\n"
+            "  │  Fetch them with any of:                                        │\n"
+            "  │    bash scripts/setup.sh                                        │\n"
+            "  │    bash tools/fetch_model.sh shared cuda      (CUDA, ~5.2 GB)   │\n"
+            "  │    bash tools/fetch_model.sh shared cpu       (CPU,  ~3.6 GB)   │\n"
+            "  │    cmake -DSAM3D_FETCH_MODELS=ON ..                             │\n"
             "  │                                                                 │\n"
-            "  │  Then extract it at the repo root:                              │\n"
-            "  │    unzip SAM3DBody-cpp-onnx-models.zip                          │\n"
-            "  │                                                                 │\n"
-            "  │  The build will succeed but the runtime will fail without them. │\n"
+            "  │  The build succeeds either way — the binaries also fetch them   │\n"
+            "  │  on first run when they are missing.                            │\n"
             "  └─────────────────────────────────────────────────────────────────┘\n"
         )
     endif()

@@ -35,13 +35,17 @@ Pre-built ONNX / GGUF / LBS model files are hosted on HuggingFace:
 
 ### With a CUDA GPU (recommended)
 
-Download the all-in-one zip, extract it, and place the resulting `onnx/` directory at the repo root:
+Fetch the models into `onnx/` at the repo root:
 
 ```bash
-wget https://huggingface.co/AmmarkoV/SAM3DBody-cpp-onnx-models/resolve/main/SAM3DBody-cpp-onnx-models.zip
-unzip SAM3DBody-cpp-onnx-models.zip
-# onnx/ is now at the repo root — ready to build
+bash tools/fetch_model.sh shared cuda    # ~5.2 GB
 ```
+
+`scripts/setup.sh` does this for you, and the binaries fetch them on first run if
+`onnx/` is missing — so this is only needed for a manual install. Use
+`shared cpu` (~3.6 GB) for a CPU-only machine, `shared trt` (~1.9 GB) for
+TensorRT, or `all` for every variant. Re-running only fetches what is absent, and
+an interrupted download resumes.
 
 | File | Size | Description |
 |------|------|-------------|

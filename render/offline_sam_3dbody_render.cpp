@@ -256,6 +256,7 @@ int main(int argc, char** argv)
     fsb::Pipeline pipeline;
     {
         fsb::PipelineConfig pcfg;
+        ensure_models(cfg);                     // fetch the models if onnx/ is empty
         resolve_detector_defaults(cfg);         // "auto" → libreyolo when available
         resolve_backbone_defaults(cfg);         // CUDA: prefer backbone_fp16.onnx if present
         apply_common_to_pipeline_cfg(cfg, pcfg);

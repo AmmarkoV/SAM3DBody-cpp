@@ -487,6 +487,7 @@ int main(int argc, char** argv)
     BVHWriter bvh_writer;
 
     fsb::PipelineConfig pcfg;
+    ensure_models(c);                       // fetch the models if onnx/ is empty
     resolve_detector_defaults(c);           // "auto" → libreyolo when available
     resolve_backbone_defaults(c);           // CUDA: prefer backbone_fp16.onnx if present
     apply_common_to_pipeline_cfg(c, pcfg);  // all shared pipeline fields

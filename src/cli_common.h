@@ -57,8 +57,10 @@
 #include <cstdio>
 #include <cstdlib>    // ensure_trt_models(): std::system() to wget/unzip the TRT models
 #include <cstring>
+#include <filesystem> // ensure_models(): locate the repo's onnx/ relative to the exe
 #include <fstream>    // resolve_backbone_defaults(): probe for backbone_fp16.onnx
 #include <string>
+#include <vector>     // ensure_models(): sentinel file list
 #include <glob.h>     // resolve_detector_defaults(): find libreyolo*.onnx in onnx_dir
 #include <unistd.h>   // ensure_trt_models(): readlink("/proc/self/exe") to locate setup_trt.sh
 
@@ -254,6 +256,142 @@ inline bool path_looks_like_libreyolo(const std::string& p)
     return base.find("libreyolo") != std::string::npos ||
            base.find("yolov9")    != std::string::npos ||
            base.find("yolo9")     != std::string::npos;
+}
+
+// ---------------------------------------------------------------------------
+// Lazily fetch the model files when they are missing at startup.
+//
+// scripts/setup.sh fetches them at install time; this is the runtime recovery
+// path for a checkout where that never ran (or where onnx/ was cleaned).  It
+// shells out to tools/fetch_model.sh, which pulls the individual files from
+// HuggingFace and verifies size + sha256 — the same delegation ensure_trt_models()
+// below uses for setup_trt.sh, so curl/TLS stays out of this binary.
+//
+// Call FIRST, before resolve_detector_defaults() / resolve_backbone_defaults():
+// both of those decide what to load by probing onnx_dir, so they need the files
+// to be on disk before they run.
+//
+// Two details that are easy to get wrong:
+//
+//   * The profile comes from the user's INTENT (--cuda), never from what is on
+//     disk.  resolve_backbone_defaults() picks fp32-vs-bf16 by probing, but with
+//     an empty onnx_dir that probe finds nothing and falls through to the bf16
+//     default — which would fetch 5.1 GB of CUDA models for a --cuda -1 run that
+//     then cannot load them (the CPU EP has no bf16 kernels).
+//
+//   * When the default './onnx' is missing we fetch into the onnx/ next to the
+//     executable, not into the current directory.  Otherwise the classic "ran it
+//     from build/" mistake (see the warning box in main()) stops being a warning
+//     and turns into a multi-GB download into build/onnx.
+//
+// Best-effort throughout: on any failure we warn and return, leaving the existing
+// "model missing" diagnostics to fire exactly as before.  SAM3D_AUTO_FETCH=0
+// disables it outright; fetch_model.sh itself refuses to download when it has no
+// terminal to prompt on, which keeps ROS nodes and CI jobs from silently pulling
+// gigabytes.
+inline void ensure_models(CommonConfig& c)
+{
+    const bool cpu = (c.cuda_device < 0);
+    const char* profile;
+    if (cpu)                      profile = "cpu";     // CPU EP: fp32 backbone + fp16 decoder
+    else if (c.use_trt)           profile = "shared";  // the TRT pair is ensure_trt_models()' job
+    else if (c.backbone_name_set) profile = "shared";  // user is driving the model choice
+    else                          profile = "cuda";    // bf16 backbone + bf16 decoder
+
+    // Deliberately NOT the 'trt' profile under --trt: setup_trt.sh also provisions
+    // the TensorRT runtime venv, and fetching the TRT models here would make
+    // ensure_trt_models() take its "already have them" early return and skip that.
+    // Pulling the 5.1 GB 'cuda' fallback set would be worse still, since a TRT run
+    // never loads it once the fp16 pair is on disk.
+
+    // Mirrors the manifest in tools/fetch_model.sh.  Presence only — the script
+    // does the size/sha verification, and re-running it is cheap and idempotent.
+    std::vector<std::string> sentinels = {
+        "pipeline.gguf", "body_model.lbs", "yolo.onnx",
+        "correctives.bin", "keypoint_mapping.bin"
+    };
+    if (cpu) {
+        // Fetched even when --backbone is pinned: pinning the backbone says
+        // nothing about the decoder, and the bf16 decoder.onnx has no CPU kernels.
+        sentinels.insert(sentinels.end(), {
+            "backbone_fp32.onnx", "backbone_fp32.onnx.data",
+            "decoder_fp16.onnx",  "decoder_fp16.onnx.data" });
+    } else if (!c.use_trt && !c.backbone_name_set) {
+        sentinels.insert(sentinels.end(), {
+            "backbone.onnx", "backbone.onnx.data", "decoder.onnx" });
+    }
+
+    // Where the executable lives, so we can find both the repo's onnx/ and the
+    // fetch script without depending on the working directory.
+    std::string exe_dir;
+    {
+        char buf[4096];
+        ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+        if (n > 0) {
+            buf[n] = '\0';
+            std::string exe(buf);
+            size_t s = exe.find_last_of('/');
+            if (s != std::string::npos) exe_dir = exe.substr(0, s);
+        }
+    }
+
+    // Retarget the default './onnx' at the repo's onnx/ when the cwd has none.
+    // Only ever fires in the case that fails outright today.
+    if (c.onnx_dir == "./onnx" && !std::filesystem::exists("./onnx") && !exe_dir.empty()) {
+        std::string repo_onnx = exe_dir + "/../onnx";
+        std::error_code ec;
+        std::filesystem::path canon = std::filesystem::weakly_canonical(repo_onnx, ec);
+        if (!ec) {
+            c.onnx_dir = canon.string();
+            // gguf_path / yolo_path default to "./onnx/..." independently of
+            // onnx_dir, so they have to move with it — otherwise the backbone
+            // loads from the repo while YOLO still looks in the (absent) ./onnx.
+            if (c.gguf_path == "./onnx/pipeline.gguf")
+                c.gguf_path = c.onnx_dir + "/pipeline.gguf";
+            if (!c.yolo_path_set && c.yolo_path == "./onnx/yolo.onnx")
+                c.yolo_path = c.onnx_dir + "/yolo.onnx";
+            std::fprintf(stderr,
+                "[cli] './onnx' not in the working directory — using '%s' instead.\n",
+                c.onnx_dir.c_str());
+        }
+    }
+
+    // Locating models the user already has is not downloading, so this opt-out
+    // is honoured only from here on.
+    if (const char* e = std::getenv("SAM3D_AUTO_FETCH"))
+        if (e[0] == '0' && e[1] == '\0') return;
+
+    auto missing = [&] {
+        for (const auto& f : sentinels)
+            if (!std::ifstream(c.onnx_dir + "/" + f).good()) return true;
+        return false;
+    };
+    if (!missing()) return;
+
+    std::string script;
+    if (!exe_dir.empty() && std::ifstream(exe_dir + "/../tools/fetch_model.sh").good())
+        script = exe_dir + "/../tools/fetch_model.sh";
+    else if (std::ifstream("tools/fetch_model.sh").good())
+        script = "tools/fetch_model.sh";
+
+    if (script.empty()) {
+        std::fprintf(stderr,
+            "[cli] models missing from '%s' and tools/fetch_model.sh not found; "
+            "fetch them with:  bash scripts/setup.sh\n", c.onnx_dir.c_str());
+        return;
+    }
+
+    std::fprintf(stderr,
+        "[cli] models missing from '%s' — running '%s %s' to fetch them…\n",
+        c.onnx_dir.c_str(), script.c_str(), profile);
+
+    const std::string cmd = "bash '" + script + "' " + profile +
+                            " --onnx-dir '" + c.onnx_dir + "'";
+    if (std::system(cmd.c_str()) != 0 || missing()) {
+        std::fprintf(stderr,
+            "[cli] model fetch did not complete — continuing; the load below will "
+            "report what is still missing.\n");
+    }
 }
 
 // Resolve the "auto" detector default and the per-detector confidence default.

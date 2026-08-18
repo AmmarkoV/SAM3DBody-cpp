@@ -156,10 +156,6 @@ BUILD_DIR="${REPO_ROOT}/build"
 VENV_DIR="${REPO_ROOT}/venv"
 ONNX_DIR="${REPO_ROOT}/onnx"
 
-HF_BASE="https://huggingface.co/AmmarkoV/SAM3DBody-cpp-onnx-models/resolve/main"
-HF_ZIP_NAME="SAM3DBody-cpp-onnx-models.zip"
-HF_ZIP_URL="${HF_BASE}/${HF_ZIP_NAME}"
-
 # ── Defaults ───────────────────────────────────────────────────────────────────
 CUDA_ARCH=""
 ORT_DIR=""
@@ -191,89 +187,26 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# ── Helper: download with resume support ───────────────────────────────────────
-_download() {
-    local url="$1" dest="$2" desc="${3:-}"
-    [[ -n "$desc" ]] && echo "  Downloading ${desc} …"
-    if command -v wget &>/dev/null; then
-        wget --continue --show-progress -q -O "${dest}" "${url}"
-    elif command -v curl &>/dev/null; then
-        curl -L --continue-at - --progress-bar -o "${dest}" "${url}"
-    else
-        echo "ERROR: neither wget nor curl found. Install one and retry." >&2
-        exit 1
-    fi
-}
-
-# ── Check for required model files ────────────────────────────────────────────
-_models_present() {
-    local required=( backbone.onnx decoder.onnx yolo.onnx pipeline.gguf body_model.lbs )
-    for f in "${required[@]}"; do
-        [[ -f "${ONNX_DIR}/${f}" ]] || return 1
-    done
-    return 0
-}
-
 # ── Model download ─────────────────────────────────────────────────────────────
+# Per-file fetch from HuggingFace via tools/fetch_model.sh (manifest + size/sha
+# verification live there).  'cuda' is the bf16 backbone/decoder pair the ORT
+# CUDA EP wants; --cpu-backbone adds the fp32 backbone + fp16 decoder, which are
+# the only ones the CPU EP can load.
 if [[ "${SKIP_MODELS}" -eq 0 ]]; then
-    echo "=== Checking models in ${ONNX_DIR} ==="
-    if _models_present; then
-        echo "  All required model files found — skipping download."
-        echo "  (Pass --skip-models to suppress this check, or delete onnx/ to re-download.)"
-    else
-        echo "  Models not found. Downloading from HuggingFace (~5 GB)…"
-        echo "  Source: ${HF_ZIP_URL}"
-        echo ""
+    echo "=== Fetching models into ${ONNX_DIR} ==="
+    _PROFILES=( shared cuda )
+    [[ "${CPU_BACKBONE}" -eq 1 ]] && _PROFILES+=( cpu )
 
-        mkdir -p "${ONNX_DIR}"
-        _ZIP_TMP="${REPO_ROOT}/${HF_ZIP_NAME}"
+    bash "${REPO_ROOT}/tools/fetch_model.sh" "${_PROFILES[@]}" \
+         --onnx-dir "${ONNX_DIR}" --yes
 
-        if [[ -f "${_ZIP_TMP}" ]]; then
-            echo "  Found existing partial/complete zip at ${_ZIP_TMP} — attempting resume."
-        fi
-
-        _download "${HF_ZIP_URL}" "${_ZIP_TMP}" "${HF_ZIP_NAME}"
-
-        echo "  Extracting ${HF_ZIP_NAME} …"
-        if command -v unzip &>/dev/null; then
-            unzip -o "${_ZIP_TMP}" -d "${REPO_ROOT}"
-        else
-            echo "ERROR: unzip not found. Install it (e.g. sudo apt install unzip) and retry." >&2
-            exit 1
-        fi
-
-        # The zip extracts to onnx/ at repo root
-        if _models_present; then
-            echo "  Extraction OK. Removing zip archive …"
-            rm -f "${_ZIP_TMP}"
-        else
-            echo "WARNING: Extraction finished but some model files are still missing." >&2
-            echo "         Zip kept at ${_ZIP_TMP} for inspection." >&2
-        fi
-    fi
-
-    # Optional: CPU-compatible models (for machines without CUDA).
-    # The stock backbone.onnx and decoder.onnx are both bfloat16 exports.  ORT's
-    # CUDA EP has bf16 kernels, the CPU EP has none, so on --cuda -1 they fail to
-    # load outright ("Could not find an implementation for MatMul(13) …").  Grab
-    # the fp32 backbone and the fp16 decoder, which the CPU EP does run — the
-    # binary picks both up automatically once they're in onnx/.
     if [[ "${CPU_BACKBONE}" -eq 1 ]]; then
-        echo ""
-        echo "=== Downloading CPU-runnable models (fp32 backbone + fp16 decoder) ==="
-        for _f in backbone_fp32.onnx "backbone_fp32.onnx.data" \
-                  decoder_fp16.onnx  "decoder_fp16.onnx.data"; do
-            if [[ -f "${ONNX_DIR}/${_f}" ]]; then
-                echo "  ${_f} already present — skipping."
-            else
-                _download "${HF_BASE}/${_f}" "${ONNX_DIR}/${_f}" "${_f}"
-            fi
-        done
         echo ""
         echo "  To run on the CPU:"
         echo "    ./build/fast_sam_3dbody_run --onnx-dir ./onnx --cuda -1 --from <input>"
     fi
 fi
+
 
 # ── External dependency: RGBDAcquisition ───────────────────────────────────────
 _RGBDA_REPO="https://github.com/AmmarkoV/RGBDAcquisition"
