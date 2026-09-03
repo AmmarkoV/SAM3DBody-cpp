@@ -19,6 +19,34 @@ static constexpr int   PATCH_SIZE       = 16;
 // BBoxScale padding factor – matches Python transforms BBoxScale(padding=1.25).
 // The crop is expanded by this factor, and condition_info[2] = (bbox_size*1.25) / focal.
 static constexpr float BBOX_SCALE_FACTOR = 1.25f;
+// "Human prior" aspect ratio (w/h) used by Python's TopdownAffine before it
+// reshapes the crop to the model's square input — see fixed_aspect_bbox_size().
+static constexpr float PRIOR_ASPECT_RATIO = 0.75f;
+
+// ─── Reproduce Python's two-stage TopdownAffine aspect-ratio fix ─────────────
+//
+// Python (sam_3d_body/data/transforms/bbox_utils.py::fix_aspect_ratio) is
+// called twice on the padded bbox scale (w0,h0) = (bw,bh) * BBOX_SCALE_FACTOR:
+//   1. reshape to a 3:4 "human" prior aspect ratio (PRIOR_ASPECT_RATIO)
+//   2. reshape that to the model's own square input aspect (1.0), which for a
+//      square target always resolves to side = max(w1, h1).
+//
+// For boxes narrower than the 3:4 prior (typical tight photo crops) this
+// collapses back to max(bw,bh)*BBOX_SCALE_FACTOR. For boxes wider than 3:4
+// (e.g. a bbox padded out by flowing clothing) it pads noticeably more —
+// omitting this step under-crops the network's input and distorts the
+// regressed body proportions (see SAM3DBody-cpp issue #15).
+inline float fixed_aspect_bbox_size(float bw, float bh)
+{
+    float w0 = bw * BBOX_SCALE_FACTOR;
+    float h0 = bh * BBOX_SCALE_FACTOR;
+
+    float w1, h1;
+    if (w0 > h0 * PRIOR_ASPECT_RATIO) { w1 = w0; h1 = w0 / PRIOR_ASPECT_RATIO; }
+    else                              { w1 = h0 * PRIOR_ASPECT_RATIO; h1 = h0; }
+
+    return std::max(w1, h1);
+}
 
 // ─── Crop one person out of a BGR image and return normalised CHW float32 ─────
 //
@@ -48,8 +76,7 @@ inline void crop_and_normalise(
     float cy   = (bbox_y1 + bbox_y2) * 0.5f;
     float bw   = bbox_x2 - bbox_x1;
     float bh   = bbox_y2 - bbox_y1;
-    // Expand by BBOX_SCALE_FACTOR (1.25) to match Python BBoxScale(padding=1.25).
-    float side = std::max(bw, bh) * BBOX_SCALE_FACTOR;
+    float side = fixed_aspect_bbox_size(bw, bh);
 
     crop_cx      = cx;
     crop_cy      = cy;
@@ -70,8 +97,12 @@ inline void crop_and_normalise(
     int roi_w = sx2 - sx1;
     int roi_h = sy2 - sy1;
 
-    // Create padded square (114 grey = common YOLO convention)
-    cv::Mat padded(y2 - y1, x2 - x1, CV_8UC3, cv::Scalar(114, 114, 114));
+    // Create padded square. Python's cv2.warpAffine (TopdownAffine) uses its
+    // default borderValue, which is black (0,0,0) — match that, not the
+    // grey(114) YOLO-letterbox convention (see SAM3DBody-cpp issue #15: a
+    // grey pad here vs black in the reference pipeline showed up as a large
+    // normalised-input divergence whenever the crop extends past the image).
+    cv::Mat padded(y2 - y1, x2 - x1, CV_8UC3, cv::Scalar(0, 0, 0));
     if (roi_w > 0 && roi_h > 0) {
         bgr(cv::Rect(sx1, sy1, roi_w, roi_h))
             .copyTo(padded(cv::Rect(pad_l, pad_t, roi_w, roi_h)));

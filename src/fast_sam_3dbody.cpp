@@ -1039,7 +1039,7 @@ struct Pipeline::Impl
                 float bh      = d.y2 - d.y1;
                 float bbox_cx = (d.x1 + d.x2) * 0.5f;
                 float bbox_cy = (d.y1 + d.y2) * 0.5f;
-                float bs      = std::max(bw, bh) * 1.25f * s_val + 1e-8f;
+                float bs      = fixed_aspect_bbox_size(bw, bh) * s_val + 1e-8f;
                 float tz      = 2.0f * fx / bs;
                 float cx_off  = 2.0f * (bbox_cx - cx) / bs;
                 float cy_off  = 2.0f * (bbox_cy - cy) / bs;
