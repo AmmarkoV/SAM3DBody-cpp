@@ -370,7 +370,6 @@ struct Pipeline::Impl
     CFFN mhr_ffn, cam_ffn;
 
     // ── Refined pose (see PLAN.md) — only loaded when cfg.refined_pose ───────
-    OrtSession sess_decoder_handbox;   // decoder_handbox_fp32.onnx: pose_token+hand_box+hand_cls
     CFFN mhr_ffn_hand, cam_ffn_hand;   // gguf mhr_proj_hand / cam_proj_hand
 
     // Iterative pass-2 (decoder_prompted, faithful port of Python's real
@@ -390,6 +389,25 @@ struct Pipeline::Impl
     OrtSession sess_decoder_hand_normfinal;
     OrtSession sess_decoder_hand_update;
     static constexpr int HAND_N_TOK = 145, HAND_KPS_START = 3, HAND_KPS3D_START = 73;
+
+    // Iterative pass-1 (plain body decode — decoder.onnx never had the real
+    // do_interm_preds + keypoint_token_update loop either; discovered while
+    // chasing the wrist-IK gate's dist_norm/angle_diff discrepancy — see
+    // POSEREFINE.md "continue hunting down discrepancies with hands"). Only
+    // used when cfg.refined_pose is on (the plain single-shot sess_decoder
+    // path remains for the non-refined case, unchanged).
+    // Token layout differs from both pass-2 (real N=4 prompt) and hand
+    // (no hand_box_embedding token pair) — dedicated layer/normfinal/update
+    // graphs, not reused from decoder_prompted_*/decoder_hand_* despite
+    // sharing the same underlying model.decoder weights (ONNX only marks the
+    // batch dim dynamic here, not the token-count dim).
+    OrtSession sess_decoder_pass1_pre;
+    std::array<OrtSession,6> sess_decoder_pass1_layers;
+    OrtSession sess_decoder_pass1_normfinal;
+    OrtSession sess_decoder_pass1_update;
+    OrtSession sess_decoder_pass1_handbox;   // last raw layer token -> hand_box+hand_cls
+    static constexpr int PASS1_N_TOK = 145, PASS1_KPS_START = 3, PASS1_KPS3D_START = 73,
+                          PASS1_HANDBOX_START = 143;
 
     // Keypoint mapping: sparse COO format for 70 MHR keypoints
     // Maps [vertices(18439) + joints(127)] → 70 keypoints
@@ -552,16 +570,6 @@ struct Pipeline::Impl
         // ── Refined pose (see PLAN.md) — extra decoder passes, off by default ──
         if (cfg.refined_pose)
         {
-            printf("[FSB] Loading decoder_handbox (fp32) … ");
-            fflush(stdout);
-            // fp32 (not bf16): ORT's CUDA EP has a bf16-specific race condition
-            // on this graph's 2-token hand-box slice+MLP (non-deterministic
-            // garbage on repeat runs of the identical file) — see PLAN.md.
-            if (!sess_decoder_handbox.load(ort_env, opath(cfg.decoder_handbox_name.c_str()),
-                                           cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false))
-                return false;
-            printf("OK\n");
-
             printf("[FSB] Loading decoder_hand (iterative, 9 graphs) … ");
             fflush(stdout);
             if (!sess_decoder_hand_pre.load(ort_env, opath("decoder_hand_pre.onnx"),
@@ -601,6 +609,30 @@ struct Pipeline::Impl
                 return false;
             if (!sess_decoder_prompted_update.load(ort_env, opath("decoder_prompted_update.onnx"),
                                                      cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false))
+                return false;
+            printf("OK\n");
+
+            printf("[FSB] Loading decoder_pass1 (iterative, 10 graphs) … ");
+            fflush(stdout);
+            if (!sess_decoder_pass1_pre.load(ort_env, opath("decoder_pass1_pre.onnx"),
+                                              cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false))
+                return false;
+            for (int li = 0; li < 6; ++li)
+            {
+                char fname[64];
+                snprintf(fname, sizeof(fname), "decoder_pass1_layer%d.onnx", li);
+                if (!sess_decoder_pass1_layers[li].load(ort_env, opath(fname),
+                                                         cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false))
+                    return false;
+            }
+            if (!sess_decoder_pass1_normfinal.load(ort_env, opath("decoder_pass1_normfinal.onnx"),
+                                                     cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false))
+                return false;
+            if (!sess_decoder_pass1_update.load(ort_env, opath("decoder_pass1_update.onnx"),
+                                                  cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false))
+                return false;
+            if (!sess_decoder_pass1_handbox.load(ort_env, opath("decoder_pass1_handbox.onnx"),
+                                                   cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false))
                 return false;
             printf("OK\n");
         }
@@ -977,7 +1009,7 @@ struct Pipeline::Impl
         timers.backbone += dt_bb;
         printf("[FSB] backbone:   %.1f ms\n", dt_bb);
 
-        // ── decoder ──────────────────────────────────────────────────────────
+        // ── decoder (pass 1) ─────────────────────────────────────────────────
         t0 = Clock::now();
         const int DECODER_DIM = (int)meta.decoder_dim;
         const size_t token_elems = (size_t)B * DECODER_DIM;
@@ -986,30 +1018,219 @@ struct Pipeline::Impl
         std::vector<int64_t> cond_shape{B, 3};
         std::vector<int64_t> ray_shape {B, 2, FEAT_HW, FEAT_HW};
 
-        Ort::Value feat_t = Ort::Value::CreateTensor<float>(
-                                mi, features.data(), features.size(), feat_shape.data(), 4);
-        Ort::Value cond_t = Ort::Value::CreateTensor<float>(
-                                mi, batch_cond.data(), batch_cond.size(), cond_shape.data(), 2);
-        Ort::Value ray_t  = Ort::Value::CreateTensor<float>(
-                                mi, batch_ray.data(), batch_ray.size(), ray_shape.data(), 4);
+        std::vector<float> pose_tokens(token_elems);
+        // Hoisted to function scope: populated below (iterative refined-pose
+        // path) or left zeroed (plain path, where hand crops are never
+        // built) — used again after the results-assembly loop (gate / pass-2
+        // keypoint prompt / wrist-IK / splice).
+        std::vector<std::array<float,8>> hand_box_out(B);
+        std::vector<std::array<float,4>> hand_cls_out(B);
+        for (auto& a : hand_box_out) a.fill(0.f);
+        for (auto& a : hand_cls_out) a.fill(0.f);
 
-        std::vector<Ort::Value> dec_inputs;
-        dec_inputs.push_back(std::move(feat_t));
-        dec_inputs.push_back(std::move(cond_t));
-        dec_inputs.push_back(std::move(ray_t));
+        if (cfg.refined_pose && sess_decoder_pass1_pre.session)
+        {
+            // Iterative pass 1 — faithful port of Python's real do_interm_preds +
+            // keypoint_token_update loop. decoder.onnx (the plain single-shot
+            // path in the `else` branch below) never had this either, discovered
+            // while chasing the wrist-IK gate's dist_norm/angle_diff discrepancy
+            // — see POSEREFINE.md "continue hunting down discrepancies with
+            // hands". Per-person (batch=1), same recipe as the pass-2/hand-crop
+            // loops further below. Also regresses hand_box/hand_cls from the
+            // LAST layer's raw (pre-norm_final) token, exactly mirroring
+            // `_get_hand_box`'s real source (`pose_output["mhr"]["hand_box"]` =
+            // `self.bbox_embed(tokens_output)`, not the norm_final'd pose token).
+            static const float zero_face72_p1[72] = {};
+            for (int i = 0; i < B; ++i)
+            {
+                std::vector<int64_t> f_sh{1, BACKBONE_DIM, FEAT_HW, FEAT_HW};
+                std::vector<int64_t> c_sh{1, 3};
+                std::vector<int64_t> r_sh{1, 2, FEAT_HW, FEAT_HW};
 
-        std::vector<const char*>& dec_in_names  = sess_decoder.input_names;
-        std::vector<const char*>& dec_out_names = sess_decoder.output_names;
+                Ort::Value pf_t = Ort::Value::CreateTensor<float>(
+                                      mi, features.data() + (size_t)i*BACKBONE_DIM*FEAT_HW*FEAT_HW,
+                                      (size_t)BACKBONE_DIM*FEAT_HW*FEAT_HW, f_sh.data(), 4);
+                Ort::Value pc_t = Ort::Value::CreateTensor<float>(
+                                      mi, batch_cond.data() + (size_t)i*3, 3, c_sh.data(), 2);
+                Ort::Value pr_t = Ort::Value::CreateTensor<float>(
+                                      mi, batch_ray.data() + (size_t)i*2*ray_plane, 2*ray_plane, r_sh.data(), 4);
+                std::vector<Ort::Value> p1_inputs;
+                p1_inputs.push_back(std::move(pf_t));
+                p1_inputs.push_back(std::move(pc_t));
+                p1_inputs.push_back(std::move(pr_t));
 
-        auto decoder_out = sess_decoder.session->Run(
-                               Ort::RunOptions{nullptr},
-                               dec_in_names.data(),  dec_inputs.data(),  dec_inputs.size(),
-                               dec_out_names.data(), 1);
-        const float* token_ptr = decoder_out[0].GetTensorData<float>();
-        std::vector<float> pose_tokens(token_ptr, token_ptr + token_elems);
-        double dt_dec = ms(t0);
-        timers.decoder += dt_dec;
-        printf("[FSB] decoder:    %.1f ms\n", dt_dec);
+                auto pre_out = sess_decoder_pass1_pre.session->Run(
+                                   Ort::RunOptions{nullptr},
+                                   sess_decoder_pass1_pre.input_names.data(), p1_inputs.data(), p1_inputs.size(),
+                                   sess_decoder_pass1_pre.output_names.data(), 5);
+                std::vector<float> token(pre_out[0].GetTensorData<float>(),
+                                          pre_out[0].GetTensorData<float>() + (size_t)PASS1_N_TOK*1024);
+                std::vector<float> tok_aug(pre_out[1].GetTensorData<float>(),
+                                            pre_out[1].GetTensorData<float>() + (size_t)PASS1_N_TOK*1024);
+                std::vector<float> feat_chw(pre_out[2].GetTensorData<float>(),
+                                             pre_out[2].GetTensorData<float>() + (size_t)BACKBONE_DIM*FEAT_HW*FEAT_HW);
+                std::vector<float> feat_flat(pre_out[3].GetTensorData<float>(),
+                                              pre_out[3].GetTensorData<float>() + (size_t)FEAT_HW*FEAT_HW*BACKBONE_DIM);
+                std::vector<float> img_aug_flat(pre_out[4].GetTensorData<float>(),
+                                                 pre_out[4].GetTensorData<float>() + (size_t)FEAT_HW*FEAT_HW*BACKBONE_DIM);
+
+                // Mirrors pass-2's decode_intermediate lambda exactly
+                // (build_model_params/apply_hand_pose/scale PCA/mhr_lbs_compute/
+                // kp_mapping/camera formula) — just uses dets[i] instead of
+                // r.bbox, since pass 1 runs before results[] is assembled.
+                auto decode_intermediate_p1 = [&](const float* praw, const float* pcam,
+                                                    std::vector<float>& kp2d_cropped_out,
+                                                    std::vector<float>& kp2d_depth_out,
+                                                    std::vector<float>& kp3d_out)
+                {
+                    float g_rot[3]; rot6d_to_euler(praw, g_rot);
+                    std::array<float,133> b_euler{};
+                    compact_cont_to_body_params(praw + 6, b_euler.data());
+                    ModelParams204 mpi = build_model_params(g_rot, b_euler.data(), nullptr, true);
+                    apply_hand_pose(mpi.data, praw + 339,
+                                     lbs_data->hand_pose_mean, lbs_data->hand_pose_comps,
+                                     lbs_data->hand_joint_idxs_left, lbs_data->hand_joint_idxs_right);
+                    if (lbs_data->scale_mean && lbs_data->scale_comps)
+                    {
+                        int ns = lbs_data->n_scale_out, npc = lbs_data->n_scale_pc;
+                        for (int j = 0; j < ns; ++j) mpi.data[136+j] = lbs_data->scale_mean[j];
+                        for (int k = 0; k < npc; ++k)
+                            for (int j = 0; j < ns; ++j)
+                                mpi.data[136+j] += praw[311+k] * lbs_data->scale_comps[k*ns+j];
+                    }
+                    std::vector<float> iv((size_t)lbs_data->n_verts*3), ij((size_t)lbs_data->n_joints*3);
+                    if (!mhr_lbs_compute(lbs_data, mpi.data, praw + 266, zero_face72_p1,
+                                          iv.data(), ij.data(), nullptr))
+                        return false;
+                    kp3d_out.assign(70*3, 0.f);
+                    for (const auto& e : kp_mapping)
+                        for (int c = 0; c < 3; ++c)
+                        {
+                            float src = (e.col < 18439) ? iv[e.col*3+c] : ij[(e.col-18439)*3+c];
+                            kp3d_out[e.row*3+c] += src * e.val;
+                        }
+                    float s_val = -pcam[0], t_x = pcam[1], t_y = -pcam[2];
+                    float bw = dets[i].x2-dets[i].x1, bh = dets[i].y2-dets[i].y1;
+                    float bbox_cx = (dets[i].x1+dets[i].x2)*0.5f, bbox_cy = (dets[i].y1+dets[i].y2)*0.5f;
+                    float bs = fixed_aspect_bbox_size(bw,bh)*s_val + 1e-8f;
+                    float cam_t[3] = { t_x + 2.f*(bbox_cx-cx)/bs, t_y + 2.f*(bbox_cy-cy)/bs, 2.f*fx/bs };
+                    kp2d_cropped_out.assign(70*2, 0.f);
+                    kp2d_depth_out.assign(70, 0.f);
+                    for (int k = 0; k < 70; ++k)
+                    {
+                        float dz = kp3d_out[k*3+2] + cam_t[2];
+                        float dx = kp3d_out[k*3+0] + cam_t[0];
+                        float dy = kp3d_out[k*3+1] + cam_t[1];
+                        if (dz < 1e-4f) dz = 1e-4f;
+                        float full_x = dx/dz*fx + cx, full_y = dy/dz*fy + cy;
+                        kp2d_cropped_out[k*2+0] = (full_x - crop_cx_v[i]) / crop_sz_v[i];
+                        kp2d_cropped_out[k*2+1] = (full_y - crop_cy_v[i]) / crop_sz_v[i];
+                        kp2d_depth_out[k] = dz;
+                    }
+                    return true;
+                };
+
+                for (int layer_idx = 0; layer_idx < 6; ++layer_idx)
+                {
+                    std::vector<int64_t> tok_sh{1, PASS1_N_TOK, 1024}, img_sh{1, FEAT_HW*FEAT_HW, BACKBONE_DIM};
+                    Ort::Value t_tok = Ort::Value::CreateTensor<float>(mi, token.data(), token.size(), tok_sh.data(), 3);
+                    Ort::Value t_img = Ort::Value::CreateTensor<float>(mi, feat_flat.data(), feat_flat.size(), img_sh.data(), 3);
+                    Ort::Value t_aug = Ort::Value::CreateTensor<float>(mi, tok_aug.data(), tok_aug.size(), tok_sh.data(), 3);
+                    Ort::Value t_iag = Ort::Value::CreateTensor<float>(mi, img_aug_flat.data(), img_aug_flat.size(), img_sh.data(), 3);
+                    std::vector<Ort::Value> lin; lin.push_back(std::move(t_tok)); lin.push_back(std::move(t_img));
+                    lin.push_back(std::move(t_aug)); lin.push_back(std::move(t_iag));
+                    auto& ls = sess_decoder_pass1_layers[layer_idx];
+                    auto lout = ls.session->Run(Ort::RunOptions{nullptr}, ls.input_names.data(), lin.data(), lin.size(),
+                                                 ls.output_names.data(), 2);
+                    token.assign(lout[0].GetTensorData<float>(), lout[0].GetTensorData<float>() + token.size());
+
+                    if (layer_idx == 5) break;  // last layer: raw token feeds hand_box below + normfinal for body pose
+
+                    std::vector<int64_t> pt_sh{1, PASS1_N_TOK, 1024};
+                    Ort::Value nf_in = Ort::Value::CreateTensor<float>(mi, token.data(), token.size(), pt_sh.data(), 3);
+                    std::vector<Ort::Value> nfin; nfin.push_back(std::move(nf_in));
+                    auto nfout = sess_decoder_pass1_normfinal.session->Run(
+                                     Ort::RunOptions{nullptr}, sess_decoder_pass1_normfinal.input_names.data(),
+                                     nfin.data(), nfin.size(), sess_decoder_pass1_normfinal.output_names.data(), 1);
+                    const float* pose_token_l = nfout[0].GetTensorData<float>();
+
+                    std::vector<float> l_mhr = cffn_run(mhr_ffn, pose_token_l, 1);
+                    std::vector<float> l_cam = cffn_run(cam_ffn, pose_token_l, 1);
+                    std::vector<float> kp2d_c, kp2d_d, kp3d;
+                    if (!decode_intermediate_p1(l_mhr.data(), l_cam.data(), kp2d_c, kp2d_d, kp3d))
+                        break;
+
+                    std::vector<int64_t> chw_sh{1, BACKBONE_DIM, FEAT_HW, FEAT_HW};
+                    std::vector<int64_t> k2_sh{1, 70, 2}, kd_sh{1, 70}, k3_sh{1, 70, 3};
+                    Ort::Value u_tok = Ort::Value::CreateTensor<float>(mi, token.data(), token.size(), tok_sh.data(), 3);
+                    Ort::Value u_aug = Ort::Value::CreateTensor<float>(mi, tok_aug.data(), tok_aug.size(), tok_sh.data(), 3);
+                    Ort::Value u_chw = Ort::Value::CreateTensor<float>(mi, feat_chw.data(), feat_chw.size(), chw_sh.data(), 4);
+                    Ort::Value u_k2  = Ort::Value::CreateTensor<float>(mi, kp2d_c.data(), kp2d_c.size(), k2_sh.data(), 3);
+                    Ort::Value u_kd  = Ort::Value::CreateTensor<float>(mi, kp2d_d.data(), kp2d_d.size(), kd_sh.data(), 2);
+                    Ort::Value u_k3  = Ort::Value::CreateTensor<float>(mi, kp3d.data(), kp3d.size(), k3_sh.data(), 3);
+                    std::vector<Ort::Value> uin;
+                    uin.push_back(std::move(u_tok)); uin.push_back(std::move(u_aug)); uin.push_back(std::move(u_chw));
+                    uin.push_back(std::move(u_k2));  uin.push_back(std::move(u_kd));  uin.push_back(std::move(u_k3));
+                    auto uout = sess_decoder_pass1_update.session->Run(
+                                    Ort::RunOptions{nullptr}, sess_decoder_pass1_update.input_names.data(),
+                                    uin.data(), uin.size(), sess_decoder_pass1_update.output_names.data(), 2);
+                    token.assign(uout[0].GetTensorData<float>(), uout[0].GetTensorData<float>() + token.size());
+                    tok_aug.assign(uout[1].GetTensorData<float>(), uout[1].GetTensorData<float>() + tok_aug.size());
+                }
+
+                // Last layer's RAW token (pre-norm_final) — hand_box/hand_cls source.
+                {
+                    std::vector<int64_t> tok_sh{1, PASS1_N_TOK, 1024};
+                    Ort::Value hbtok = Ort::Value::CreateTensor<float>(mi, token.data(), token.size(), tok_sh.data(), 3);
+                    std::vector<Ort::Value> hbin; hbin.push_back(std::move(hbtok));
+                    auto hbout = sess_decoder_pass1_handbox.session->Run(
+                                     Ort::RunOptions{nullptr}, sess_decoder_pass1_handbox.input_names.data(),
+                                     hbin.data(), hbin.size(), sess_decoder_pass1_handbox.output_names.data(), 2);
+                    const float* hb = hbout[0].GetTensorData<float>();   // [1,2,4]
+                    const float* hc = hbout[1].GetTensorData<float>();   // [1,2,2]
+                    std::memcpy(hand_box_out[i].data(), hb, 8*sizeof(float));
+                    std::memcpy(hand_cls_out[i].data(), hc, 4*sizeof(float));
+                }
+
+                std::vector<int64_t> pt_sh_final{1, PASS1_N_TOK, 1024};
+                Ort::Value nf_in_final = Ort::Value::CreateTensor<float>(mi, token.data(), token.size(), pt_sh_final.data(), 3);
+                std::vector<Ort::Value> nfin_final; nfin_final.push_back(std::move(nf_in_final));
+                auto nfout_final = sess_decoder_pass1_normfinal.session->Run(
+                                       Ort::RunOptions{nullptr}, sess_decoder_pass1_normfinal.input_names.data(),
+                                       nfin_final.data(), nfin_final.size(), sess_decoder_pass1_normfinal.output_names.data(), 1);
+                std::memcpy(pose_tokens.data() + (size_t)i*DECODER_DIM, nfout_final[0].GetTensorData<float>(),
+                            (size_t)DECODER_DIM*sizeof(float));
+            }
+            double dt_dec = ms(t0);
+            timers.decoder += dt_dec;
+            printf("[FSB] decoder (pass1, iterative): %.1f ms\n", dt_dec);
+        }
+        else
+        {
+            Ort::Value feat_t = Ort::Value::CreateTensor<float>(
+                                    mi, features.data(), features.size(), feat_shape.data(), 4);
+            Ort::Value cond_t = Ort::Value::CreateTensor<float>(
+                                    mi, batch_cond.data(), batch_cond.size(), cond_shape.data(), 2);
+            Ort::Value ray_t  = Ort::Value::CreateTensor<float>(
+                                    mi, batch_ray.data(), batch_ray.size(), ray_shape.data(), 4);
+
+            std::vector<Ort::Value> dec_inputs;
+            dec_inputs.push_back(std::move(feat_t));
+            dec_inputs.push_back(std::move(cond_t));
+            dec_inputs.push_back(std::move(ray_t));
+
+            std::vector<const char*>& dec_in_names  = sess_decoder.input_names;
+            std::vector<const char*>& dec_out_names = sess_decoder.output_names;
+
+            auto decoder_out = sess_decoder.session->Run(
+                                   Ort::RunOptions{nullptr},
+                                   dec_in_names.data(),  dec_inputs.data(),  dec_inputs.size(),
+                                   dec_out_names.data(), 1);
+            std::memcpy(pose_tokens.data(), decoder_out[0].GetTensorData<float>(), token_elems*sizeof(float));
+            double dt_dec = ms(t0);
+            timers.decoder += dt_dec;
+            printf("[FSB] decoder:    %.1f ms\n", dt_dec);
+        }
 
         // ── MHR head (CPU FFN) ────────────────────────────────────────────────
         t0 = Clock::now();
@@ -1019,17 +1240,15 @@ struct Pipeline::Impl
         timers.mhr_ffn += dt_ffn;
         printf("[FSB] MHR FFN:    %.1f ms\n", dt_ffn);
 
-        // ── Refined pose: hand-box regression + hand-crop decoder passes ───────
-        // (see PLAN.md, issue #15 "refined pose" plan). Off by default; adds a
-        // second decoder pass (fp32, hand-box regression) plus up to 2×B more
-        // decoder_hand.onnx forward passes (one per visible hand per person).
-        // The validity gate / pass-2 keypoint-prompted decoder / wrist-IK
-        // fusion that turn this into a corrected final body_pose run further
-        // below, after the per-person results (incl. keypoints_2d) exist.
-        std::vector<std::array<float,8>> hand_box_out(B);
-        std::vector<std::array<float,4>> hand_cls_out(B);
-        for (auto& a : hand_box_out) a.fill(0.f);
-        for (auto& a : hand_cls_out) a.fill(0.f);
+        // ── Refined pose: hand-crop decoder passes ──────────────────────────
+        // (see PLAN.md, issue #15 "refined pose" plan; POSEREFINE.md for the
+        // pass-1/pass-2/hand iterative-refinement history). Off by default;
+        // adds up to 2×B decoder_hand.onnx forward passes (one per visible
+        // hand per person), using hand_box_out/hand_cls_out from the pass-1
+        // loop above. The validity gate / pass-2 keypoint-prompted decoder /
+        // wrist-IK fusion that turn this into a corrected final body_pose run
+        // further below, after the per-person results (incl. keypoints_2d)
+        // exist.
         // Hoisted to function scope: used again after the results-assembly loop
         // below (gate / pass-2 keypoint prompt / wrist-IK / splice).
         struct HandCropRef {
@@ -1038,37 +1257,8 @@ struct Pipeline::Impl
         };
         std::vector<HandCropRef> hand_refs;
         std::vector<float> hand_mhr_raw, hand_cam_raw;
-        if (cfg.refined_pose && sess_decoder_handbox.session)
+        if (cfg.refined_pose && sess_decoder_pass1_pre.session)
         {
-            t0 = Clock::now();
-            Ort::Value hb_feat_t = Ort::Value::CreateTensor<float>(
-                                       mi, features.data(), features.size(), feat_shape.data(), 4);
-            Ort::Value hb_cond_t = Ort::Value::CreateTensor<float>(
-                                       mi, batch_cond.data(), batch_cond.size(), cond_shape.data(), 2);
-            Ort::Value hb_ray_t  = Ort::Value::CreateTensor<float>(
-                                       mi, batch_ray.data(), batch_ray.size(), ray_shape.data(), 4);
-            std::vector<Ort::Value> hb_inputs;
-            hb_inputs.push_back(std::move(hb_feat_t));
-            hb_inputs.push_back(std::move(hb_cond_t));
-            hb_inputs.push_back(std::move(hb_ray_t));
-
-            auto hb_out = sess_decoder_handbox.session->Run(
-                              Ort::RunOptions{nullptr},
-                              sess_decoder_handbox.input_names.data(),  hb_inputs.data(), hb_inputs.size(),
-                              sess_decoder_handbox.output_names.data(), sess_decoder_handbox.output_names.size());
-            // outputs: [pose_token (unused — bf16 decoder's is used instead), hand_box, hand_cls]
-            if (hb_out.size() >= 3)
-            {
-                const float* hb = hb_out[1].GetTensorData<float>();   // [B,2,4]
-                const float* hc = hb_out[2].GetTensorData<float>();   // [B,2,2]
-                for (int i = 0; i < B; ++i)
-                {
-                    std::memcpy(hand_box_out[i].data(), hb + (size_t)i * 8, 8 * sizeof(float));
-                    std::memcpy(hand_cls_out[i].data(), hc + (size_t)i * 4, 4 * sizeof(float));
-                }
-            }
-            printf("[FSB] handbox:    %.1f ms\n", ms(t0));
-
             // ── Build left/right hand crops from the regressed boxes ───────────
             // hand_box layout per person: [left_cx,cy,w,h, right_cx,cy,w,h],
             // normalised to the 512x512 body crop [0,1]. Convert to original-
@@ -1779,6 +1969,22 @@ struct Pipeline::Impl
                 float pre_R1l[9];    quat_to_mat3(lbs_data->joint_prerotations + 77*4, pre_R1l);
                 mat3_mul(lowarm_R1l, pre_R1l, zero_rot_R1_left[pi].data());
                 zero_rot_R1_ok[pi] = 1;
+
+                // DIAGNOSTIC: dump pass-1's full per-joint global quats (q1) for
+                // person 0 -- used to localize where the left-arm chain diverges
+                // from Python's real joint_global_rots (see POSEREFINE.md "still
+                // relatively far from official" investigation).
+                if (pi == 0 && getenv("FSB_DUMP_PASS1_Q1"))
+                {
+                    FILE* fp = fopen(getenv("FSB_DUMP_PASS1_Q1"), "w");
+                    if (fp)
+                    {
+                        for (int j = 0; j < lbs_data->n_joints; ++j)
+                            fprintf(fp, "%.8f %.8f %.8f %.8f\n",
+                                    q1[j*4+0], q1[j*4+1], q1[j*4+2], q1[j*4+3]);
+                        fclose(fp);
+                    }
+                }
             }
 
             for (int h = 0; h < HB; ++h)
@@ -1792,6 +1998,28 @@ struct Pipeline::Impl
                 compact_cont_to_body_params(raw + 6, F.body_euler.data());
                 std::copy(raw + 339, raw + 339 + 108, F.hand108.begin());
                 std::copy(raw + 311, raw + 311 + 28,  F.scale28.begin());
+                if (const char* dp = getenv("FSB_DUMP_HAND108_PREFIX"))
+                {
+                    char path[512];
+                    snprintf(path, sizeof(path), "%s_%s.txt", dp, ref.is_left ? "left" : "right");
+                    FILE* fp = fopen(path, "w");
+                    if (fp) { for (float v : F.hand108) fprintf(fp, "%.8f\n", v); fclose(fp); }
+                }
+                // DIAGNOSTIC: override with Python's real captured hand108 (one file
+                // per side) to isolate whether the finger-PCA regression gap is
+                // visually significant — see POSEREFINE.md "still not 1:1 on hands".
+                if (const char* op = getenv("FSB_OVERRIDE_HAND108_PREFIX"))
+                {
+                    char path[512];
+                    snprintf(path, sizeof(path), "%s_%s.txt", op, ref.is_left ? "left" : "right");
+                    FILE* fp = fopen(path, "r");
+                    if (fp)
+                    {
+                        for (int k = 0; k < 108; ++k)
+                            if (fscanf(fp, "%f", &F.hand108[k]) != 1) break;
+                        fclose(fp);
+                    }
+                }
                 std::copy(raw + 266, raw + 266 + 45,  F.shape45.begin());
 
                 // head_camera_hand uses DEFAULT_SCALE_FACTOR_HAND=10 (model_config.yaml)
@@ -1865,10 +2093,78 @@ struct Pipeline::Impl
 
                 // Always joint 42 (r_wrist) — the hand-crop's own skeleton is always
                 // computed in a "this is a right hand" frame regardless of ref.is_left
-                // (same reason the keypoint lookup elsewhere always uses KP_RIGHT_WRIST).
+                // (same reason the keypoint lookup elsewhere always uses KP_RIGHT_WRIST;
+                // apply_hand_pose() above always routes hand108[54:108] to the RIGHT
+                // joint-index table regardless of ref.is_left, which is why joint 42 is
+                // where every crop's real predicted articulation lands, and why joint 78
+                // is not populated with anything meaningful in OUR rig construction).
+                //
+                // But for a LEFT crop, Python's real "Doing IK"/gate code reads
+                // left_joint_global_rots[:,78] (l_wrist), NOT [:,42] -- confirmed by
+                // directly comparing captured Python values: Python's OWN joint 42 for a
+                // left crop numerically matches OUR joint 42 closely (both are the
+                // "mirrored, as if this were a right hand" rotation), while Python's
+                // joint 78 is the real un-mirrored left-wrist rotation, related by
+                // `joint78 = Rx(180deg) * joint42` exactly (verified to ~1e-6 against
+                // captured ground truth) — a property of the character rig's left/right
+                // mirror symmetry, not something specific to Python's own computation.
+                // So for LEFT crops we apply that same Rx(180) correction to OUR joint 42
+                // quat before using it anywhere (gate criterion 1's pred_global_R, and
+                // the wrist-IK splice's pred_global_R) — this was a real bug (not just
+                // precision noise): every LEFT-hand splice/gate decision before this fix
+                // was working off the wrong (mirrored) rotation. See POSEREFINE.md
+                // "still relatively far from official" investigation.
                 const int wrist_joint = 42;
                 std::copy(hq_scratch.begin() + wrist_joint*4, hq_scratch.begin() + wrist_joint*4 + 4,
                           F.wrist_quat.begin());
+                if (ref.is_left)
+                {
+                    // Hamilton product q_Rx180 ⊗ q, with q_Rx180=(x=1,y=0,z=0,w=0) in
+                    // XYZW order (matches quat_to_mat3's convention) — algebraically
+                    // simplifies to (x'=w, y'=-z, z'=y, w'=-x); verified to reproduce
+                    // Rx(180)@quat_to_mat3(q) exactly.
+                    float x=F.wrist_quat[0], y=F.wrist_quat[1], z=F.wrist_quat[2], w=F.wrist_quat[3];
+                    F.wrist_quat = { w, -z, y, -x };
+                }
+                if (getenv("FSB_DUMP_HAND_JOINT78"))
+                {
+                    float R42[9]; quat_to_mat3(hq_scratch.data() + 42*4, R42);
+                    float R78[9]; quat_to_mat3(hq_scratch.data() + 78*4, R78);
+                    printf("[FSB]   joint78dbg h=%d %s:\n"
+                           "     R42=[%.4f %.4f %.4f / %.4f %.4f %.4f / %.4f %.4f %.4f]\n"
+                           "     R78=[%.4f %.4f %.4f / %.4f %.4f %.4f / %.4f %.4f %.4f]\n",
+                           h, ref.is_left?"left":"right",
+                           R42[0],R42[1],R42[2],R42[3],R42[4],R42[5],R42[6],R42[7],R42[8],
+                           R78[0],R78[1],R78[2],R78[3],R78[4],R78[5],R78[6],R78[7],R78[8]);
+                }
+                // DIAGNOSTIC: dump OUR own hq_scratch (per-joint global quats, joint-
+                // index space matching mhr_joint_table.h / Python's joint_global_rots)
+                // for the finger chain, to directly test for axis/handedness bugs in
+                // apply_hand_pose()/compact_cont_to_hand_params() the same way the
+                // wrist-mirror bug was found — see POSEREFINE.md "lift the hand
+                // transforms ... check for axis or handedness errors".
+                if (const char* fp_path = getenv("FSB_DUMP_HAND_FINGER_Q"))
+                {
+                    static const int finger_joints[] = {
+                        42,                      // r_wrist
+                        43,44,45,46,             // r_pinky0..3
+                        48,49,50,                // r_ring1..3
+                        52,53,54,                // r_middle1..3
+                        56,57,58,                // r_index1..3
+                        60,61,62,63              // r_thumb0..3
+                    };
+                    char path[512];
+                    snprintf(path, sizeof(path), "%s_%s.txt", fp_path, ref.is_left ? "left" : "right");
+                    FILE* fp = fopen(path, "w");
+                    if (fp)
+                    {
+                        for (int j : finger_joints)
+                            fprintf(fp, "%d %.8f %.8f %.8f %.8f\n", j,
+                                    hq_scratch[j*4+0], hq_scratch[j*4+1],
+                                    hq_scratch[j*4+2], hq_scratch[j*4+3]);
+                        fclose(fp);
+                    }
+                }
                 {
                     float Rdbg[9]; quat_to_mat3(F.wrist_quat.data(), Rdbg);
                     printf("[FSB]   wristquatdbg h=%d %s: R=[[%.4f %.4f %.4f] [%.4f %.4f %.4f] [%.4f %.4f %.4f]]\n",

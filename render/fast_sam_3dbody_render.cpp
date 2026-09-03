@@ -425,6 +425,48 @@ static void draw_yolo_skeleton(cv::Mat& img,
     }
 }
 
+// ── Save GL depth buffer to file (linearized, metres, camera-space distance) ─
+//
+// Reads the GL_DEPTH_COMPONENT buffer and undoes the standard OpenGL
+// perspective-divide nonlinearity to recover linear eye-space depth, using
+// the SAME near/far planes mhr_camera_matrices() (mhr_pose_driver.h) uses to
+// build the projection matrix. Background pixels (never touched by
+// glDrawElements, so still at the far clear value) are written as 0 so a
+// consumer can mask them out. Positive values increase with distance from
+// the camera, matching pyrender's own depth convention (see
+// render_python_gt.py / python_gt_depth.npy) — written for direct numeric
+// comparison against that file (see POSEREFINE.md "hand depth error
+// measurement" / tools/hand_depth_error.py).
+static void save_depth_buffer(const std::string& path, int w, int h) {
+    const float near_plane = 0.01f, far_plane = 100.0f;   // must match mhr_pose_driver.h
+    std::vector<float> depth_ndc(w * h);
+    GLint old_pack = 4;
+    glGetIntegerv(GL_PACK_ALIGNMENT, &old_pack);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, w, h, GL_DEPTH_COMPONENT, GL_FLOAT, depth_ndc.data());
+    glPixelStorei(GL_PACK_ALIGNMENT, old_pack);
+
+    std::vector<float> depth_m(w * h);
+    for (int i = 0; i < w * h; ++i) {
+        float d = depth_ndc[i];
+        if (d >= 1.0f) { depth_m[i] = 0.0f; continue; }   // untouched background
+        float z_ndc = 2.0f * d - 1.0f;
+        float z_eye = (2.0f * near_plane * far_plane) /
+                      (far_plane + near_plane - z_ndc * (far_plane - near_plane));
+        depth_m[i] = z_eye;   // already positive: eye-space -Z distance
+    }
+    // glReadPixels gives bottom-up rows; flip vertically to match save_framebuffer's
+    // (and pyrender's) top-down row order.
+    std::vector<float> flipped(w * h);
+    for (int y = 0; y < h; ++y)
+        std::memcpy(flipped.data() + y*w, depth_m.data() + (h-1-y)*w, w*sizeof(float));
+
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) { fprintf(stderr, "[export] cannot open %s\n", path.c_str()); return; }
+    fwrite(flipped.data(), sizeof(float), (size_t)w*h, f);
+    fclose(f);
+}
+
 // ── Save GL framebuffer to file ──────────────────────────────────────────────
 
 static void save_framebuffer(const std::string& path, int w, int h) {
@@ -563,6 +605,7 @@ int main(int argc, const char** argv) {
     std::string src       = "0";
     std::string save_frames_prefix = "";
     int         save_frame_idx     = 0;
+    std::string save_depth_prefix  = "";   // --save-depth: per-frame raw float32 depth dump
     std::string export_mesh_prefix = "";   // --export-mesh: per-frame .obj dump
     int         export_mesh_stride = 1;     // --export-mesh-stride: every Nth frame
     std::string bvh_path           = "";
@@ -625,6 +668,7 @@ int main(int argc, const char** argv) {
         A1("--frag",        frag_path,          std::string)
         A1("--lbs",         lbs_path,           std::string)
         A1("--save-frames", save_frames_prefix, std::string)
+        A1("--save-depth",  save_depth_prefix,  std::string)
         A1("--export-mesh", export_mesh_prefix, std::string)
         A1("--fx",          focal_x,            std::stof)
         A1("--fy",          focal_y,            std::stof)
@@ -1327,6 +1371,12 @@ int main(int argc, const char** argv) {
             snprintf(path, sizeof(path), "%s%05d.jpg",
                      save_frames_prefix.c_str(), ++save_frame_idx);
             save_framebuffer(path, W, H);
+        }
+        if (!save_depth_prefix.empty()) {
+            char path[4096];
+            snprintf(path, sizeof(path), "%s%05d.bin",
+                     save_depth_prefix.c_str(), save_frame_idx > 0 ? save_frame_idx : 1);
+            save_depth_buffer(path, W, H);
         }
 
         glx3_endRedraw();

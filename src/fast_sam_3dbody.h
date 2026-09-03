@@ -152,7 +152,6 @@ struct PipelineConfig {
     // faithful per-layer ONNX + native-LBS port of that iterative loop) is
     // built out on this branch.
     bool refined_pose = false;
-    std::string decoder_handbox_name = "decoder_handbox_fp32.onnx";
     std::string decoder_hand_name    = "decoder_hand.onnx";
     std::string decoder_prompted_name= "decoder_prompted.onnx";
 };
