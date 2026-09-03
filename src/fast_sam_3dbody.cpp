@@ -1805,6 +1805,15 @@ struct Pipeline::Impl
                 r.global_rot = { p2_global_rot_euler[2], p2_global_rot_euler[1], p2_global_rot_euler[0] };
                 std::array<float,133> p2_body_euler{};
                 compact_cont_to_body_params(p2 + 6, p2_body_euler.data());
+                if (const char* dump_path = getenv("FSB_DUMP_P2_BODY_EULER"))
+                {
+                    FILE* fp = fopen(dump_path, "w");
+                    if (fp)
+                    {
+                        for (float v : p2_body_euler) fprintf(fp, "%.8f\n", v);
+                        fclose(fp);
+                    }
+                }
                 r.shape.assign(p2 + 266, p2 + 266 + 45);
                 r.scale.assign(p2 + 311, p2 + 311 + 28);
                 r.hand_pose.assign(p2 + 339, p2 + 339 + 108);

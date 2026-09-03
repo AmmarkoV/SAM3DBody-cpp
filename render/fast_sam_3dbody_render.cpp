@@ -1162,6 +1162,37 @@ int main(int argc, const char** argv) {
                             lbs_out.data(),
                             lbs_joints.data(),
                             nullptr);
+            // DIAGNOSTIC: override vertices/camera with externally-supplied ground
+            // truth (e.g. Python's real pred_vertices/pred_cam_t/focal_length) to
+            // isolate whether the C++ OpenGL rendering pipeline itself is at fault
+            // vs. the upstream MHR computation. FSB_VERTS_OVERRIDE points at a raw
+            // binary file of MHR_VERTEX_FLOATS little-endian floats (x0,y0,z0,x1,...).
+            // FSB_CAM_OVERRIDE points at a text file "tx ty tz focal_length".
+            if (const char* vpath = getenv("FSB_VERTS_OVERRIDE")) {
+                FILE* fp = fopen(vpath, "rb");
+                if (fp) {
+                    size_t n = fread(lbs_out.data(), sizeof(float), MHR_VERTEX_FLOATS, fp);
+                    fclose(fp);
+                    fprintf(stderr, "[DIAG] loaded %zu floats from %s (override verts)\n", n, vpath);
+                }
+            }
+            std::array<float,3> cam_t_override = r.pred_cam_t;
+            float focal_override = r.focal_length;
+            bool  have_cam_override = false;
+            if (const char* cpath = getenv("FSB_CAM_OVERRIDE")) {
+                FILE* fp = fopen(cpath, "r");
+                if (fp) {
+                    float tx, ty, tz, focal;
+                    if (fscanf(fp, "%f %f %f %f", &tx, &ty, &tz, &focal) == 4) {
+                        cam_t_override = {tx, ty, tz};
+                        focal_override = focal;
+                        have_cam_override = true;
+                        fprintf(stderr, "[DIAG] override cam_t=(%.4f,%.4f,%.4f) focal=%.3f\n",
+                                tx, ty, tz, focal);
+                    }
+                    fclose(fp);
+                }
+            }
             mhr_update_mesh_vertices(tri_model, lbs_out.data());
 
             // Export the deformed mesh (Blender-importable) for offline checking
@@ -1225,7 +1256,8 @@ int main(int argc, const char** argv) {
             // Build MVP = projection * view
             float proj[16], view[16], mvp[16];
             mhr_camera_matrices(proj, view,
-                                r.focal_length, r.pred_cam_t.data(),
+                                have_cam_override ? focal_override : r.focal_length,
+                                have_cam_override ? cam_t_override.data() : r.pred_cam_t.data(),
                                 frame_w, frame_h);
 
 
