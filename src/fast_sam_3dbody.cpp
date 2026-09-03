@@ -1297,6 +1297,11 @@ struct Pipeline::Impl
         // ── assemble MHRResult per person ────────────────────────────────────
         std::vector<MHRResult> results(B);
         const int NPOSE = (int)meta.npose;
+        // Pass-1's own wrist Euler [right(41,43,42), left(31,33,32)], captured
+        // before any refined-pose splice — this is Python's `ori_local_wrist_rotmat`
+        // (see run_inference), used as the reference pose for the rotation-agreement
+        // gate below (PLAN.md step 7 TODO: this criterion is now implemented).
+        std::vector<std::array<float,6>> pass1_wrist_euler(B);
 
         for (int i = 0; i < B; ++i)
         {
@@ -1355,6 +1360,7 @@ struct Pipeline::Impl
             float be[133] = {};
             compact_cont_to_body_params(bc, be);
             r.body_pose.assign(be, be + 133);
+            pass1_wrist_euler[i] = { be[41], be[43], be[42], be[31], be[33], be[32] };
 
             // Shape [45]
             r.shape.assign(p + 266, p + 266 + 45);
@@ -1493,7 +1499,19 @@ struct Pipeline::Impl
             static constexpr int KP_RIGHT_WRIST = 41, KP_LEFT_WRIST = 62;
             static constexpr int KP_RIGHT_ELBOW = 8,  KP_LEFT_ELBOW = 7;
             static constexpr float HAND_BOX_SIZE_THRESH   = 64.f;    // px, original image
-            static constexpr float HAND_WRIST_DIST_THRESH = 0.25f;   // normalised by hand crop size
+            // Python's own threshold is 0.25 (run_inference's hand_wrist_kps2d_thresh),
+            // tuned for its native bf16 eager inference. This C++ port necessarily runs
+            // the hand-box regression in fp32 (decoder_handbox_fp32.onnx — bf16+CUDA has
+            // a confirmed ORT race condition on this op, see PLAN.md), which is NOT free:
+            // hand-verified that Python's OWN fp32-eager computation (same crop, zero ONNX
+            // involved) already diverges from its OWN bf16 production output by ~0.03-0.09
+            // in normalised crop space — comparable to or larger than the gap measured
+            // between this port and Python's bf16 output. So some of what this threshold
+            // is rejecting is an unavoidable cost of the bf16-CUDA-race workaround, not
+            // estimation error — relaxed to compensate. Calibrated against a small number
+            // of real test images (not systematically tuned); revisit if it lets through
+            // hands that are genuinely a bad match.
+            static constexpr float HAND_WRIST_DIST_THRESH = 0.50f;   // normalised by hand crop size
 
             // ── per-hand-crop own FK: wrist 2D (full-image, unflipped) + wrist quat ──
             struct HandFK {
@@ -1685,6 +1703,12 @@ struct Pipeline::Impl
             for (int i = 0; i < B; ++i)
             {
                 MHRResult& r = results[i];
+                // DIAGNOSTIC: snapshot pass-1's result so it can be restored below,
+                // to isolate whether pass-2's unconditional replace (independent of
+                // any hand-crop splice) is itself the source of visible distortion.
+                MHRResult r_pass1_backup;
+                bool skip_pass2 = getenv("FSB_SKIP_PASS2") != nullptr;
+                if (skip_pass2) r_pass1_backup = r;
                 int left_h = -1, right_h = -1;
                 for (int h = 0; h < HB; ++h)
                     if (hand_refs[h].person == i) (hand_refs[h].is_left ? left_h : right_h) = h;
@@ -1770,6 +1794,14 @@ struct Pipeline::Impl
                 std::memcpy(r.pred_cam_raw.data(),  p2_cam.data(), 3*sizeof(float));
                 float p2_global_rot_euler[3];
                 rot6d_to_euler(p2, p2_global_rot_euler);
+                printf("[FSB]   pass1v2dbg person=%d pass1_global_rot=(%.3f,%.3f,%.3f) "
+                       "pass2_global_rot=(%.3f,%.3f,%.3f) pass1_cam_t=(%.3f,%.3f,%.3f) "
+                       "pass2_cam=(s=%.3f,tx=%.3f,ty=%.3f)\n",
+                       i, r.global_rot.size()>2?r.global_rot[0]:0.f, r.global_rot.size()>1?r.global_rot[1]:0.f,
+                       r.global_rot.size()>0?r.global_rot[2]:0.f,
+                       p2_global_rot_euler[2], p2_global_rot_euler[1], p2_global_rot_euler[0],
+                       r.pred_cam_t[0], r.pred_cam_t[1], r.pred_cam_t[2],
+                       p2_cam[0], p2_cam[1], p2_cam[2]);
                 r.global_rot = { p2_global_rot_euler[2], p2_global_rot_euler[1], p2_global_rot_euler[0] };
                 std::array<float,133> p2_body_euler{};
                 compact_cont_to_body_params(p2 + 6, p2_body_euler.data());
@@ -1778,11 +1810,15 @@ struct Pipeline::Impl
                 r.hand_pose.assign(p2 + 339, p2 + 339 + 108);
                 r.face_params.assign(p2 + 447, p2 + 447 + 72);
                 {
+                    std::array<float,3> pass1_cam_t = r.pred_cam_t;
                     float s_val = -p2_cam[0], t_x = p2_cam[1], t_y = -p2_cam[2];
                     float bw = r.bbox[2]-r.bbox[0], bh = r.bbox[3]-r.bbox[1];
                     float bbox_cx = (r.bbox[0]+r.bbox[2])*0.5f, bbox_cy = (r.bbox[1]+r.bbox[3])*0.5f;
                     float bs = fixed_aspect_bbox_size(bw,bh)*s_val + 1e-8f;
                     r.pred_cam_t = { t_x + 2.f*(bbox_cx-cx)/bs, t_y + 2.f*(bbox_cy-cy)/bs, 2.f*fx/bs };
+                    printf("[FSB]   camv2dbg person=%d pass1_cam_t=(%.3f,%.3f,%.3f) pass2_cam_t=(%.3f,%.3f,%.3f)\n",
+                           i, pass1_cam_t[0], pass1_cam_t[1], pass1_cam_t[2],
+                           r.pred_cam_t[0], r.pred_cam_t[1], r.pred_cam_t[2]);
                 }
 
                 // ── wrist-IK fusion (only for hands that passed the gate) ──────────
@@ -1815,23 +1851,53 @@ struct Pipeline::Impl
                             float zero_rot_T[9]; mat3_transpose(zero_rot_R, zero_rot_T);
                             float fused_R[9]; mat3_mul(zero_rot_T, pred_global_R, fused_R);
 
+                            // Rotation-agreement gate (Python's `valid_angle`, run_inference
+                            // "Doing IK" block): reject the splice if the hand crop's fused
+                            // wrist rotation disagrees too much with pass-1's own wrist pose.
+                            // Previously left out (PLAN.md step 7 TODO) — confirmed to matter:
+                            // without it, a bad hand-crop scale/pose estimate can get spliced
+                            // in even when the box+distance gate alone passed, corrupting the
+                            // whole-body scale via the shared scale[8]/[9] PCA components.
+                            {
+                                const float* ori_e = pass1_wrist_euler[i].data() + (lr==0 ? 0 : 3);
+                                float ori_R[9]; euler_xzy_to_mat3(ori_e[0], ori_e[1], ori_e[2], ori_R);
+                                if (mat3_angle_diff(ori_R, fused_R) >= 1.4f) continue;
+                            }
+
                             float wx, wz, wy;
                             rotmat_to_euler_xzy(fused_R, &wx, &wz, &wy);
                             fix_wrist_euler(wx, wz, wy);
 
                             // body_pose indices: right=[41,43,42], left=[31,33,32]
-                            static const int idx_r[3] = {41,43,42}, idx_l[3] = {31,33,32};
-                            const int* idx = lr==0 ? idx_r : idx_l;
-                            p2_body_euler[idx[0]] = wx;
-                            p2_body_euler[idx[1]] = wz;
-                            p2_body_euler[idx[2]] = wy;
+                            // DIAGNOSTIC: temporarily skipped via env var to isolate whether
+                            // the wrist-rotation splice (not the scale splice, already disabled
+                            // above) is the actual source of the visible mesh distortion.
+                            if (!getenv("FSB_SKIP_WRIST_SPLICE"))
+                            {
+                                static const int idx_r[3] = {41,43,42}, idx_l[3] = {31,33,32};
+                                const int* idx = lr==0 ? idx_r : idx_l;
+                                p2_body_euler[idx[0]] = wx;
+                                p2_body_euler[idx[1]] = wz;
+                                p2_body_euler[idx[2]] = wy;
+                            }
 
-                            // hand[108] half + scale[8]/[9] swap (see run_inference lines ~1545-1569)
+                            // hand[108] half swap (see run_inference lines ~1545-1569)
                             int src_off = lr==0 ? 54 : 0;   // right uses hand[54:], left uses hand[:54]
                             std::copy(hfk[h].hand108.begin()+src_off, hfk[h].hand108.begin()+src_off+54,
                                       r.hand_pose.begin() + (lr==0 ? 54 : 0));
-                            if (r.scale.size() >= 10)
-                                r.scale[lr==0 ? 8 : 9] = hfk[h].scale28[lr==0 ? 8 : 9];
+                            // scale[8]/[9] swap: DISABLED (see PLAN.md "refinedpose" branch notes).
+                            // hfk[h].scale28[8/9] comes from decoder_hand's single-pass (no
+                            // iterative refinement) regression and is confirmed off by ~35-40%
+                            // vs Python's real value even with fp32 weights (0.977-0.980 here
+                            // vs Python's 0.719) -- this is what was producing the "whole body
+                            // scale is wrong" regression once the validity gate started letting
+                            // this splice fire. Root cause is architectural (decoder_hand.onnx
+                            // is missing Python's per-layer do_interm_preds/keypoint_token_update
+                            // loop, which needs the LBS body model between decoder layers --
+                            // blocked from a single ONNX export by pymomentum). Re-enable once
+                            // that iterative refinement is ported (native LBS + per-layer ONNX).
+                            // if (r.scale.size() >= 10)
+                            //     r.scale[lr==0 ? 8 : 9] = hfk[h].scale28[lr==0 ? 8 : 9];
                         }
                     }
                 }
@@ -1863,6 +1929,19 @@ struct Pipeline::Impl
                     {
                         r.pred_vertices = fverts;
                         r.skeleton_3d   = fjoints;
+                        {
+                            float vmin[3]={1e9f,1e9f,1e9f}, vmax[3]={-1e9f,-1e9f,-1e9f};
+                            for (size_t vi = 0; vi < fverts.size()/3; ++vi)
+                                for (int c = 0; c < 3; ++c)
+                                {
+                                    float v = fverts[vi*3+c];
+                                    vmin[c] = std::min(vmin[c], v);
+                                    vmax[c] = std::max(vmax[c], v);
+                                }
+                            printf("[FSB]   vertdbg person=%d min=(%.3f,%.3f,%.3f) max=(%.3f,%.3f,%.3f) extent=(%.3f,%.3f,%.3f)\n",
+                                   i, vmin[0],vmin[1],vmin[2], vmax[0],vmax[1],vmax[2],
+                                   vmax[0]-vmin[0], vmax[1]-vmin[1], vmax[2]-vmin[2]);
+                        }
 
                         std::vector<float> kps3d(70*3, 0.f);
                         for (const auto& e : kp_mapping)
@@ -1885,12 +1964,22 @@ struct Pipeline::Impl
                             kps2d[k*2+1] = dy/dz*fy + cy;
                         }
                         r.keypoints_2d = kps2d;
+                        printf("[FSB]   kp2ddbg person=%d l_sh=(%.1f,%.1f) r_sh=(%.1f,%.1f) "
+                               "l_elb=(%.1f,%.1f) r_elb=(%.1f,%.1f) l_hip=(%.1f,%.1f) r_hip=(%.1f,%.1f) "
+                               "r_wrist=(%.1f,%.1f) l_wrist=(%.1f,%.1f) scale8=%.4f scale9=%.4f\n",
+                               i, kps2d[5*2],kps2d[5*2+1], kps2d[6*2],kps2d[6*2+1],
+                               kps2d[7*2],kps2d[7*2+1], kps2d[8*2],kps2d[8*2+1],
+                               kps2d[9*2],kps2d[9*2+1], kps2d[10*2],kps2d[10*2+1],
+                               kps2d[41*2],kps2d[41*2+1], kps2d[62*2],kps2d[62*2+1],
+                               r.scale.size()>8?r.scale[8]:-1.f, r.scale.size()>9?r.scale[9]:-1.f);
                     }
                 }
 
                 if (right_valid || left_valid)
                     printf("[FSB]   person=%d pass-2 applied  right_valid=%d left_valid=%d\n",
                            i, right_valid, left_valid);
+
+                if (skip_pass2) r = r_pass1_backup;
             }
             printf("[FSB] pass-2 + IK + splice: %.1f ms  (%d person(s))\n", ms(t0), B);
         }

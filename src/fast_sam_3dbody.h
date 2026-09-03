@@ -140,6 +140,17 @@ struct PipelineConfig {
     // a fix that mainly affects hand/wrist articulation. When on, loads three
     // extra ONNX graphs (decoder_handbox_fp32.onnx, decoder_hand.onnx,
     // decoder_prompted.onnx) and the pipeline.gguf hand FFN heads.
+    // decoder_hand STOPGAP: reverted to the original bf16 file. The fp32
+    // re-export (decoder_hand_fp32.onnx) is numerically more faithful to
+    // Python's own fp32 math, but both bf16 and fp32 versions are missing
+    // Python's iterative per-layer keypoint-token refinement (do_interm_preds
+    // + keypoint_token_update, disabled by the ONNX export wrapper because it
+    // calls the pymomentum LBS model, incompatible with ONNX export) — see
+    // PLAN.md "refinedpose" branch notes. That gap dominates hand-crop scale
+    // accuracy regardless of bf16/fp32, so reverting here is a pure regression
+    // fix (back to the known pre-session baseline) while the real fix (a
+    // faithful per-layer ONNX + native-LBS port of that iterative loop) is
+    // built out on this branch.
     bool refined_pose = false;
     std::string decoder_handbox_name = "decoder_handbox_fp32.onnx";
     std::string decoder_hand_name    = "decoder_hand.onnx";
