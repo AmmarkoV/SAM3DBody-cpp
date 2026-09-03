@@ -61,6 +61,7 @@ with the flag, or by hand with `bash tools/fetch_model.sh cuda refined`; see
 | `onnx/body_model.lbs` | ~27 MB | Native C LBS data (joints, weights, shape) |
 | `onnx/correctives.bin` | ~33 MB | Pose corrective blend shapes |
 | `onnx/keypoint_mapping.bin` | ~8 KB | MHR-70 keypoint index map |
+| `onnx/libreyolo9.onnx` | ~8 MB | *Optional* LibreYOLO bbox detector — fetched automatically when explicitly selected (`--detector libreyolo`, or `--yolo` pinned to a `libreyolo*` file) |
 
 ### Without a CUDA GPU (CPU-only)
 

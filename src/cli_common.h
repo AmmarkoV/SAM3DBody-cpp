@@ -346,6 +346,15 @@ inline void ensure_models(CommonConfig& c, bool refined_pose = false)
             "decoder_pass1_layer5.onnx", "decoder_pass1_normfinal.onnx",
             "decoder_pass1_update.onnx", "decoder_pass1_handbox.onnx" });
     }
+    // LibreYOLO is explicitly SELECTED (not "auto"): --detector libreyolo, or a
+    // pinned --yolo pointing at a libreyolo* export.  Fetch the canonical model
+    // in that case.  "auto" only adopts a LibreYOLO model that is already on
+    // disk, so the default behaviour (and the default download set) is
+    // unchanged by this.
+    const bool want_libreyolo =
+        (c.detector == "libreyolo") ||
+        (c.yolo_path_set && path_looks_like_libreyolo(c.yolo_path));
+    if (want_libreyolo) sentinels.push_back("libreyolo9.onnx");
 
     // Where the executable lives, so we can find both the repo's onnx/ and the
     // fetch script without depending on the working directory.
@@ -408,7 +417,8 @@ inline void ensure_models(CommonConfig& c, bool refined_pose = false)
     }
 
     const std::string profiles =
-        std::string(profile) + (refined_pose ? " refined" : "");
+        std::string(profile) + (refined_pose ? " refined" : "") +
+        (want_libreyolo ? " libreyolo" : "");
 
     std::fprintf(stderr,
         "[cli] models missing from '%s' — running '%s %s' to fetch them…\n",
@@ -454,6 +464,10 @@ inline void resolve_detector_defaults(CommonConfig& c)
         }
         c.detector = path_looks_like_libreyolo(c.yolo_path) ? "libreyolo"
                                                             : "yolo-pose";
+    } else if (c.detector == "libreyolo" && !c.yolo_path_set) {
+        // Explicitly selected without a --yolo pin: use the canonical export
+        // (ensure_models() fetched it via the 'libreyolo' profile).
+        c.yolo_path = c.onnx_dir + "/libreyolo9.onnx";
     }
 
     if (!c.thresh_set) {

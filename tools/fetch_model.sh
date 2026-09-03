@@ -15,6 +15,12 @@
 #            issue #15 "refined pose" plan) — opt-in, not part
 #            of 'all'; combine with a base profile, e.g.
 #            'tools/fetch_model.sh cuda refined'              ~607 MB
+#   libreyolo  the LibreYOLO bbox detector (~8 MB) — fetched
+#            automatically at runtime only when explicitly
+#            selected (--detector libreyolo, or --yolo pinned
+#            to a libreyolo* file); '--detector auto' only
+#            adopts a LibreYOLO model already on disk, so the
+#            default behaviour is unchanged.
 #
 # Called by hand, from scripts/setup.sh, and lazily at runtime by
 # ensure_models() when a binary starts up with models missing.
@@ -22,7 +28,7 @@
 # Usage:
 #   tools/fetch_model.sh [PROFILE...] [options]
 #
-#   PROFILE    one or more of: shared cpu cuda trt refined all
+#   PROFILE    one or more of: shared cpu cuda trt refined libreyolo all
 #              (default: shared cuda). 'shared' is implied by every
 #              other profile. 'all' does NOT include 'refined' — it
 #              stays opt-in since most users don't need it.
@@ -121,6 +127,10 @@ MANIFEST=(
   "refined|decoder_pass1_update.onnx|13700938|b0fa19f7455ac0b15630617ed608396d6c8995adb86c1da4e7efec8dedf53a7f"
   "refined|decoder_pass1_handbox.onnx|8432332|f481ef0fdbc1f0b2da44b197ebbdb746739a64cd998b97cca3a59786e0a60924"
   "refined|pipeline_refined.gguf|14764576|88ec6f7bdbf8519f5016c87cbb9c72b4db50e0ea2d71f298593f00a8999b9951"
+
+  # LibreYOLO bbox detector (optional — --detector libreyolo / pinned --yolo;
+  # the default 'auto' detector prefers it only when it is already on disk).
+  "libreyolo|libreyolo9.onnx|8318984|6e9d6e1dabd99547fcc0c0f5e3503a6c50fbcc624e653e1425800bf36e8bc024"
 )
 
 # Print the header comment block (everything after the shebang up to the first
@@ -132,7 +142,7 @@ usage() {
 # ── Args ────────────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        shared|cpu|cuda|trt|refined|all) PROFILES+=("$1"); shift ;;
+        shared|cpu|cuda|trt|refined|libreyolo|all) PROFILES+=("$1"); shift ;;
         --onnx-dir) ONNX_DIR="$2"; shift 2 ;;
         --revision) HF_REVISION="$2"; shift 2 ;;
         --list)     LIST_ONLY=1; shift ;;
