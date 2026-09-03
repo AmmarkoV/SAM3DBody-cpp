@@ -468,6 +468,83 @@ inline void euler_xzy_to_mat3(float a, float b, float c, float R[9])
     R[6]=sa*sb*cc-ca*sc;       R[7]=sa*cb;  R[8]=sa*sb*sc+ca*cc;
 }
 
+// ─── Hand-crop wrist-centric → body-rooted transform (refined pose) ─────────
+// (see PLAN.md, issue #15 "refined pose" plan). MHRHead.mhr_forward's
+// enable_hand_model branch (mhr_head.py:181-196) — used only by
+// head_pose_hand, never head_pose — transforms the hand-crop-predicted
+// global_rot/global_trans from a wrist-centric frame into the SAME
+// body-rooted frame model_params[3:6] normally represents, and zeros all
+// non-hand body_pose_params/scales, before running the SAME full-body
+// skinning model. Skipping this (an earlier version of this code did) means
+// the resulting joint_global_rots — including the wrist joint used for the
+// wrist-IK fusion — are in the wrong frame entirely, not just numerically
+// off. Hand-verified end-to-end against real captured Python internals
+// (mhr_forward hooked with the internal transform bypassed via an
+// identity-substitution trick) to <1e-7 — see PLAN.md for the verification
+// script and methodology.
+//
+// R = Rz(a2)@Ry(a1)@Rx(a0) for a 3-tuple (a0,a1,a2) in the SAME order as
+// Python's `global_rot` tensor / model_params[3:6] (i.e. build_model_params's
+// OUTPUT order, NOT rot6d_to_euler's raw (rx,ry,rz) order — swap [0]<->[2]
+// first, same swap build_model_params does internally). This is roma's
+// "xyz" EXTRINSIC convention (lowercase => extrinsic; hand-derived from
+// roma's own intrinsic/extrinsic conversion rule and cross-checked against
+// roma.euler_to_rotmat("xyz", ...) numerically — see PLAN.md).
+inline void mp_rot_to_mat3(const float a[3], float R[9])
+{
+    float ca=std::cos(a[0]), sa=std::sin(a[0]);
+    float cb=std::cos(a[1]), sb=std::sin(a[1]);
+    float cc=std::cos(a[2]), sc=std::sin(a[2]);
+    R[0]=cc*cb;           R[1]=cc*sb*sa-sc*ca;  R[2]=cc*sb*ca+sc*sa;
+    R[3]=sc*cb;           R[4]=sc*sb*sa+cc*ca;  R[5]=sc*sb*ca-cc*sa;
+    R[6]=-sb;             R[7]=cb*sa;           R[8]=cb*ca;
+}
+
+// Inverse of mp_rot_to_mat3: given R = Rz(a2)@Ry(a1)@Rx(a0), recover (a0,a1,a2).
+inline void mat3_to_mp_rot(const float R[9], float a[3])
+{
+    a[0] = std::atan2(R[7], R[8]);                                 // atan2(R21, R22)
+    a[1] = std::asin(std::max(-1.f, std::min(1.f, -R[6])));        // asin(-R20)
+    a[2] = std::atan2(R[3], R[0]);                                 // atan2(R10, R00)
+}
+
+// mat3 @ vec3 (row-major R, column vector v)
+inline void mat3_vec3(const float R[9], const float v[3], float out[3])
+{
+    out[0] = R[0]*v[0] + R[1]*v[1] + R[2]*v[2];
+    out[1] = R[3]*v[0] + R[4]*v[1] + R[5]*v[2];
+    out[2] = R[6]*v[0] + R[7]*v[1] + R[8]*v[2];
+}
+
+// Constants extracted from head_pose_hand on the sam-3d-body-dinov3
+// checkpoint (nn.Parameter buffers — see PLAN.md's dump_hand_constants.py).
+// Re-extract if the checkpoint ever changes.
+static constexpr float HAND_RIGHT_WRIST_COORDS[3] = {-0.539864182472229f, 1.1133134365081787f, 0.1318483203649521f};
+static constexpr float HAND_ROOT_COORDS[3]        = {0.0f, 0.9239869713783264f, 0.0f};
+// Row-major 3x3 (local_to_world_wrist is stored the same way as a plain
+// matrix in Python; no transpose needed — verified end-to-end, see above).
+static constexpr float HAND_LOCAL_TO_WORLD_WRIST[9] = {
+    0.6428927779197693f,  0.4922248423099518f, -0.5868593454360962f,
+   -0.6405355930328369f,  0.7656170129776001f, -0.059537410736083984f,
+    0.4200035333633423f,  0.4141804277896881f,  0.8074971437454224f
+};
+// model_params[204] indices to zero (145 of them — everything except the
+// right-arm/hand chain + global trans/rot); the model already computes the
+// hand-crop's own skeleton entirely in a "this is always a right hand"
+// frame (see the KP_RIGHT_WRIST-always note elsewhere) regardless of which
+// physical hand the crop came from — left crops are pre-flipped to look
+// right before ever reaching the network.
+static constexpr int HAND_NONHAND_PARAM_IDXS[145] = {
+    6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,
+    31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,
+    55,56,57,58,59,60,61,62,63,64,65,66,67,95,96,97,98,99,100,101,102,103,
+    104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,
+    121,122,123,124,125,126,127,128,129,130,131,132,133,134,135,136,137,
+    138,139,140,141,142,143,145,146,147,148,149,150,151,152,153,179,180,
+    181,182,183,184,185,186,187,188,189,190,191,192,193,194,195,196,197,
+    198,199,200,201,202,203
+};
+
 // Mirrors Python's fix_wrist_euler: try the "flipped" angle set (±pi on each
 // axis, z additionally sign-flipped) and keep whichever set violates the
 // joint limits less.

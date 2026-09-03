@@ -1568,13 +1568,47 @@ struct Pipeline::Impl
                             mp.data[136+j] += F.scale28[k] * lbs_data->scale_comps[k*ns+j];
                 }
 
+                // Wrist-centric → body-rooted transform (mhr_head.py's enable_hand_model
+                // branch, only used by head_pose_hand) — see preprocess.hpp's
+                // mp_rot_to_mat3 doc comment / PLAN.md for the derivation+verification.
+                // mp.data[3:6] is ALREADY in the (rz,ry,rx) order this needs (build_model_params
+                // put it there); global_trans_ori is always 0 (single-view inference).
+                {
+                    float R_ori[9]; mp_rot_to_mat3(mp.data + 3, R_ori);
+                    float R_new[9]; mat3_mul(R_ori, HAND_LOCAL_TO_WORLD_WRIST, R_new);
+                    float mp_rot_new[3]; mat3_to_mp_rot(R_new, mp_rot_new);
+
+                    float diff[3] = {
+                        HAND_RIGHT_WRIST_COORDS[0] - HAND_ROOT_COORDS[0],
+                        HAND_RIGHT_WRIST_COORDS[1] - HAND_ROOT_COORDS[1],
+                        HAND_RIGHT_WRIST_COORDS[2] - HAND_ROOT_COORDS[2]
+                    };
+                    float rotated[3]; mat3_vec3(R_new, diff, rotated);
+                    mp.data[0] = -(rotated[0] + HAND_ROOT_COORDS[0]) * 10.f;
+                    mp.data[1] = -(rotated[1] + HAND_ROOT_COORDS[1]) * 10.f;
+                    mp.data[2] = -(rotated[2] + HAND_ROOT_COORDS[2]) * 10.f;
+                    mp.data[3] = mp_rot_new[0];
+                    mp.data[4] = mp_rot_new[1];
+                    mp.data[5] = mp_rot_new[2];
+                    for (int idx : HAND_NONHAND_PARAM_IDXS) mp.data[idx] = 0.f;
+                }
+
                 if (!mhr_lbs_compute(lbs_data, mp.data, F.shape45.data(), zero_face72,
                                      hv_scratch.data(), hj_scratch.data(), hq_scratch.data()))
                     continue;
 
-                int wrist_joint = ref.is_left ? 78 : 42;   // l_wrist / r_wrist (mhr_joint_table.h)
+                // Always joint 42 (r_wrist) — the hand-crop's own skeleton is always
+                // computed in a "this is a right hand" frame regardless of ref.is_left
+                // (same reason the keypoint lookup elsewhere always uses KP_RIGHT_WRIST).
+                const int wrist_joint = 42;
                 std::copy(hq_scratch.begin() + wrist_joint*4, hq_scratch.begin() + wrist_joint*4 + 4,
                           F.wrist_quat.begin());
+                {
+                    float Rdbg[9]; quat_to_mat3(F.wrist_quat.data(), Rdbg);
+                    printf("[FSB]   wristquatdbg h=%d %s: R=[[%.4f %.4f %.4f] [%.4f %.4f %.4f] [%.4f %.4f %.4f]]\n",
+                           h, ref.is_left?"left":"right",
+                           Rdbg[0],Rdbg[1],Rdbg[2],Rdbg[3],Rdbg[4],Rdbg[5],Rdbg[6],Rdbg[7],Rdbg[8]);
+                }
 
                 // A hand crop's OWN predicted keypoints always report the wrist at
                 // kps_right_wrist_idx (41), regardless of which hand it is — every
