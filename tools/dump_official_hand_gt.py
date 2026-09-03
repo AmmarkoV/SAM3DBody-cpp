@@ -99,8 +99,19 @@ def hook_run_inference(img, batch, inference_type="full", transform_hand=None,
             {k: batch_lhand[k] for k in keep if k in batch_lhand})
         cap["batch_rhand"] = _to_numpy_dict(
             {k: batch_rhand[k] for k in keep if k in batch_rhand})
+        cap["lhand_img"] = batch_lhand["img"].detach().cpu().numpy()
+        cap["rhand_img"] = batch_rhand["img"].detach().cpu().numpy()
     return ret
 model.run_inference = hook_run_inference
+
+_orig_run_keypoint_prompt = model.run_keypoint_prompt
+def hook_run_keypoint_prompt(batch, output, keypoint_prompt):
+    out, kp = _orig_run_keypoint_prompt(batch, output, keypoint_prompt)
+    # out["mhr"] is now the pass-2 (keypoint-prompted) output, pre-splice:
+    # joint_global_rots here is what the "Doing IK" zero_rot_R is built from.
+    cap["pass2_mhr"] = _to_numpy_dict(out["mhr"])
+    return out, kp
+model.run_keypoint_prompt = hook_run_keypoint_prompt
 
 # ── run ──────────────────────────────────────────────────────────────────────
 H, W = 1382, 1080
@@ -132,6 +143,12 @@ for k, v in cap["batch_lhand"].items():
     save("batch_lhand_" + k, v)
 for k, v in cap["batch_rhand"].items():
     save("batch_rhand_" + k, v)
+if "pass2_mhr" in cap:
+    for k, v in cap["pass2_mhr"].items():
+        save("pass2_" + k, v)
+if "lhand_img" in cap:
+    save("lhand_img", cap["lhand_img"])
+    save("rhand_img", cap["rhand_img"])
 
 # ── recompute the gate + splice intermediates (same formulas as run_inference)
 body_pose_p1 = torch.from_numpy(cap["pass1_mhr"]["body_pose"]).float()
@@ -187,6 +204,26 @@ save("gate_wrist_ok", wrist_ok.numpy())
 hand_valid = (angle_diff < 1.4) & box_ok & kps_ok & wrist_ok
 save("gate_hand_valid_mask", hand_valid.numpy())
 
+# ── pass-2 (Doing IK) splice internals ───────────────────────────────────────
+if "pass2_mhr" in cap:
+    jgr_p2 = torch.from_numpy(cap["pass2_mhr"]["joint_global_rots"]).float()
+    lowarm_p2 = jgr_p2[:, torch.LongTensor([76, 40])]
+    wrist_zero_p2 = lowarm_p2 @ pre
+    save("splice_wrist_zero_p2", wrist_zero_p2.numpy())
+    fused_p2 = torch.einsum("kabc,kabd->kadc", pred_global_wrist, wrist_zero_p2)
+    save("splice_fused_p2", fused_p2.numpy())
+    wrist_xzy = fix_wrist_euler(roma.rotmat_to_euler("XZY", fused_p2))
+    save("splice_wrist_xzy", wrist_xzy.numpy())
+    valid_angle = (rotation_angle_difference(ori_local_wrist_rotmat, fused_p2)
+                   < 1.4) & hand_valid
+    save("splice_valid_angle", valid_angle.numpy())
+    splice_summary = [
+        f"splice_valid_angle = {valid_angle.numpy()}",
+        f"official spliced wrist_xzy (x,z,y): {wrist_xzy.numpy()}",
+    ]
+else:
+    splice_summary = []
+
 # ── human-readable summary ───────────────────────────────────────────────────
 lines = []
 lines.append("== gate ==")
@@ -196,6 +233,7 @@ lines.append(f"kps3_ok          = {kps_ok.numpy()}")
 lines.append(f"wrist dist l/r   = {left_dist.item():.4f} / {right_dist.item():.4f}")
 lines.append(f"wrist_ok         = {wrist_ok.numpy()}")
 lines.append(f"hand_valid_mask  = {hand_valid.numpy()}")
+lines += splice_summary
 lines.append("")
 lines.append("== final spliced ==")
 for k in ("global_rot", "body_pose_params", "hand_pose_params", "scale_params",

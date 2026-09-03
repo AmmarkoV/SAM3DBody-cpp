@@ -1336,6 +1336,18 @@ struct Pipeline::Impl
             // ── decoder_hand.onnx: run all 2×B hand crops in one batch ─────────
             t0 = Clock::now();
             const int HB = (int)hand_refs.size();
+            // DIAGNOSTIC: dump the normalised hand-crop tensors (3,512,512 per side)
+            // for pixel-level comparison against Python's real hand crops.
+            if (const char* dp = getenv("FSB_DUMP_HAND_CROP_PREFIX"))
+            {
+                for (int h = 0; h < HB; ++h)
+                {
+                    char path[512];
+                    snprintf(path, sizeof(path), "%s_%s.bin", dp, hand_refs[h].is_left ? "left" : "right");
+                    FILE* fp = fopen(path, "wb");
+                    if (fp) { fwrite(hbatch_crops.data() + (size_t)h*3*plane, sizeof(float), 3*plane, fp); fclose(fp); }
+                }
+            }
             std::vector<int64_t> himg_shape{HB, 3, CROP_SIZE, CROP_SIZE};
             std::vector<int64_t> hcond_shape{HB, 3};
             std::vector<int64_t> hray_shape {HB, 2, FEAT_HW, FEAT_HW};
@@ -1349,6 +1361,36 @@ struct Pipeline::Impl
             const float* hfeat_ptr = hand_backbone_out[0].GetTensorData<float>();
             size_t hfeat_elems = (size_t)HB * BACKBONE_DIM * FEAT_HW * FEAT_HW;
             std::vector<float> hand_features(hfeat_ptr, hfeat_ptr + hfeat_elems);
+            // DIAGNOSTIC: dump hand-crop backbone features per side (C,FEAT_HW,FEAT_HW
+            // layout) for comparison against Python's real captured ones.
+            if (const char* dp = getenv("FSB_DUMP_HAND_FEAT_PREFIX"))
+            {
+                for (int h = 0; h < HB; ++h)
+                {
+                    char path[512];
+                    snprintf(path, sizeof(path), "%s_%s.bin", dp, hand_refs[h].is_left ? "left" : "right");
+                    FILE* fp = fopen(path, "wb");
+                    if (fp) { fwrite(hand_features.data() + (size_t)h*BACKBONE_DIM*FEAT_HW*FEAT_HW,
+                                     sizeof(float), (size_t)BACKBONE_DIM*FEAT_HW*FEAT_HW, fp); fclose(fp); }
+                }
+            }
+            // DIAGNOSTIC: dump hand-crop cond[3]/ray[2,32,32] per side (the
+            // decoder_pre inputs), for the same comparison.
+            if (const char* dp = getenv("FSB_DUMP_HAND_CONDRAY_PREFIX"))
+            {
+                for (int h = 0; h < HB; ++h)
+                {
+                    char path[512];
+                    snprintf(path, sizeof(path), "%s_%s.bin", dp, hand_refs[h].is_left ? "left" : "right");
+                    FILE* fp = fopen(path, "wb");
+                    if (fp)
+                    {
+                        fwrite(hbatch_cond.data() + (size_t)h*3, sizeof(float), 3, fp);
+                        fwrite(hbatch_ray.data() + (size_t)h*2*ray_plane, sizeof(float), 2*ray_plane, fp);
+                        fclose(fp);
+                    }
+                }
+            }
 
             // Iterative refinement (same recipe as pass-2's decoder_prompted —
             // see POSEREFINE.md): decoder_hand.onnx's single-shot export is
@@ -1704,10 +1746,18 @@ struct Pipeline::Impl
         // ── assemble MHRResult per person ────────────────────────────────────
         std::vector<MHRResult> results(B);
         const int NPOSE = (int)meta.npose;
-        // Pass-1's own wrist Euler [right(41,43,42), left(31,33,32)], captured
+        // Pass-1's own wrist Euler [left(41,43,42), right(31,33,32)], captured
         // before any refined-pose splice — this is Python's `ori_local_wrist_rotmat`
         // (see run_inference), used as the reference pose for the rotation-agreement
         // gate below (PLAN.md step 7 TODO: this criterion is now implemented).
+        //
+        // SIDE CONVENTION (verified against the real rig, see POSEREFINE.md
+        // "fix the discrepancy ... hand pose estimation result"): body_pose
+        // PARAM indices [41,43,42] drive the LEFT hand chain (joints 77..104)
+        // and [31,33,32] the RIGHT chain (joints 41..68) — the opposite of what
+        // this code assumed for a long time. An earlier version stored/labeled
+        // these [right(41,43,42), left(31,33,32)], which crossed the gate's
+        // ori-vs-fused comparison AND the final wrist-IK splice between hands.
         std::vector<std::array<float,6>> pass1_wrist_euler(B);
 
         for (int i = 0; i < B; ++i)
@@ -1767,7 +1817,7 @@ struct Pipeline::Impl
             float be[133] = {};
             compact_cont_to_body_params(bc, be);
             r.body_pose.assign(be, be + 133);
-            pass1_wrist_euler[i] = { be[41], be[43], be[42], be[31], be[33], be[32] };
+            pass1_wrist_euler[i] = { be[41], be[43], be[42], be[31], be[33], be[32] };  // [left, right]
 
             // Shape [45]
             r.shape.assign(p + 266, p + 266 + 45);
@@ -2004,6 +2054,21 @@ struct Pipeline::Impl
                     snprintf(path, sizeof(path), "%s_%s.txt", dp, ref.is_left ? "left" : "right");
                     FILE* fp = fopen(path, "w");
                     if (fp) { for (float v : F.hand108) fprintf(fp, "%.8f\n", v); fclose(fp); }
+                }
+                // DIAGNOSTIC: dump the full hand-crop regression output (519-dim
+                // mhr raw + 3-dim cam) per side, for comparison against Python's
+                // real mhr_hand output (pred_pose_raw/shape/scale/hand/face/pred_cam).
+                if (const char* dp = getenv("FSB_DUMP_HAND_RAW_PREFIX"))
+                {
+                    char path[512];
+                    snprintf(path, sizeof(path), "%s_%s.txt", dp, ref.is_left ? "left" : "right");
+                    FILE* fp = fopen(path, "w");
+                    if (fp)
+                    {
+                        for (int k = 0; k < mhr_ffn_hand.out_dim; ++k) fprintf(fp, "%.8f\n", raw[k]);
+                        fprintf(fp, "%.8f\n%.8f\n%.8f\n", camr[0], camr[1], camr[2]);
+                        fclose(fp);
+                    }
                 }
                 // DIAGNOSTIC: override with Python's real captured hand108 (one file
                 // per side) to isolate whether the finger-PCA regression gap is
@@ -2244,7 +2309,7 @@ struct Pipeline::Impl
                     float pred_global_R[9]; quat_to_mat3(F.wrist_quat.data(), pred_global_R);
                     float zr_T[9]; mat3_transpose(zr, zr_T);
                     float fused_R[9]; mat3_mul(zr_T, pred_global_R, fused_R);
-                    const float* ori_e = pass1_wrist_euler[ref.person].data() + (ref.is_left ? 3 : 0);
+                    const float* ori_e = pass1_wrist_euler[ref.person].data() + (ref.is_left ? 0 : 3);  // [left, right] layout
                     float ori_R[9]; euler_xzy_to_mat3(ori_e[0], ori_e[1], ori_e[2], ori_R);
                     dbg_angle = mat3_angle_diff(ori_R, fused_R);
                     valid_angle = dbg_angle < HAND_WRIST_ANGLE_THRESH;
@@ -2277,6 +2342,10 @@ struct Pipeline::Impl
                 int left_h = -1, right_h = -1;
                 for (int h = 0; h < HB; ++h)
                     if (hand_refs[h].person == i) (hand_refs[h].is_left ? left_h : right_h) = h;
+                // Per-side splice-time validity (gate AND the splice's own angle
+                // check) — feeds the scale[18:]/shape[40:] valid-weighted average
+                // below, mirroring Python's `valid_angle` masking.
+                bool splice_valid_r = false, splice_valid_l = false;
 
                 // keypoint_prompt[4,3]: right_wrist, left_wrist, right_elbow, left_elbow.
                 // Coords are crop-normalised to the BODY pass's own crop [-0.5,0.5]
@@ -2603,6 +2672,20 @@ struct Pipeline::Impl
                     if (mhr_lbs_compute(lbs_data, mp2.data, shape_for_q2, zero_face72,
                                         v2.data(), j2.data(), q2.data()))
                     {
+                        // DIAGNOSTIC: dump pass-2 FK per-joint global quats
+                        // (splice "zero rotation" source) for comparison against
+                        // Python's real pass-2 joint_global_rots.
+                        if (const char* dp = getenv("FSB_DUMP_PASS2_Q2"))
+                        {
+                            FILE* fp = fopen(dp, "w");
+                            if (fp)
+                            {
+                                for (int j = 0; j < lbs_data->n_joints; ++j)
+                                    fprintf(fp, "%.8f %.8f %.8f %.8f\n",
+                                            q2[j*4+0], q2[j*4+1], q2[j*4+2], q2[j*4+3]);
+                                fclose(fp);
+                            }
+                        }
                         for (int lr = 0; lr < 2; ++lr)   // 0=right, 1=left
                         {
                             bool valid  = lr==0 ? right_valid : left_valid;
@@ -2651,7 +2734,7 @@ struct Pipeline::Impl
                             // in even when the box+distance gate alone passed, corrupting the
                             // whole-body scale via the shared scale[8]/[9] PCA components.
                             {
-                                const float* ori_e = pass1_wrist_euler[i].data() + (lr==0 ? 0 : 3);
+                                const float* ori_e = pass1_wrist_euler[i].data() + (lr==0 ? 3 : 0);  // [left, right] layout
                                 float ori_R[9]; euler_xzy_to_mat3(ori_e[0], ori_e[1], ori_e[2], ori_R);
                                 if (mat3_angle_diff(ori_R, fused_R) >= 1.4f) continue;
                             }
@@ -2662,37 +2745,74 @@ struct Pipeline::Impl
                             printf("[FSB]   splicedwristdbg lr=%d(%s) wx=%.4f wz=%.4f wy=%.4f\n",
                                    lr, lr==0?"right":"left", wx, wz, wy);
 
-                            // body_pose indices: right=[41,43,42], left=[31,33,32]
+                            // body_pose PARAM indices: left=[41,43,42], right=[31,33,32]
+                            // (verified against the real rig — [41,43,42] drives joints
+                            // 77..104 = LEFT chain; see the pass1_wrist_euler comment above.
+                            // An earlier version had these swapped, cross-splicing the two
+                            // hands' wrist rotations.)
                             // DIAGNOSTIC: temporarily skipped via env var to isolate whether
                             // the wrist-rotation splice (not the scale splice, already disabled
                             // above) is the actual source of the visible mesh distortion.
                             if (!getenv("FSB_SKIP_WRIST_SPLICE"))
                             {
-                                static const int idx_r[3] = {41,43,42}, idx_l[3] = {31,33,32};
+                                static const int idx_r[3] = {31,33,32}, idx_l[3] = {41,43,42};
                                 const int* idx = lr==0 ? idx_r : idx_l;
                                 p2_body_euler[idx[0]] = wx;
                                 p2_body_euler[idx[1]] = wz;
                                 p2_body_euler[idx[2]] = wy;
                             }
 
-                            // hand[108] half swap (see run_inference lines ~1545-1569)
-                            int src_off = lr==0 ? 54 : 0;   // right uses hand[54:], left uses hand[:54]
+                            // hand[108] half swap: BOTH sides take hand[54:] (the hand
+                            // decoder's "right-hand frame" decode). Python's
+                            // left_hand_pose_params extraction reads lhand hand[:, :54],
+                            // but run_inference first OVERWRITES that half with hand[:, 54:]
+                            // ("### Flip hand pose") since the left crop is a flipped
+                            // image whose real articulation lands in the right-hand half.
+                            // Reading hand[:54] for the left crop (an earlier version did)
+                            // splices the raw left-half decode — a different pose entirely.
+                            int src_off = 54;   // both sides: right-frame decode half
                             std::copy(hfk[h].hand108.begin()+src_off, hfk[h].hand108.begin()+src_off+54,
                                       r.hand_pose.begin() + (lr==0 ? 54 : 0));
-                            // scale[8]/[9] swap: DISABLED (see PLAN.md "refinedpose" branch notes).
-                            // hfk[h].scale28[8/9] comes from decoder_hand's single-pass (no
-                            // iterative refinement) regression and is confirmed off by ~35-40%
-                            // vs Python's real value even with fp32 weights (0.977-0.980 here
-                            // vs Python's 0.719) -- this is what was producing the "whole body
-                            // scale is wrong" regression once the validity gate started letting
-                            // this splice fire. Root cause is architectural (decoder_hand.onnx
-                            // is missing Python's per-layer do_interm_preds/keypoint_token_update
-                            // loop, which needs the LBS body model between decoder layers --
-                            // blocked from a single ONNX export by pymomentum). Re-enable once
-                            // that iterative refinement is ported (native LBS + per-layer ONNX).
-                            // if (r.scale.size() >= 10)
-                            //     r.scale[lr==0 ? 8 : 9] = hfk[h].scale28[lr==0 ? 8 : 9];
+
+                            // scale[8]/[9] splice (Python run_inference "Drop in hand scales"):
+                            // right(8) = rhand scale28[8] directly; left(9) is DERIVED from
+                            // the left crop's scale28[8] via the body head's PCA stats
+                            // (run_inference's scale_r/l_hands_mean/std lines — the left
+                            // crop always decodes in the right-hand frame, so its scale[9]
+                            // slot is meaningless and Python rebuilds it from scale[8]).
+                            // Re-enabled now that decoder_hand runs the iterative
+                            // refinement loop (previously disabled because the single-shot
+                            // export's scale28 was off by ~35-40%; see POSEREFINE.md).
+                            if (r.scale.size() >= 10 && lbs_data->scale_mean && lbs_data->scale_comps)
+                            {
+                                int ns = lbs_data->n_scale_out;
+                                if (lr==0)   // right
+                                    r.scale[8] = hfk[h].scale28[8];
+                                else         // left: PCA-derive scale[9] from scale[8]
+                                    r.scale[9] = ((lbs_data->scale_mean[8]
+                                                   + lbs_data->scale_comps[8*ns+8] * hfk[h].scale28[8])
+                                                  - lbs_data->scale_mean[9])
+                                                 / lbs_data->scale_comps[9*ns+9];
+                            }
+                            (lr==0 ? splice_valid_r : splice_valid_l) = true;
                         }
+                    }
+
+                    // scale[18:] / shape[40:] splices (Python "Replace shared shape and
+                    // scale"): valid-hand-weighted average of the two hand crops'
+                    // scale28[18:]/shape45[40:], kept as pass-2's values when no hand
+                    // passed the splice-time validity check.
+                    if ((splice_valid_r || splice_valid_l) && left_h >= 0 && right_h >= 0)
+                    {
+                        const float wl = splice_valid_l ? 1.f : 0.f;
+                        const float wr = splice_valid_r ? 1.f : 0.f;
+                        const float wsum = wl + wr;
+                        if (r.scale.size() >= 28)
+                            for (int k = 18; k < 28; ++k)
+                                r.scale[k] = (hfk[left_h].scale28[k]*wl + hfk[right_h].scale28[k]*wr) / wsum;
+                        if (r.shape.size() >= 45)
+                            for (int k = 40; k < 45; ++k)
+                                r.shape[k] = (hfk[left_h].shape45[k]*wl + hfk[right_h].shape45[k]*wr) / wsum;
                     }
                 }
                 r.body_pose.assign(p2_body_euler.begin(), p2_body_euler.end());
