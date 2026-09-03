@@ -1716,19 +1716,16 @@ struct Pipeline::Impl
             static constexpr int KP_RIGHT_WRIST = 41, KP_LEFT_WRIST = 62;
             static constexpr int KP_RIGHT_ELBOW = 8,  KP_LEFT_ELBOW = 7;
             static constexpr float HAND_BOX_SIZE_THRESH   = 64.f;    // px, original image
-            // Python's own threshold is 0.25 (run_inference's hand_wrist_kps2d_thresh),
-            // tuned for its native bf16 eager inference. This C++ port necessarily runs
-            // the hand-box regression in fp32 (decoder_handbox_fp32.onnx — bf16+CUDA has
-            // a confirmed ORT race condition on this op, see PLAN.md), which is NOT free:
-            // hand-verified that Python's OWN fp32-eager computation (same crop, zero ONNX
-            // involved) already diverges from its OWN bf16 production output by ~0.03-0.09
-            // in normalised crop space — comparable to or larger than the gap measured
-            // between this port and Python's bf16 output. So some of what this threshold
-            // is rejecting is an unavoidable cost of the bf16-CUDA-race workaround, not
-            // estimation error — relaxed to compensate. Calibrated against a small number
-            // of real test images (not systematically tuned); revisit if it lets through
-            // hands that are genuinely a bad match.
-            static constexpr float HAND_WRIST_DIST_THRESH = 0.50f;   // normalised by hand crop size
+            // Python's real threshold (run_inference's hand_wrist_kps2d_thresh) — matched
+            // exactly now that criterion 1 (rotation agreement) has been added below, per
+            // "fix the validity gate to match Python's real criteria". An earlier version
+            // of this gate relaxed this to 0.50 to compensate for fp32-regression precision
+            // gaps (this C++ port runs the hand-box regression in fp32, decoder_handbox_fp32.onnx
+            // — bf16+CUDA has a confirmed ORT race condition on this op, see PLAN.md); that
+            // relaxation is no longer applied since it isn't a faithful port and the combined
+            // 4-criteria gate can only get stricter, never more permissive, by fixing this.
+            static constexpr float HAND_WRIST_DIST_THRESH = 0.25f;   // normalised by hand crop size
+            static constexpr float HAND_WRIST_ANGLE_THRESH = 1.4f;   // rad; Python's thresh_wrist_angle
 
             // ── per-hand-crop own FK: wrist 2D (full-image, unflipped) + wrist quat ──
             struct HandFK {
@@ -1749,6 +1746,40 @@ struct Pipeline::Impl
             std::vector<float> hj_scratch((size_t)lbs_data->n_joints * 3);
             std::vector<float> hq_scratch((size_t)lbs_data->n_joints * 4);
             static const float zero_face72[72] = {};
+
+            // ── Criterion 1 (rotation agreement) prerequisite: pass-1's own "zero
+            // rotation" FK reference per person, for both hands — matches Python's
+            // run_inference lines ~1286-1314 exactly: `joint_rotations =
+            // pose_output["mhr"]["joint_global_rots"]` there is PASS-1's own body
+            // decoder output (Step 1's `pose_output`, before pass-2/keypoint-prompt
+            // even runs) — NOT pass-2's. This is a SEPARATE computation from the
+            // later wrist-IK fusion's own zero_rot_R (which correctly uses pass-2's
+            // body pose, matching Python's "Doing IK" block, which by that point has
+            // already overwritten pose_output["mhr"]["body_pose"] via the keypoint
+            // prompt pass) — see POSEREFINE.md, an earlier attempt to reuse pass-1
+            // for BOTH was not actually a faithful port, reverted.
+            std::vector<std::array<float,9>> zero_rot_R1_right(B), zero_rot_R1_left(B);
+            std::vector<uint8_t> zero_rot_R1_ok(B, 0);
+            for (int pi = 0; pi < B; ++pi)
+            {
+                MHRResult& pr = results[pi];
+                if (pr.body_pose.size() < 133 || pr.global_rot.size() < 3) continue;
+                float g_rxryrz[3] = { pr.global_rot[2], pr.global_rot[1], pr.global_rot[0] };
+                ModelParams204 mp1 = build_model_params(g_rxryrz, pr.body_pose.data(), nullptr, true);
+                std::vector<float> zshape1((size_t)lbs_data->n_shape_pc, 0.f);
+                std::vector<float> v1((size_t)lbs_data->n_verts*3), j1((size_t)lbs_data->n_joints*3),
+                                   q1((size_t)lbs_data->n_joints*4);
+                if (!mhr_lbs_compute(lbs_data, mp1.data, zshape1.data(), zero_face72,
+                                      v1.data(), j1.data(), q1.data()))
+                    continue;
+                float lowarm_R1r[9]; quat_to_mat3(q1.data() + 40*4, lowarm_R1r);
+                float pre_R1r[9];    quat_to_mat3(lbs_data->joint_prerotations + 41*4, pre_R1r);
+                mat3_mul(lowarm_R1r, pre_R1r, zero_rot_R1_right[pi].data());
+                float lowarm_R1l[9]; quat_to_mat3(q1.data() + 76*4, lowarm_R1l);
+                float pre_R1l[9];    quat_to_mat3(lbs_data->joint_prerotations + 77*4, pre_R1l);
+                mat3_mul(lowarm_R1l, pre_R1l, zero_rot_R1_left[pi].data());
+                zero_rot_R1_ok[pi] = 1;
+            }
 
             for (int h = 0; h < HB; ++h)
             {
@@ -1903,14 +1934,35 @@ struct Pipeline::Impl
                     valid_dist = dist < HAND_WRIST_DIST_THRESH;
                     dbg_dist = dist; dbg_bodyx = body_wrist2d[0]; dbg_bodyy = body_wrist2d[1];
                 }
-                F.valid = valid_box && valid_dist;
+                // Criterion 1 (rotation agreement): fuse this hand crop's own predicted
+                // global wrist rotation with pass-1's "zero rotation" FK reference for
+                // this person/side, then compare against pass-1's own local wrist Euler
+                // — matches run_inference's early angle_difference_valid_mask exactly
+                // (see the zero_rot_R1_right/left precompute above this loop).
+                bool valid_angle = false;
+                float dbg_angle = -1.f;
+                if (zero_rot_R1_ok[ref.person])
+                {
+                    const float* zr = ref.is_left ? zero_rot_R1_left[ref.person].data()
+                                                   : zero_rot_R1_right[ref.person].data();
+                    float pred_global_R[9]; quat_to_mat3(F.wrist_quat.data(), pred_global_R);
+                    float zr_T[9]; mat3_transpose(zr, zr_T);
+                    float fused_R[9]; mat3_mul(zr_T, pred_global_R, fused_R);
+                    const float* ori_e = pass1_wrist_euler[ref.person].data() + (ref.is_left ? 3 : 0);
+                    float ori_R[9]; euler_xzy_to_mat3(ori_e[0], ori_e[1], ori_e[2], ori_R);
+                    dbg_angle = mat3_angle_diff(ori_R, fused_R);
+                    valid_angle = dbg_angle < HAND_WRIST_ANGLE_THRESH;
+                }
+                F.valid = valid_box && valid_dist && valid_angle;
                 // Dev escape hatch for gate-threshold tuning/debugging without a
-                // rebuild — bypasses only the distance check, box-size still applies.
+                // rebuild — bypasses the distance and angle checks, box-size still applies.
                 if (getenv("FSB_FORCE_HAND_VALID")) F.valid = valid_box;
                 printf("[FSB]   gate-debug h=%d person=%d %s: orig_sz=%.1f valid_box=%d "
-                       "hand_wrist2d=(%.1f,%.1f) body_wrist2d=(%.1f,%.1f) dist_norm=%.3f valid_dist=%d\n",
+                       "hand_wrist2d=(%.1f,%.1f) body_wrist2d=(%.1f,%.1f) dist_norm=%.3f valid_dist=%d "
+                       "angle_diff=%.3f valid_angle=%d valid=%d\n",
                        h, ref.person, ref.is_left?"left":"right", ref.orig_sz, valid_box,
-                       wx, wy, dbg_bodyx, dbg_bodyy, dbg_dist, valid_dist);
+                       wx, wy, dbg_bodyx, dbg_bodyy, dbg_dist, valid_dist,
+                       dbg_angle, valid_angle, F.valid);
             }
             printf("[FSB] hand FK + gate: %.1f ms  (%d/%d hand(s) valid)\n", ms(t0),
                    (int)std::count_if(hfk.begin(), hfk.end(), [](const HandFK& f){ return f.valid; }), HB);
@@ -2210,18 +2262,22 @@ struct Pipeline::Impl
                 // ── wrist-IK fusion (only for hands that passed the gate) ──────────
                 if (right_valid || left_valid)
                 {
-                    // Build the "zero rotation" FK reference from pass-1's own body pose,
-                    // not pass-2's (see POSEREFINE.md "design a robust fusion formula").
-                    // zero_rot_R is a deep chain-composed rotation (root..lowarm, 6-7
-                    // joints) where residual per-joint decode error compounds
-                    // multiplicatively; empirically confirmed pass-1's body pose gives a
-                    // meaningfully smaller error here than pass-2's (117deg -> 83deg on
-                    // the zero_rot_R matrix itself, 67deg -> 44.5deg on the final spliced
-                    // wrist angle, for the test case this was diagnosed against) — a real,
-                    // measured improvement, not a full fix (the underlying chain-compounding
-                    // sensitivity remains). Set FSB_ZERO_ROT_PASS2 to revert to the
-                    // (worse) pass-2-based reference for comparison/debugging.
-                    bool use_pass1_for_zero_rot = getenv("FSB_ZERO_ROT_PASS2") == nullptr;
+                    // Build the "zero rotation" FK reference from PASS-2's own body pose —
+                    // this is the faithful port of Python's "Doing IK" splice block
+                    // (run_inference: `joint_rotations = pose_output["mhr"]["joint_global_rots"]`
+                    // at that point in the code is pass-2's, since pass-2's decode has
+                    // already overwritten pose_output["mhr"] by then). An earlier version of
+                    // this code defaulted to pass-1's body pose here instead, which measured
+                    // as a real empirical improvement on one test image (117deg -> 83deg on
+                    // zero_rot_R, 67deg -> 44.5deg on the final spliced wrist angle) but was
+                    // NOT what Python actually does for this specific computation — Python
+                    // only uses pass-1 for the EARLIER validity-gate's criterion 1 (see the
+                    // zero_rot_R1_right/left precompute + gate-debug block above), not for
+                    // this splice. Reverted per "fix the validity gate to match Python's real
+                    // criteria" — see POSEREFINE.md. Set FSB_ZERO_ROT_PASS1 to go back to the
+                    // old (unfaithful but empirically smaller-error) pass-1-based reference
+                    // for comparison/debugging.
+                    bool use_pass1_for_zero_rot = getenv("FSB_ZERO_ROT_PASS1") != nullptr;
                     ModelParams204 mp2 = use_pass1_for_zero_rot
                         ? build_model_params(pass1_global_rot_rxryrz, pass1_body_euler_snapshot.data(), nullptr, true)
                         : build_model_params(p2_global_rot_euler, p2_body_euler.data(), nullptr, true);
