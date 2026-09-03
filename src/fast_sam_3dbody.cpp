@@ -371,9 +371,25 @@ struct Pipeline::Impl
 
     // ── Refined pose (see PLAN.md) — only loaded when cfg.refined_pose ───────
     OrtSession sess_decoder_handbox;   // decoder_handbox_fp32.onnx: pose_token+hand_box+hand_cls
-    OrtSession sess_decoder_hand;      // decoder_hand.onnx: hand-crop decoder pass
-    OrtSession sess_decoder_prompted;  // decoder_prompted.onnx: keypoint-prompted body pass 2
     CFFN mhr_ffn_hand, cam_ffn_hand;   // gguf mhr_proj_hand / cam_proj_hand
+
+    // Iterative pass-2 (decoder_prompted, faithful port of Python's real
+    // do_interm_preds + keypoint_token_update loop — see POSEREFINE.md).
+    // Replaces the earlier single-shot decoder_prompted.onnx entirely: that
+    // file is never loaded when refined_pose is on.
+    OrtSession sess_decoder_prompted_pre;
+    std::array<OrtSession,6> sess_decoder_prompted_layers;
+    OrtSession sess_decoder_prompted_normfinal;
+    OrtSession sess_decoder_prompted_update;
+    static constexpr int P2_N_TOK = 148, P2_KPS_START = 6, P2_KPS3D_START = 76;
+
+    // Iterative decoder_hand (same recipe, same rationale — see POSEREFINE.md).
+    // Replaces the earlier single-shot decoder_hand.onnx entirely.
+    OrtSession sess_decoder_hand_pre;
+    std::array<OrtSession,6> sess_decoder_hand_layers;
+    OrtSession sess_decoder_hand_normfinal;
+    OrtSession sess_decoder_hand_update;
+    static constexpr int HAND_N_TOK = 145, HAND_KPS_START = 3, HAND_KPS3D_START = 73;
 
     // Keypoint mapping: sparse COO format for 70 MHR keypoints
     // Maps [vertices(18439) + joints(127)] → 70 keypoints
@@ -483,6 +499,16 @@ struct Pipeline::Impl
                 if (lbs_data)
                 {
                     printf("OK (%d joints, %d vertices)\n", lbs_data->n_joints, lbs_data->n_verts);
+                    if (getenv("FSB_DUMP_HAND_TABLES") && lbs_data->hand_joint_idxs_left)
+                    {
+                        printf("[DIAG] hand_joint_idxs_left: ");
+                        for (int k = 0; k < 27; ++k) printf("%d ", lbs_data->hand_joint_idxs_left[k]);
+                        printf("\n[DIAG] hand_joint_idxs_right: ");
+                        for (int k = 0; k < 27; ++k) printf("%d ", lbs_data->hand_joint_idxs_right[k]);
+                        printf("\n[DIAG] hand_pose_mean[:10]: ");
+                        for (int k = 0; k < 10; ++k) printf("%.6f ", lbs_data->hand_pose_mean[k]);
+                        printf("\n");
+                    }
 #ifdef FSB_CUDA
                     lbs_cuda = mhr_lbs_cuda_init(lbs_data);
                     if (lbs_cuda) printf("[FSB] LBS CUDA accelerated (GPU shape blend + scatter)\n");
@@ -536,17 +562,45 @@ struct Pipeline::Impl
                 return false;
             printf("OK\n");
 
-            printf("[FSB] Loading decoder_hand … ");
+            printf("[FSB] Loading decoder_hand (iterative, 9 graphs) … ");
             fflush(stdout);
-            if (!sess_decoder_hand.load(ort_env, opath(cfg.decoder_hand_name.c_str()),
-                                        cuda, dev, cfg.use_fp16, cfg.use_trt_ep))
+            if (!sess_decoder_hand_pre.load(ort_env, opath("decoder_hand_pre.onnx"),
+                                             cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false))
+                return false;
+            for (int li = 0; li < 6; ++li)
+            {
+                char fname[64];
+                snprintf(fname, sizeof(fname), "decoder_hand_layer%d.onnx", li);
+                if (!sess_decoder_hand_layers[li].load(ort_env, opath(fname),
+                                                        cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false))
+                    return false;
+            }
+            if (!sess_decoder_hand_normfinal.load(ort_env, opath("decoder_hand_normfinal.onnx"),
+                                                    cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false))
+                return false;
+            if (!sess_decoder_hand_update.load(ort_env, opath("decoder_hand_update.onnx"),
+                                                 cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false))
                 return false;
             printf("OK\n");
 
-            printf("[FSB] Loading decoder_prompted … ");
+            printf("[FSB] Loading decoder_prompted (iterative, 9 graphs) … ");
             fflush(stdout);
-            if (!sess_decoder_prompted.load(ort_env, opath(cfg.decoder_prompted_name.c_str()),
-                                            cuda, dev, cfg.use_fp16, cfg.use_trt_ep))
+            if (!sess_decoder_prompted_pre.load(ort_env, opath("decoder_prompted_pre.onnx"),
+                                                 cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false))
+                return false;
+            for (int li = 0; li < 6; ++li)
+            {
+                char fname[64];
+                snprintf(fname, sizeof(fname), "decoder_prompted_layer%d.onnx", li);
+                if (!sess_decoder_prompted_layers[li].load(ort_env, opath(fname),
+                                                            cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false))
+                    return false;
+            }
+            if (!sess_decoder_prompted_normfinal.load(ort_env, opath("decoder_prompted_normfinal.onnx"),
+                                                        cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false))
+                return false;
+            if (!sess_decoder_prompted_update.load(ort_env, opath("decoder_prompted_update.onnx"),
+                                                     cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false))
                 return false;
             printf("OK\n");
         }
@@ -1106,28 +1160,191 @@ struct Pipeline::Impl
             size_t hfeat_elems = (size_t)HB * BACKBONE_DIM * FEAT_HW * FEAT_HW;
             std::vector<float> hand_features(hfeat_ptr, hfeat_ptr + hfeat_elems);
 
-            std::vector<int64_t> hfeat_shape{HB, BACKBONE_DIM, FEAT_HW, FEAT_HW};
-            Ort::Value hd_feat_t = Ort::Value::CreateTensor<float>(
-                                       mi, hand_features.data(), hand_features.size(), hfeat_shape.data(), 4);
-            Ort::Value hd_cond_t = Ort::Value::CreateTensor<float>(
-                                       mi, hbatch_cond.data(), hbatch_cond.size(), hcond_shape.data(), 2);
-            Ort::Value hd_ray_t  = Ort::Value::CreateTensor<float>(
-                                       mi, hbatch_ray.data(), hbatch_ray.size(), hray_shape.data(), 4);
-            std::vector<Ort::Value> hd_inputs;
-            hd_inputs.push_back(std::move(hd_feat_t));
-            hd_inputs.push_back(std::move(hd_cond_t));
-            hd_inputs.push_back(std::move(hd_ray_t));
+            // Iterative refinement (same recipe as pass-2's decoder_prompted —
+            // see POSEREFINE.md): decoder_hand.onnx's single-shot export is
+            // missing Python's real do_interm_preds + keypoint_token_update
+            // loop between the 6 transformer layers, which needs the (ONNX-
+            // incompatible) MHR/LBS body model in between. Ported the same
+            // way: 9 small graphs, C++ drives the loop using the existing
+            // native LBS + mhr_ffn_hand/cam_ffn_hand regression heads for the
+            // between-layer step. One hand crop at a time (batch=1 per call,
+            // matching pass-2's per-person loop pattern) rather than the
+            // original's batched-HB call, for simplicity.
+            hand_mhr_raw.assign((size_t)HB * mhr_ffn_hand.out_dim, 0.f);
+            hand_cam_raw.assign((size_t)HB * 3, 0.f);
+            static const float hand_zero_face72[72] = {};
 
-            auto hd_out = sess_decoder_hand.session->Run(
-                              Ort::RunOptions{nullptr},
-                              sess_decoder_hand.input_names.data(),  hd_inputs.data(), hd_inputs.size(),
-                              sess_decoder_hand.output_names.data(), 1);
-            const float* hd_token_ptr = hd_out[0].GetTensorData<float>();
-            std::vector<float> hand_pose_tokens(hd_token_ptr, hd_token_ptr + (size_t)HB * DECODER_DIM);
+            for (int h = 0; h < HB; ++h)
+            {
+                const auto& ref = hand_refs[h];
+                std::vector<int64_t> f1_sh{1, BACKBONE_DIM, FEAT_HW, FEAT_HW};
+                std::vector<int64_t> c1_sh{1, 3};
+                std::vector<int64_t> r1_sh{1, 2, FEAT_HW, FEAT_HW};
+                Ort::Value hf_t = Ort::Value::CreateTensor<float>(
+                                      mi, hand_features.data() + (size_t)h*BACKBONE_DIM*FEAT_HW*FEAT_HW,
+                                      (size_t)BACKBONE_DIM*FEAT_HW*FEAT_HW, f1_sh.data(), 4);
+                Ort::Value hc_t = Ort::Value::CreateTensor<float>(
+                                      mi, hbatch_cond.data() + (size_t)h*3, 3, c1_sh.data(), 2);
+                Ort::Value hr_t = Ort::Value::CreateTensor<float>(
+                                      mi, hbatch_ray.data() + (size_t)h*2*ray_plane, 2*ray_plane, r1_sh.data(), 4);
+                std::vector<Ort::Value> hpre_in;
+                hpre_in.push_back(std::move(hf_t)); hpre_in.push_back(std::move(hc_t)); hpre_in.push_back(std::move(hr_t));
 
-            hand_mhr_raw = cffn_run(mhr_ffn_hand, hand_pose_tokens.data(), HB);
-            hand_cam_raw = cffn_run(cam_ffn_hand, hand_pose_tokens.data(), HB);
-            printf("[FSB] hand decoder+ffn: %.1f ms  (%d hand crop(s))\n", ms(t0), HB);
+                auto hpre_out = sess_decoder_hand_pre.session->Run(
+                                    Ort::RunOptions{nullptr}, sess_decoder_hand_pre.input_names.data(),
+                                    hpre_in.data(), hpre_in.size(), sess_decoder_hand_pre.output_names.data(), 5);
+                std::vector<float> htoken(hpre_out[0].GetTensorData<float>(),
+                                           hpre_out[0].GetTensorData<float>() + (size_t)HAND_N_TOK*1024);
+                std::vector<float> htok_aug(hpre_out[1].GetTensorData<float>(),
+                                             hpre_out[1].GetTensorData<float>() + (size_t)HAND_N_TOK*1024);
+                std::vector<float> hfeat_chw(hpre_out[2].GetTensorData<float>(),
+                                              hpre_out[2].GetTensorData<float>() + (size_t)BACKBONE_DIM*FEAT_HW*FEAT_HW);
+                std::vector<float> hfeat_flat(hpre_out[3].GetTensorData<float>(),
+                                               hpre_out[3].GetTensorData<float>() + (size_t)FEAT_HW*FEAT_HW*BACKBONE_DIM);
+                std::vector<float> himg_aug_flat(hpre_out[4].GetTensorData<float>(),
+                                                  hpre_out[4].GetTensorData<float>() + (size_t)FEAT_HW*FEAT_HW*BACKBONE_DIM);
+
+                // Decodes a raw 519-dim hand regression output into 70 3D
+                // keypoints + crop-normalised 2D/depth, INCLUDING the
+                // wrist-centric→body-rooted transform head_pose_hand always
+                // applies internally (mirrors the FK block below exactly —
+                // see its own comments for the transform derivation/verification).
+                auto decode_intermediate_hand = [&](const float* praw, const float* pcam,
+                                                     std::vector<float>& kp2d_cropped_out,
+                                                     std::vector<float>& kp2d_depth_out,
+                                                     std::vector<float>& kp3d_out)
+                {
+                    float g_rot[3]; rot6d_to_euler(praw, g_rot);
+                    std::array<float,133> b_euler{};
+                    compact_cont_to_body_params(praw + 6, b_euler.data());
+                    ModelParams204 mpi = build_model_params(g_rot, b_euler.data(), nullptr, true);
+                    apply_hand_pose(mpi.data, praw + 339,
+                                     lbs_data->hand_pose_mean, lbs_data->hand_pose_comps,
+                                     lbs_data->hand_joint_idxs_left, lbs_data->hand_joint_idxs_right);
+                    if (lbs_data->scale_mean && lbs_data->scale_comps)
+                    {
+                        int ns = lbs_data->n_scale_out, npc = lbs_data->n_scale_pc;
+                        for (int j = 0; j < ns; ++j) mpi.data[136+j] = lbs_data->scale_mean[j];
+                        for (int k = 0; k < npc; ++k)
+                            for (int j = 0; j < ns; ++j)
+                                mpi.data[136+j] += praw[311+k] * lbs_data->scale_comps[k*ns+j];
+                    }
+                    {
+                        float R_ori[9]; mp_rot_to_mat3(mpi.data + 3, R_ori);
+                        float R_new[9]; mat3_mul(R_ori, HAND_LOCAL_TO_WORLD_WRIST, R_new);
+                        float mp_rot_new[3]; mat3_to_mp_rot(R_new, mp_rot_new);
+                        float diff[3] = {
+                            HAND_RIGHT_WRIST_COORDS[0] - HAND_ROOT_COORDS[0],
+                            HAND_RIGHT_WRIST_COORDS[1] - HAND_ROOT_COORDS[1],
+                            HAND_RIGHT_WRIST_COORDS[2] - HAND_ROOT_COORDS[2]
+                        };
+                        float rotated[3]; mat3_vec3(R_new, diff, rotated);
+                        mpi.data[0] = -(rotated[0] + HAND_ROOT_COORDS[0]) * 10.f;
+                        mpi.data[1] = -(rotated[1] + HAND_ROOT_COORDS[1]) * 10.f;
+                        mpi.data[2] = -(rotated[2] + HAND_ROOT_COORDS[2]) * 10.f;
+                        mpi.data[3] = mp_rot_new[0]; mpi.data[4] = mp_rot_new[1]; mpi.data[5] = mp_rot_new[2];
+                        for (int idx : HAND_NONHAND_PARAM_IDXS) mpi.data[idx] = 0.f;
+                    }
+                    std::vector<float> iv((size_t)lbs_data->n_verts*3), ij((size_t)lbs_data->n_joints*3);
+                    if (!mhr_lbs_compute(lbs_data, mpi.data, praw + 266, hand_zero_face72,
+                                          iv.data(), ij.data(), nullptr))
+                        return false;
+                    kp3d_out.assign(70*3, 0.f);
+                    for (const auto& e : kp_mapping)
+                        for (int c = 0; c < 3; ++c)
+                        {
+                            float src = (e.col < 18439) ? iv[e.col*3+c] : ij[(e.col-18439)*3+c];
+                            kp3d_out[e.row*3+c] += src * e.val;
+                        }
+                    static constexpr float HAND_CAM_SCALE_FACTOR = 10.f;
+                    float geom_cx     = ref.is_left ? (float(W) - ref.orig_cx) : ref.orig_cx;
+                    float geom_cam_cx = ref.is_left ? (float(W) - cx)          : cx;
+                    float s_val = -pcam[0], t_x = pcam[1], t_y = -pcam[2];
+                    float bs = ref.orig_sz * s_val * HAND_CAM_SCALE_FACTOR + 1e-8f;
+                    float cam_t[3] = { t_x + 2.f*(geom_cx-geom_cam_cx)/bs, t_y + 2.f*(ref.orig_cy-cy)/bs, 2.f*fx/bs };
+                    kp2d_cropped_out.assign(70*2, 0.f);
+                    kp2d_depth_out.assign(70, 0.f);
+                    for (int k = 0; k < 70; ++k)
+                    {
+                        float dz = kp3d_out[k*3+2] + cam_t[2];
+                        float dx = kp3d_out[k*3+0] + cam_t[0];
+                        float dy = kp3d_out[k*3+1] + cam_t[1];
+                        if (dz < 1e-4f) dz = 1e-4f;
+                        float full_x = dx/dz*fx + geom_cam_cx, full_y = dy/dz*fy + cy;
+                        // Crop-normalise against THIS hand crop's own geometry
+                        // (geom_cx/orig_sz), matching _full_to_crop's role for
+                        // the body case but in the hand crop's own frame —
+                        // consistent with how this crop's tokens were built.
+                        kp2d_cropped_out[k*2+0] = (full_x - geom_cx) / std::max(1.f, ref.orig_sz);
+                        kp2d_cropped_out[k*2+1] = (full_y - ref.orig_cy) / std::max(1.f, ref.orig_sz);
+                        kp2d_depth_out[k] = dz;
+                    }
+                    return true;
+                };
+
+                for (int layer_idx = 0; layer_idx < 6; ++layer_idx)
+                {
+                    std::vector<int64_t> tok_sh{1, HAND_N_TOK, 1024}, img_sh{1, FEAT_HW*FEAT_HW, BACKBONE_DIM};
+                    Ort::Value t_tok = Ort::Value::CreateTensor<float>(mi, htoken.data(), htoken.size(), tok_sh.data(), 3);
+                    Ort::Value t_img = Ort::Value::CreateTensor<float>(mi, hfeat_flat.data(), hfeat_flat.size(), img_sh.data(), 3);
+                    Ort::Value t_aug = Ort::Value::CreateTensor<float>(mi, htok_aug.data(), htok_aug.size(), tok_sh.data(), 3);
+                    Ort::Value t_iag = Ort::Value::CreateTensor<float>(mi, himg_aug_flat.data(), himg_aug_flat.size(), img_sh.data(), 3);
+                    std::vector<Ort::Value> lin;
+                    lin.push_back(std::move(t_tok)); lin.push_back(std::move(t_img));
+                    lin.push_back(std::move(t_aug)); lin.push_back(std::move(t_iag));
+                    auto& ls = sess_decoder_hand_layers[layer_idx];
+                    auto lout = ls.session->Run(Ort::RunOptions{nullptr}, ls.input_names.data(), lin.data(), lin.size(),
+                                                 ls.output_names.data(), 2);
+                    htoken.assign(lout[0].GetTensorData<float>(), lout[0].GetTensorData<float>() + htoken.size());
+
+                    std::vector<int64_t> pt_sh{1, HAND_N_TOK, 1024};
+                    Ort::Value nf_in = Ort::Value::CreateTensor<float>(mi, htoken.data(), htoken.size(), pt_sh.data(), 3);
+                    std::vector<Ort::Value> nfin; nfin.push_back(std::move(nf_in));
+                    auto nfout = sess_decoder_hand_normfinal.session->Run(
+                                     Ort::RunOptions{nullptr}, sess_decoder_hand_normfinal.input_names.data(),
+                                     nfin.data(), nfin.size(), sess_decoder_hand_normfinal.output_names.data(), 1);
+                    const float* pose_token = nfout[0].GetTensorData<float>();
+
+                    if (layer_idx == 5) break;
+
+                    std::vector<float> l_mhr = cffn_run(mhr_ffn_hand, pose_token, 1);
+                    std::vector<float> l_cam = cffn_run(cam_ffn_hand, pose_token, 1);
+                    std::vector<float> kp2d_c, kp2d_d, kp3d;
+                    if (!decode_intermediate_hand(l_mhr.data(), l_cam.data(), kp2d_c, kp2d_d, kp3d))
+                        break;
+
+                    std::vector<int64_t> chw_sh{1, BACKBONE_DIM, FEAT_HW, FEAT_HW};
+                    std::vector<int64_t> k2_sh{1, 70, 2}, kd_sh{1, 70}, k3_sh{1, 70, 3};
+                    Ort::Value u_tok = Ort::Value::CreateTensor<float>(mi, htoken.data(), htoken.size(), tok_sh.data(), 3);
+                    Ort::Value u_aug = Ort::Value::CreateTensor<float>(mi, htok_aug.data(), htok_aug.size(), tok_sh.data(), 3);
+                    Ort::Value u_chw = Ort::Value::CreateTensor<float>(mi, hfeat_chw.data(), hfeat_chw.size(), chw_sh.data(), 4);
+                    Ort::Value u_k2  = Ort::Value::CreateTensor<float>(mi, kp2d_c.data(), kp2d_c.size(), k2_sh.data(), 3);
+                    Ort::Value u_kd  = Ort::Value::CreateTensor<float>(mi, kp2d_d.data(), kp2d_d.size(), kd_sh.data(), 2);
+                    Ort::Value u_k3  = Ort::Value::CreateTensor<float>(mi, kp3d.data(), kp3d.size(), k3_sh.data(), 3);
+                    std::vector<Ort::Value> uin;
+                    uin.push_back(std::move(u_tok)); uin.push_back(std::move(u_aug)); uin.push_back(std::move(u_chw));
+                    uin.push_back(std::move(u_k2));  uin.push_back(std::move(u_kd));  uin.push_back(std::move(u_k3));
+                    auto uout = sess_decoder_hand_update.session->Run(
+                                    Ort::RunOptions{nullptr}, sess_decoder_hand_update.input_names.data(),
+                                    uin.data(), uin.size(), sess_decoder_hand_update.output_names.data(), 2);
+                    htoken.assign(uout[0].GetTensorData<float>(), uout[0].GetTensorData<float>() + htoken.size());
+                    htok_aug.assign(uout[1].GetTensorData<float>(), uout[1].GetTensorData<float>() + htok_aug.size());
+                }
+
+                std::vector<int64_t> pt_sh_f{1, HAND_N_TOK, 1024};
+                Ort::Value nf_in_f = Ort::Value::CreateTensor<float>(mi, htoken.data(), htoken.size(), pt_sh_f.data(), 3);
+                std::vector<Ort::Value> nfin_f; nfin_f.push_back(std::move(nf_in_f));
+                auto nfout_f = sess_decoder_hand_normfinal.session->Run(
+                                   Ort::RunOptions{nullptr}, sess_decoder_hand_normfinal.input_names.data(),
+                                   nfin_f.data(), nfin_f.size(), sess_decoder_hand_normfinal.output_names.data(), 1);
+                const float* h_pose_token = nfout_f[0].GetTensorData<float>();
+
+                std::vector<float> h_mhr = cffn_run(mhr_ffn_hand, h_pose_token, 1);
+                std::vector<float> h_cam = cffn_run(cam_ffn_hand, h_pose_token, 1);
+                std::copy(h_mhr.begin(), h_mhr.end(), hand_mhr_raw.begin() + (size_t)h*mhr_ffn_hand.out_dim);
+                std::copy(h_cam.begin(), h_cam.end(), hand_cam_raw.begin() + (size_t)h*3);
+            }
+            printf("[FSB] hand decoder+ffn (iterative): %.1f ms  (%d hand crop(s))\n", ms(t0), HB);
 
             // hand_mhr_raw/hand_cam_raw/hand_refs are used below (after the
             // per-person results are assembled) for the validity gate, pass-2
@@ -1493,7 +1710,7 @@ struct Pipeline::Impl
         //   - kept everything else faithful, including the closed-form wrist-IK
         //     rotation solve (this is what the LBS out_joint_quats extension —
         //     see model_loader_transform_joints.c — was added for).
-        if (cfg.refined_pose && sess_decoder_prompted.session && lbs_data && !kp_mapping.empty())
+        if (cfg.refined_pose && sess_decoder_prompted_pre.session && lbs_data && !kp_mapping.empty())
         {
             t0 = Clock::now();
             static constexpr int KP_RIGHT_WRIST = 41, KP_LEFT_WRIST = 62;
@@ -1777,11 +1994,139 @@ struct Pipeline::Impl
                 p2_inputs.push_back(std::move(pk_t));
                 p2_inputs.push_back(std::move(pp_t));
 
-                auto p2_out = sess_decoder_prompted.session->Run(
-                                  Ort::RunOptions{nullptr},
-                                  sess_decoder_prompted.input_names.data(),  p2_inputs.data(), p2_inputs.size(),
-                                  sess_decoder_prompted.output_names.data(), 1);
-                const float* p2_token = p2_out[0].GetTensorData<float>();
+                // ── iterative pass-2: preamble → 6 layers, with the real do_interm_preds
+                // + keypoint_token_update loop interposed between layers, using the
+                // EXISTING native LBS + mhr_ffn/cam_ffn regression heads for the
+                // between-layer step (the piece that can't be exported to ONNX
+                // directly — see POSEREFINE.md). ────────────────────────────────────
+                auto pre_out = sess_decoder_prompted_pre.session->Run(
+                                   Ort::RunOptions{nullptr},
+                                   sess_decoder_prompted_pre.input_names.data(), p2_inputs.data(), p2_inputs.size(),
+                                   sess_decoder_prompted_pre.output_names.data(), 5);
+                std::vector<float> token(pre_out[0].GetTensorData<float>(),
+                                          pre_out[0].GetTensorData<float>() + (size_t)P2_N_TOK*1024);
+                std::vector<float> tok_aug(pre_out[1].GetTensorData<float>(),
+                                            pre_out[1].GetTensorData<float>() + (size_t)P2_N_TOK*1024);
+                std::vector<float> feat_chw(pre_out[2].GetTensorData<float>(),
+                                             pre_out[2].GetTensorData<float>() + (size_t)BACKBONE_DIM*FEAT_HW*FEAT_HW);
+                std::vector<float> feat_flat(pre_out[3].GetTensorData<float>(),
+                                              pre_out[3].GetTensorData<float>() + (size_t)FEAT_HW*FEAT_HW*BACKBONE_DIM);
+                std::vector<float> img_aug_flat(pre_out[4].GetTensorData<float>(),
+                                                 pre_out[4].GetTensorData<float>() + (size_t)FEAT_HW*FEAT_HW*BACKBONE_DIM);
+
+                // Decodes a raw 519-dim regression output (p2/p2_cam) into 70 3D
+                // keypoints + their crop-normalised 2D/depth projections, for the
+                // keypoint_token_update step — mirrors the FINAL pass-2 decode+LBS+
+                // projection block below exactly (build_model_params/apply_hand_pose/
+                // scale PCA/mhr_lbs_compute/kp_mapping/camera formula), just run
+                // mid-loop instead of once at the end.
+                auto decode_intermediate = [&](const float* praw, const float* pcam,
+                                                std::vector<float>& kp2d_cropped_out,
+                                                std::vector<float>& kp2d_depth_out,
+                                                std::vector<float>& kp3d_out)
+                {
+                    float g_rot[3]; rot6d_to_euler(praw, g_rot);
+                    std::array<float,133> b_euler{};
+                    compact_cont_to_body_params(praw + 6, b_euler.data());
+                    ModelParams204 mpi = build_model_params(g_rot, b_euler.data(), nullptr, true);
+                    apply_hand_pose(mpi.data, praw + 339,
+                                     lbs_data->hand_pose_mean, lbs_data->hand_pose_comps,
+                                     lbs_data->hand_joint_idxs_left, lbs_data->hand_joint_idxs_right);
+                    if (lbs_data->scale_mean && lbs_data->scale_comps)
+                    {
+                        int ns = lbs_data->n_scale_out, npc = lbs_data->n_scale_pc;
+                        for (int j = 0; j < ns; ++j) mpi.data[136+j] = lbs_data->scale_mean[j];
+                        for (int k = 0; k < npc; ++k)
+                            for (int j = 0; j < ns; ++j)
+                                mpi.data[136+j] += praw[311+k] * lbs_data->scale_comps[k*ns+j];
+                    }
+                    std::vector<float> iv((size_t)lbs_data->n_verts*3), ij((size_t)lbs_data->n_joints*3);
+                    if (!mhr_lbs_compute(lbs_data, mpi.data, praw + 266, zero_face72,
+                                          iv.data(), ij.data(), nullptr))
+                        return false;
+                    kp3d_out.assign(70*3, 0.f);
+                    for (const auto& e : kp_mapping)
+                        for (int c = 0; c < 3; ++c)
+                        {
+                            float src = (e.col < 18439) ? iv[e.col*3+c] : ij[(e.col-18439)*3+c];
+                            kp3d_out[e.row*3+c] += src * e.val;
+                        }
+                    float s_val = -pcam[0], t_x = pcam[1], t_y = -pcam[2];
+                    float bw = r.bbox[2]-r.bbox[0], bh = r.bbox[3]-r.bbox[1];
+                    float bbox_cx = (r.bbox[0]+r.bbox[2])*0.5f, bbox_cy = (r.bbox[1]+r.bbox[3])*0.5f;
+                    float bs = fixed_aspect_bbox_size(bw,bh)*s_val + 1e-8f;
+                    float cam_t[3] = { t_x + 2.f*(bbox_cx-cx)/bs, t_y + 2.f*(bbox_cy-cy)/bs, 2.f*fx/bs };
+                    kp2d_cropped_out.assign(70*2, 0.f);
+                    kp2d_depth_out.assign(70, 0.f);
+                    for (int k = 0; k < 70; ++k)
+                    {
+                        float dz = kp3d_out[k*3+2] + cam_t[2];
+                        float dx = kp3d_out[k*3+0] + cam_t[0];
+                        float dy = kp3d_out[k*3+1] + cam_t[1];
+                        if (dz < 1e-4f) dz = 1e-4f;
+                        float full_x = dx/dz*fx + cx, full_y = dy/dz*fy + cy;
+                        kp2d_cropped_out[k*2+0] = (full_x - crop_cx_v[i]) / crop_sz_v[i];
+                        kp2d_cropped_out[k*2+1] = (full_y - crop_cy_v[i]) / crop_sz_v[i];
+                        kp2d_depth_out[k] = dz;
+                    }
+                    return true;
+                };
+
+                for (int layer_idx = 0; layer_idx < 6; ++layer_idx)
+                {
+                    std::vector<int64_t> tok_sh{1, P2_N_TOK, 1024}, img_sh{1, FEAT_HW*FEAT_HW, BACKBONE_DIM};
+                    Ort::Value t_tok = Ort::Value::CreateTensor<float>(mi, token.data(), token.size(), tok_sh.data(), 3);
+                    Ort::Value t_img = Ort::Value::CreateTensor<float>(mi, feat_flat.data(), feat_flat.size(), img_sh.data(), 3);
+                    Ort::Value t_aug = Ort::Value::CreateTensor<float>(mi, tok_aug.data(), tok_aug.size(), tok_sh.data(), 3);
+                    Ort::Value t_iag = Ort::Value::CreateTensor<float>(mi, img_aug_flat.data(), img_aug_flat.size(), img_sh.data(), 3);
+                    std::vector<Ort::Value> lin; lin.push_back(std::move(t_tok)); lin.push_back(std::move(t_img));
+                    lin.push_back(std::move(t_aug)); lin.push_back(std::move(t_iag));
+                    auto& ls = sess_decoder_prompted_layers[layer_idx];
+                    auto lout = ls.session->Run(Ort::RunOptions{nullptr}, ls.input_names.data(), lin.data(), lin.size(),
+                                                 ls.output_names.data(), 2);
+                    token.assign(lout[0].GetTensorData<float>(), lout[0].GetTensorData<float>() + token.size());
+
+                    std::vector<int64_t> pt_sh{1, P2_N_TOK, 1024};
+                    Ort::Value nf_in = Ort::Value::CreateTensor<float>(mi, token.data(), token.size(), pt_sh.data(), 3);
+                    std::vector<Ort::Value> nfin; nfin.push_back(std::move(nf_in));
+                    auto nfout = sess_decoder_prompted_normfinal.session->Run(
+                                     Ort::RunOptions{nullptr}, sess_decoder_prompted_normfinal.input_names.data(),
+                                     nfin.data(), nfin.size(), sess_decoder_prompted_normfinal.output_names.data(), 1);
+                    const float* pose_token = nfout[0].GetTensorData<float>();
+
+                    if (layer_idx == 5) break;  // last layer: no update, drop straight to final regress below
+
+                    std::vector<float> l_mhr = cffn_run(mhr_ffn, pose_token, 1);
+                    std::vector<float> l_cam = cffn_run(cam_ffn, pose_token, 1);
+                    std::vector<float> kp2d_c, kp2d_d, kp3d;
+                    if (!decode_intermediate(l_mhr.data(), l_cam.data(), kp2d_c, kp2d_d, kp3d))
+                        break;
+
+                    std::vector<int64_t> chw_sh{1, BACKBONE_DIM, FEAT_HW, FEAT_HW};
+                    std::vector<int64_t> k2_sh{1, 70, 2}, kd_sh{1, 70}, k3_sh{1, 70, 3};
+                    Ort::Value u_tok = Ort::Value::CreateTensor<float>(mi, token.data(), token.size(), tok_sh.data(), 3);
+                    Ort::Value u_aug = Ort::Value::CreateTensor<float>(mi, tok_aug.data(), tok_aug.size(), tok_sh.data(), 3);
+                    Ort::Value u_chw = Ort::Value::CreateTensor<float>(mi, feat_chw.data(), feat_chw.size(), chw_sh.data(), 4);
+                    Ort::Value u_k2  = Ort::Value::CreateTensor<float>(mi, kp2d_c.data(), kp2d_c.size(), k2_sh.data(), 3);
+                    Ort::Value u_kd  = Ort::Value::CreateTensor<float>(mi, kp2d_d.data(), kp2d_d.size(), kd_sh.data(), 2);
+                    Ort::Value u_k3  = Ort::Value::CreateTensor<float>(mi, kp3d.data(), kp3d.size(), k3_sh.data(), 3);
+                    std::vector<Ort::Value> uin;
+                    uin.push_back(std::move(u_tok)); uin.push_back(std::move(u_aug)); uin.push_back(std::move(u_chw));
+                    uin.push_back(std::move(u_k2));  uin.push_back(std::move(u_kd));  uin.push_back(std::move(u_k3));
+                    auto uout = sess_decoder_prompted_update.session->Run(
+                                    Ort::RunOptions{nullptr}, sess_decoder_prompted_update.input_names.data(),
+                                    uin.data(), uin.size(), sess_decoder_prompted_update.output_names.data(), 2);
+                    token.assign(uout[0].GetTensorData<float>(), uout[0].GetTensorData<float>() + token.size());
+                    tok_aug.assign(uout[1].GetTensorData<float>(), uout[1].GetTensorData<float>() + tok_aug.size());
+                }
+
+                std::vector<int64_t> pt_sh_final{1, P2_N_TOK, 1024};
+                Ort::Value nf_in_final = Ort::Value::CreateTensor<float>(mi, token.data(), token.size(), pt_sh_final.data(), 3);
+                std::vector<Ort::Value> nfin_final; nfin_final.push_back(std::move(nf_in_final));
+                auto nfout_final = sess_decoder_prompted_normfinal.session->Run(
+                                       Ort::RunOptions{nullptr}, sess_decoder_prompted_normfinal.input_names.data(),
+                                       nfin_final.data(), nfin_final.size(), sess_decoder_prompted_normfinal.output_names.data(), 1);
+                const float* p2_token = nfout_final[0].GetTensorData<float>();
 
                 std::vector<float> p2_mhr = cffn_run(mhr_ffn, p2_token, 1);
                 std::vector<float> p2_cam = cffn_run(cam_ffn, p2_token, 1);
@@ -1803,6 +2148,27 @@ struct Pipeline::Impl
                        r.pred_cam_t[0], r.pred_cam_t[1], r.pred_cam_t[2],
                        p2_cam[0], p2_cam[1], p2_cam[2]);
                 r.global_rot = { p2_global_rot_euler[2], p2_global_rot_euler[1], p2_global_rot_euler[0] };
+                // DIAGNOSTIC: override global_rot with an externally-supplied ground
+                // truth (e.g. Python's real [rz,ry,rx]) to isolate whether OUR root
+                // rotation (not just the OpenGL camera matrices, already proven fine)
+                // is a source of the visible whole-body misalignment.
+                if (const char* gpath = getenv("FSB_GLOBAL_ROT_OVERRIDE")) {
+                    FILE* fp = fopen(gpath, "r");
+                    if (fp) {
+                        float rz, ry, rx;
+                        if (fscanf(fp, "%f %f %f", &rz, &ry, &rx) == 3) {
+                            r.global_rot = {rz, ry, rx};
+                            // p2_global_rot_euler is [rx,ry,rz] (rot6d_to_euler's own
+                            // convention) and is what build_model_params() actually
+                            // consumes below -- must override THIS, not just r.global_rot.
+                            p2_global_rot_euler[0] = rx;
+                            p2_global_rot_euler[1] = ry;
+                            p2_global_rot_euler[2] = rz;
+                            fprintf(stderr, "[DIAG] override global_rot rz=%.4f ry=%.4f rx=%.4f\n", rz, ry, rx);
+                        }
+                        fclose(fp);
+                    }
+                }
                 std::array<float,133> p2_body_euler{};
                 compact_cont_to_body_params(p2 + 6, p2_body_euler.data());
                 if (const char* dump_path = getenv("FSB_DUMP_P2_BODY_EULER"))
@@ -1927,6 +2293,15 @@ struct Pipeline::Impl
                             mp_final.data[136+j] += r.scale[k] * lbs_data->scale_comps[k*ns+j];
                 }
                 std::memcpy(r.mhr_model_params.data(), mp_final.data, 204*sizeof(float));
+                if (const char* dump_path = getenv("FSB_DUMP_MHR_MODEL_PARAMS"))
+                {
+                    FILE* fp = fopen(dump_path, "w");
+                    if (fp)
+                    {
+                        for (float v : r.mhr_model_params) fprintf(fp, "%.8f\n", v);
+                        fclose(fp);
+                    }
+                }
 
                 if (!r.pred_vertices.empty())
                 {
