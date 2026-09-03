@@ -2203,9 +2203,12 @@ struct Pipeline::Impl
                     // hand/scale not needed for FK (arms only), zero_face/zero-shape are fine —
                     // only joint rotations are used, not vertices.
                     std::vector<float> zshape((size_t)lbs_data->n_shape_pc, 0.f);
+                    // DIAGNOSTIC: test whether using the REAL (non-zero) shape changes the
+                    // FK's joint rotations -- see POSEREFINE.md wrist-IK bug hunt.
+                    const float* shape_for_q2 = getenv("FSB_Q2_REAL_SHAPE") ? r.shape.data() : zshape.data();
                     std::vector<float> v2((size_t)lbs_data->n_verts*3), j2((size_t)lbs_data->n_joints*3),
                                        q2((size_t)lbs_data->n_joints*4);
-                    if (mhr_lbs_compute(lbs_data, mp2.data, zshape.data(), zero_face72,
+                    if (mhr_lbs_compute(lbs_data, mp2.data, shape_for_q2, zero_face72,
                                         v2.data(), j2.data(), q2.data()))
                     {
                         for (int lr = 0; lr < 2; ++lr)   // 0=right, 1=left
@@ -2221,6 +2224,17 @@ struct Pipeline::Impl
                             float zero_rot_R[9]; mat3_mul(lowarm_R, pre_R, zero_rot_R);
 
                             float pred_global_R[9]; quat_to_mat3(hfk[h].wrist_quat.data(), pred_global_R);
+
+                            printf("[FSB]   zerorotdbg lr=%d lowarm_j=%d wristtwist_j=%d\n"
+                                   "     lowarm_R=[%.4f %.4f %.4f / %.4f %.4f %.4f / %.4f %.4f %.4f]\n"
+                                   "     pre_R=   [%.4f %.4f %.4f / %.4f %.4f %.4f / %.4f %.4f %.4f]\n"
+                                   "     zero_rot_R=[%.4f %.4f %.4f / %.4f %.4f %.4f / %.4f %.4f %.4f]\n"
+                                   "     pred_global_R=[%.4f %.4f %.4f / %.4f %.4f %.4f / %.4f %.4f %.4f]\n",
+                                   lr, lowarm_j, wristtwist_j,
+                                   lowarm_R[0],lowarm_R[1],lowarm_R[2],lowarm_R[3],lowarm_R[4],lowarm_R[5],lowarm_R[6],lowarm_R[7],lowarm_R[8],
+                                   pre_R[0],pre_R[1],pre_R[2],pre_R[3],pre_R[4],pre_R[5],pre_R[6],pre_R[7],pre_R[8],
+                                   zero_rot_R[0],zero_rot_R[1],zero_rot_R[2],zero_rot_R[3],zero_rot_R[4],zero_rot_R[5],zero_rot_R[6],zero_rot_R[7],zero_rot_R[8],
+                                   pred_global_R[0],pred_global_R[1],pred_global_R[2],pred_global_R[3],pred_global_R[4],pred_global_R[5],pred_global_R[6],pred_global_R[7],pred_global_R[8]);
 
                             // fused_local = zero_rot^T @ pred_global  (see PLAN.md derivation)
                             float zero_rot_T[9]; mat3_transpose(zero_rot_R, zero_rot_T);
@@ -2242,6 +2256,8 @@ struct Pipeline::Impl
                             float wx, wz, wy;
                             rotmat_to_euler_xzy(fused_R, &wx, &wz, &wy);
                             fix_wrist_euler(wx, wz, wy);
+                            printf("[FSB]   splicedwristdbg lr=%d(%s) wx=%.4f wz=%.4f wy=%.4f\n",
+                                   lr, lr==0?"right":"left", wx, wz, wy);
 
                             // body_pose indices: right=[41,43,42], left=[31,33,32]
                             // DIAGNOSTIC: temporarily skipped via env var to isolate whether
