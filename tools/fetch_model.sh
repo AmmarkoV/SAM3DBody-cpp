@@ -7,10 +7,14 @@
 # needs.  The profiles mirror the swaps resolve_backbone_defaults()
 # (src/cli_common.h) performs at startup:
 #
-#   shared  always needed                                      ~151 MB
-#   cuda    bf16 backbone + bf16 decoder (ORT CUDA EP)        ~5.1 GB
-#   cpu     fp32 backbone + fp16 decoder (CPU EP has no bf16) ~3.5 GB
-#   trt     fp16 TRT backbone + fp16 decoder (TensorRT EP)    ~1.8 GB
+#   shared   always needed                                      ~151 MB
+#   cuda     bf16 backbone + bf16 decoder (ORT CUDA EP)        ~5.1 GB
+#   cpu      fp32 backbone + fp16 decoder (CPU EP has no bf16) ~3.5 GB
+#   trt      fp16 TRT backbone + fp16 decoder (TensorRT EP)    ~1.8 GB
+#   refined  extra files for --refined-pose (see PLAN.md,
+#            issue #15 "refined pose" plan) — opt-in, not part
+#            of 'all'; combine with a base profile, e.g.
+#            'tools/fetch_model.sh cuda refined'              ~373 MB
 #
 # Called by hand, from scripts/setup.sh, and lazily at runtime by
 # ensure_models() when a binary starts up with models missing.
@@ -18,8 +22,10 @@
 # Usage:
 #   tools/fetch_model.sh [PROFILE...] [options]
 #
-#   PROFILE    one or more of: shared cpu cuda trt all   (default: shared cuda)
-#              'shared' is implied by every other profile.
+#   PROFILE    one or more of: shared cpu cuda trt refined all
+#              (default: shared cuda). 'shared' is implied by every
+#              other profile. 'all' does NOT include 'refined' — it
+#              stays opt-in since most users don't need it.
 #
 # Options:
 #   --onnx-dir DIR   destination (default: <repo>/onnx)
@@ -74,6 +80,15 @@ MANIFEST=(
   "trt|backbone_fp16_trt.onnx.data|1683328000|246b48f6febc86fe32d9c15410dd1a284cf3975f17d444b51acb4bd2ae94f3e7"
   "trt|decoder_fp16.onnx|275064|c37e6b7c7328c89d69e67900d734a98ec600ff66c5f0757a434a127b646bf167"
   "trt|decoder_fp16.onnx.data|97099804|ceee2cc6313dac633858b4580f072b431d196efcdd6e3edf1e795bbe9eab9418"
+
+  # --refined-pose (see PLAN.md, issue #15 "refined pose" plan). Opt-in —
+  # not part of 'all'. pipeline.gguf's own entry above is untouched by
+  # this: the hand-decoder heads live in a SEPARATE pipeline_refined.gguf
+  # specifically so that entry never has to change for non-refined users.
+  "refined|decoder_hand.onnx|97360225|62dd39a0b0f1a81e0b33044f8efa82c68d23cdc09f31e24ce1d395d6e3949a1c"
+  "refined|decoder_handbox_fp32.onnx|184047928|9d661bf9885580c3c71dcc9dcbe89ec96dfc47f0796289c0d92bd4caa47494c7"
+  "refined|decoder_prompted.onnx|92124099|0a8059084a3f849d1b96915bc8116dcc1b1ce43a3d11ccf8a8c1d6492f2a4597"
+  "refined|pipeline_refined.gguf|14764576|88ec6f7bdbf8519f5016c87cbb9c72b4db50e0ea2d71f298593f00a8999b9951"
 )
 
 # Print the header comment block (everything after the shebang up to the first
@@ -85,7 +100,7 @@ usage() {
 # ── Args ────────────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        shared|cpu|cuda|trt|all) PROFILES+=("$1"); shift ;;
+        shared|cpu|cuda|trt|refined|all) PROFILES+=("$1"); shift ;;
         --onnx-dir) ONNX_DIR="$2"; shift 2 ;;
         --revision) HF_REVISION="$2"; shift 2 ;;
         --list)     LIST_ONLY=1; shift ;;

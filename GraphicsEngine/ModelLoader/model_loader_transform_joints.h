@@ -84,6 +84,15 @@ void mhr_lbs_free(struct MHR_LBS_Data *d);
  *   face_coeffs   [n_face_pc]  from MHRResult.face_params
  *   out_verts     [n_verts*3]  caller-allocated output (float[18439*3])
  *   out_joints    [n_joints*3] caller-allocated output (float[127*3]), may be NULL
+ *   out_joint_quats [n_joints*4] caller-allocated output (float[127*4], XYZW),
+ *                 may be NULL. Global joint ROTATION (g_q from the FK step),
+ *                 in the model's own unflipped frame — matches Python
+ *                 mhr_forward(..., return_joint_rotations=True)'s
+ *                 joint_global_rots directly (no Y/Z flip applied, unlike
+ *                 out_joints/out_verts). Needed for the refined-pose wrist-IK
+ *                 fusion (see PLAN.md, issue #15) — the position-only output
+ *                 doesn't carry enough information to solve for a joint's
+ *                 local rotation given a desired global rotation.
  * Applies pose correctives from d if mhr_correctives_load() was called.
  * Returns 1 on success, 0 on failure. */
 int mhr_lbs_compute(const struct MHR_LBS_Data *d,
@@ -91,7 +100,8 @@ int mhr_lbs_compute(const struct MHR_LBS_Data *d,
                     const float *shape_coeffs,
                     const float *face_coeffs,
                     float       *out_verts,
-                    float       *out_joints);
+                    float       *out_joints,
+                    float       *out_joint_quats);
 
 /* ── TRI bone transforms ────────────────────────────────────────────────────── */
 

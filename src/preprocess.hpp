@@ -19,6 +19,13 @@ static constexpr int   PATCH_SIZE       = 16;
 // BBoxScale padding factor – matches Python transforms BBoxScale(padding=1.25).
 // The crop is expanded by this factor, and condition_info[2] = (bbox_size*1.25) / focal.
 static constexpr float BBOX_SCALE_FACTOR = 1.25f;
+// Hand-crop padding factor — matches SAM3DBodyEstimator.transform_hand's
+// GetBBoxCenterScale(padding=0.9) (sam_3d_body_estimator.py __init__),
+// DIFFERENT from the body crop's 1.25. Both then go through the same
+// TopdownAffine aspect-ratio fix (fixed_aspect_bbox_size). See PLAN.md,
+// issue #15 "refined pose" plan — this was a real bug (hand crops were
+// getting the body's 1.25 factor, inflating them ~1.4x too large).
+static constexpr float HAND_BBOX_SCALE_FACTOR = 0.9f;
 // "Human prior" aspect ratio (w/h) used by Python's TopdownAffine before it
 // reshapes the crop to the model's square input — see fixed_aspect_bbox_size().
 static constexpr float PRIOR_ASPECT_RATIO = 0.75f;
@@ -36,10 +43,10 @@ static constexpr float PRIOR_ASPECT_RATIO = 0.75f;
 // (e.g. a bbox padded out by flowing clothing) it pads noticeably more —
 // omitting this step under-crops the network's input and distorts the
 // regressed body proportions (see SAM3DBody-cpp issue #15).
-inline float fixed_aspect_bbox_size(float bw, float bh)
+inline float fixed_aspect_bbox_size(float bw, float bh, float scale_factor = BBOX_SCALE_FACTOR)
 {
-    float w0 = bw * BBOX_SCALE_FACTOR;
-    float h0 = bh * BBOX_SCALE_FACTOR;
+    float w0 = bw * scale_factor;
+    float h0 = bh * scale_factor;
 
     float w1, h1;
     if (w0 > h0 * PRIOR_ASPECT_RATIO) { w1 = w0; h1 = w0 / PRIOR_ASPECT_RATIO; }
@@ -65,7 +72,12 @@ inline void crop_and_normalise(
     float  bbox_x2, float bbox_y2,
     float* out_chw,                  // [3, CROP_SIZE, CROP_SIZE]
     float& crop_cx, float& crop_cy,  // outputs: crop centre
-    float& crop_size_out             // output: square side in source pixels
+    float& crop_size_out,            // output: square side in source pixels
+    // Python's GetBBoxCenterScale padding factor: 1.25 for the body crop
+    // (self.transform), 0.9 for hand crops (self.transform_hand) — see
+    // SAM3DBodyEstimator.__init__ in sam_3d_body_estimator.py. Both then go
+    // through the SAME TopdownAffine aspect-ratio fix (fixed_aspect_bbox_size).
+    float scale_factor = BBOX_SCALE_FACTOR
 )
 {
     const int img_w = bgr.cols;
@@ -76,7 +88,7 @@ inline void crop_and_normalise(
     float cy   = (bbox_y1 + bbox_y2) * 0.5f;
     float bw   = bbox_x2 - bbox_x1;
     float bh   = bbox_y2 - bbox_y1;
-    float side = fixed_aspect_bbox_size(bw, bh);
+    float side = fixed_aspect_bbox_size(bw, bh, scale_factor);
 
     crop_cx      = cx;
     crop_cy      = cy;
@@ -384,6 +396,100 @@ static inline void rot6d_to_euler(const float* d6, float* euler) {
     euler[0] = std::atan2(e12, e22);  // rx = atan2(R[2,1], R[2,2])
     euler[1] = std::asin(std::max(-1.f, std::min(1.f, -e02)));  // ry = asin(-R[2,0])
     euler[2] = std::atan2(e01, e00);  // rz = atan2(R[1,0], R[0,0])
+}
+
+// ─── Small rotation-matrix helpers for the wrist-IK fusion (refined pose) ────
+// (see PLAN.md, issue #15 "refined pose" plan). Ports the pieces of
+// sam3d_body.py's run_inference "Doing IK" block that need real 3x3 rotation
+// matrices, not the Euler-angle-only path the rest of this file uses.
+
+// XYZW quaternion → row-major 3x3 rotation matrix.
+inline void quat_to_mat3(const float q[4], float R[9])
+{
+    float x=q[0], y=q[1], z=q[2], w=q[3];
+    float x2=x+x, y2=y+y, z2=z+z;
+    float xx=x*x2, xy=x*y2, xz=x*z2;
+    float yy=y*y2, yz=y*z2, zz=z*z2;
+    float wx=w*x2, wy=w*y2, wz=w*z2;
+    R[0]=1.f-(yy+zz); R[1]=xy-wz;      R[2]=xz+wy;
+    R[3]=xy+wz;       R[4]=1.f-(xx+zz);R[5]=yz-wx;
+    R[6]=xz-wy;       R[7]=yz+wx;      R[8]=1.f-(xx+yy);
+}
+
+// C = A @ B, all row-major 3x3.
+inline void mat3_mul(const float A[9], const float B[9], float C[9])
+{
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+        {
+            float s = 0.f;
+            for (int k = 0; k < 3; ++k) s += A[r*3+k]*B[k*3+c];
+            C[r*3+c] = s;
+        }
+}
+
+inline void mat3_transpose(const float A[9], float At[9])
+{
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+            At[c*3+r] = A[r*3+c];
+}
+
+// Geodesic angle between two rotation matrices (radians). Mirrors Python's
+// rotation_angle_difference: angle = acos((trace(A@B^T) - 1) / 2).
+inline float mat3_angle_diff(const float A[9], const float B[9])
+{
+    float Bt[9]; mat3_transpose(B, Bt);
+    float R[9];  mat3_mul(A, Bt, R);
+    float tr = R[0] + R[4] + R[8];
+    float c  = std::max(-1.f, std::min(1.f, (tr - 1.f) * 0.5f));
+    return std::acos(c);
+}
+
+// R = Rx(a) @ Rz(b) @ Ry(c)  →  (a,b,c), matching roma.rotmat_to_euler("XZY", …)
+// (derived by hand from the same composition roma.euler_to_rotmat("XZY", …)
+// uses — see PLAN.md for the derivation).
+inline void rotmat_to_euler_xzy(const float R[9], float* a, float* b, float* c)
+{
+    // R[0]=R00 R[1]=R01 R[2]=R02 / R[3]=R10 R[4]=R11 R[5]=R12 / R[6]=R20 R[7]=R21 R[8]=R22
+    *a = std::atan2(R[7], R[4]);                                   // atan2(R21, R11)
+    *b = std::asin(std::max(-1.f, std::min(1.f, -R[1])));          // asin(-R01)
+    *c = std::atan2(R[2], R[0]);                                   // atan2(R02, R00)
+}
+
+// Rx(a) @ Rz(b) @ Ry(c) → row-major 3x3. (Inverse of rotmat_to_euler_xzy.)
+inline void euler_xzy_to_mat3(float a, float b, float c, float R[9])
+{
+    float ca=std::cos(a), sa=std::sin(a);
+    float cb=std::cos(b), sb=std::sin(b);
+    float cc=std::cos(c), sc=std::sin(c);
+    R[0]=cb*cc;                R[1]=-sb;    R[2]=cb*sc;
+    R[3]=ca*sb*cc+sa*sc;       R[4]=ca*cb;  R[5]=ca*sb*sc-sa*cc;
+    R[6]=sa*sb*cc-ca*sc;       R[7]=sa*cb;  R[8]=sa*sb*sc+ca*cc;
+}
+
+// Mirrors Python's fix_wrist_euler: try the "flipped" angle set (±pi on each
+// axis, z additionally sign-flipped) and keep whichever set violates the
+// joint limits less.
+inline void fix_wrist_euler(float& x, float& z, float& y,
+                            float lim_x0=-2.2f, float lim_x1=1.0f,
+                            float lim_z0=-2.2f, float lim_z1=1.5f,
+                            float lim_y0=-1.2f, float lim_y1=1.5f)
+{
+    constexpr float PI_F = 3.14159265358979323846f;
+    auto wrap = [](float v){ return std::atan2(std::sin(v), std::cos(v)); };
+    float x_alt =  wrap(x + PI_F);
+    float z_alt =  wrap(-(z + PI_F));
+    float y_alt =  wrap(y + PI_F);
+
+    auto violation = [](float v, float lo, float hi){
+        float below = std::max(0.f, lo - v);
+        float above = std::max(0.f, v - hi);
+        return below*below + above*above;
+    };
+    float v_orig = violation(x,lim_x0,lim_x1) + violation(z,lim_z0,lim_z1) + violation(y,lim_y0,lim_y1);
+    float v_alt  = violation(x_alt,lim_x0,lim_x1) + violation(z_alt,lim_z0,lim_z1) + violation(y_alt,lim_y0,lim_y1);
+    if (v_alt < v_orig) { x = x_alt; z = z_alt; y = y_alt; }
 }
 
 // 3-DOF joint index layout in the 133-param vector

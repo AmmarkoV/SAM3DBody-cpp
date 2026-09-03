@@ -75,6 +75,13 @@ struct MHRResult {
     // Raw camera head FFN output [s, tx, ty] before the nonlinear
     // s/tx/ty → world-space pred_cam_t conversion.
     std::array<float, 3> pred_cam_raw{};
+
+    // ── Refined-pose diagnostics (populated only when PipelineConfig::refined_pose
+    // is set; see PLAN.md). Hand-box regression from the pass-1 decoder tokens —
+    // [left, right] × [cx, cy, w, h], normalised to the 512x512 crop [0,1].
+    bool  has_hand_box = false;
+    std::array<float, 8> hand_box{};       // [2][4]: left, right
+    std::array<float, 4> hand_box_cls{};   // [2][2] softmax-able logits
 };
 
 // ─── Pipeline configuration ───────────────────────────────────────────────────
@@ -83,7 +90,15 @@ struct PipelineConfig {
     std::string onnx_dir;           // Directory with backbone.onnx, decoder.onnx, body_model.onnx
     std::string backbone_name = "backbone.onnx"; // filename within onnx_dir; override for quantized variant
     std::string decoder_name  = "decoder.onnx";  // filename within onnx_dir; resolver swaps in decoder_fp16.onnx under --trt
-    std::string gguf_path;          // Path to pipeline.gguf
+    std::string gguf_path;          // Path to pipeline.gguf (mhr_proj/cam_proj — always loaded)
+    // Path to pipeline_refined.gguf (mhr_proj_hand/cam_proj_hand — only loaded
+    // when refined_pose is set). Empty = derive from gguf_path by inserting
+    // "_refined" before ".gguf" (e.g. "onnx/pipeline.gguf" ->
+    // "onnx/pipeline_refined.gguf"). Kept as a SEPARATE file/manifest entry
+    // from pipeline.gguf on purpose — see PLAN.md, issue #15 "refined pose"
+    // plan — so pipeline.gguf's HuggingFace manifest entry (size/hash) never
+    // has to change for users who don't use --refined-pose.
+    std::string gguf_refined_path;
     std::string yolo_path;          // YOLO model: .onnx or .engine (TRT)
 
     // Device
@@ -119,6 +134,16 @@ struct PipelineConfig {
 
     // Debug / diagnostic flags
     bool zero_face_params = true;   // Force face expression coefficients to 0 (default on; pass --dev-face to enable)
+
+    // ── Refined pose (see PLAN.md, issue #15 "refined pose" plan) ────────────
+    // Off by default: the extra decoder + hand-crop passes cost real fps for
+    // a fix that mainly affects hand/wrist articulation. When on, loads three
+    // extra ONNX graphs (decoder_handbox_fp32.onnx, decoder_hand.onnx,
+    // decoder_prompted.onnx) and the pipeline.gguf hand FFN heads.
+    bool refined_pose = false;
+    std::string decoder_handbox_name = "decoder_handbox_fp32.onnx";
+    std::string decoder_hand_name    = "decoder_hand.onnx";
+    std::string decoder_prompted_name= "decoder_prompted.onnx";
 };
 
 // ─── Pipeline class ───────────────────────────────────────────────────────────

@@ -597,6 +597,7 @@ int main(int argc, const char** argv) {
     bool use_trt      = false;
     bool fp16         = true;
     bool zero_face    = true;
+    bool refined_pose = false;  // --refined-pose: see PLAN.md
     std::string boxes_path;  // --boxes: external person boxes, one "x1 y1 x2 y2" per line
     float  focal_x    = 0.f; // --fx: camera focal x in pixels (0 = pipeline default)
     float  focal_y    = 0.f; // --fy: camera focal y in pixels (0 = pipeline default)
@@ -655,6 +656,7 @@ int main(int argc, const char** argv) {
             { cap_fps = std::stod(argv[++i]); continue; }
         if (!strcmp(argv[i], "--mjpg")) { use_mjpg = true; continue; }
         if (!strcmp(argv[i], "--dev-face"))    { zero_face      = false; continue; }
+        if (!strcmp(argv[i], "--refined-pose")){ refined_pose   = true;  continue; }
         if (!strcmp(argv[i], "--butterworth"))              { use_butterworth  = true; continue; }
         if (!strcmp(argv[i], "--butterworth-root-rotation")){ filter_root_rot  = true; continue; }
         if (!strcmp(argv[i], "--headless"))                 { headless = true; continue; }
@@ -733,7 +735,14 @@ int main(int argc, const char** argv) {
             printf("[boxes] loaded %zu external person boxes from %s\n",
                    cfg.external_boxes.size(), boxes_path.c_str());
         }
-        cfg.skip_body_model = true;    // LBS runs natively in C; skip body_model.onnx
+        // LBS runs natively in C (this binary loads its own copy below for the
+        // GL mesh); skip body_model.onnx. Exception: refined_pose needs the
+        // Pipeline's OWN lbs_data/kp_mapping internally for the wrist-IK
+        // fusion's FK + keypoint-projection steps (see PLAN.md) — a second,
+        // redundant load, but LBS load/compute is cheap and this keeps the
+        // Pipeline self-contained rather than threading render's copy in.
+        cfg.skip_body_model = !refined_pose;
+        cfg.refined_pose    = refined_pose;
         if (!pipeline.load(cfg)) {
             fprintf(stderr, "Failed to load pipeline\n"); return 1;
         }
@@ -1151,7 +1160,8 @@ int main(int argc, const char** argv) {
                             r.shape.data(),
                             zero_face ? zero_face_buf : r.face_params.data(),
                             lbs_out.data(),
-                            lbs_joints.data());
+                            lbs_joints.data(),
+                            nullptr);
             mhr_update_mesh_vertices(tri_model, lbs_out.data());
 
             // Export the deformed mesh (Blender-importable) for offline checking

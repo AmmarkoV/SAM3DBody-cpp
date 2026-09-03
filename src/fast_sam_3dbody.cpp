@@ -369,6 +369,12 @@ struct Pipeline::Impl
     // CPU FFNs for MHR + camera heads (weights loaded from GGUF)
     CFFN mhr_ffn, cam_ffn;
 
+    // ── Refined pose (see PLAN.md) — only loaded when cfg.refined_pose ───────
+    OrtSession sess_decoder_handbox;   // decoder_handbox_fp32.onnx: pose_token+hand_box+hand_cls
+    OrtSession sess_decoder_hand;      // decoder_hand.onnx: hand-crop decoder pass
+    OrtSession sess_decoder_prompted;  // decoder_prompted.onnx: keypoint-prompted body pass 2
+    CFFN mhr_ffn_hand, cam_ffn_hand;   // gguf mhr_proj_hand / cam_proj_hand
+
     // Keypoint mapping: sparse COO format for 70 MHR keypoints
     // Maps [vertices(18439) + joints(127)] → 70 keypoints
     struct KpEntry
@@ -517,6 +523,34 @@ struct Pipeline::Impl
             }
         }
 
+        // ── Refined pose (see PLAN.md) — extra decoder passes, off by default ──
+        if (cfg.refined_pose)
+        {
+            printf("[FSB] Loading decoder_handbox (fp32) … ");
+            fflush(stdout);
+            // fp32 (not bf16): ORT's CUDA EP has a bf16-specific race condition
+            // on this graph's 2-token hand-box slice+MLP (non-deterministic
+            // garbage on repeat runs of the identical file) — see PLAN.md.
+            if (!sess_decoder_handbox.load(ort_env, opath(cfg.decoder_handbox_name.c_str()),
+                                           cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false))
+                return false;
+            printf("OK\n");
+
+            printf("[FSB] Loading decoder_hand … ");
+            fflush(stdout);
+            if (!sess_decoder_hand.load(ort_env, opath(cfg.decoder_hand_name.c_str()),
+                                        cuda, dev, cfg.use_fp16, cfg.use_trt_ep))
+                return false;
+            printf("OK\n");
+
+            printf("[FSB] Loading decoder_prompted … ");
+            fflush(stdout);
+            if (!sess_decoder_prompted.load(ort_env, opath(cfg.decoder_prompted_name.c_str()),
+                                            cuda, dev, cfg.use_fp16, cfg.use_trt_ep))
+                return false;
+            printf("OK\n");
+        }
+
         // YOLO – optional (might not exist for image-only usage)
         if (!cfg.yolo_path.empty())
         {
@@ -537,6 +571,26 @@ struct Pipeline::Impl
         fflush(stdout);
         if (!load_gguf(cfg.gguf_path)) return false;
         printf("OK\n");
+
+        if (cfg.refined_pose)
+        {
+            std::string refined_path = cfg.gguf_refined_path;
+            if (refined_path.empty())
+            {
+                // Derive "onnx/pipeline.gguf" -> "onnx/pipeline_refined.gguf".
+                const std::string suffix = ".gguf";
+                refined_path = cfg.gguf_path;
+                if (refined_path.size() >= suffix.size() &&
+                    refined_path.compare(refined_path.size()-suffix.size(), suffix.size(), suffix) == 0)
+                    refined_path = refined_path.substr(0, refined_path.size()-suffix.size()) + "_refined.gguf";
+                else
+                    refined_path += "_refined.gguf";
+            }
+            printf("[FSB] Loading %s … ", refined_path.c_str());
+            fflush(stdout);
+            if (!load_gguf_hand(refined_path)) return false;
+            printf("OK\n");
+        }
 
         loaded = true;
         return true;
@@ -586,6 +640,57 @@ struct Pipeline::Impl
         printf("[FSB] FFNs: MHR(%dx%d->%d) Cam(%dx%d->%d)\n",
                mhr_ffn.in_dim, mhr_ffn.hid_dim, mhr_ffn.out_dim,
                cam_ffn.in_dim, cam_ffn.hid_dim, cam_ffn.out_dim);
+        return true;
+    }
+
+    // Loads mhr_proj_hand/cam_proj_hand from a SEPARATE gguf file (see PLAN.md,
+    // issue #15 "refined pose" plan — kept out of pipeline.gguf so its
+    // HuggingFace manifest entry never has to change). Required (unlike the
+    // hand tensors used to be, optionally, inside load_gguf) — only called at
+    // all when cfg.refined_pose is set, in which case they must be present.
+    bool load_gguf_hand(const std::string& path)
+    {
+        gguf_context* gctx = nullptr;
+        ggml_context* tmp_ctx = nullptr;
+        {
+            struct gguf_init_params p
+            {
+                true, &tmp_ctx
+            };
+            gctx = gguf_init_from_file(path.c_str(), p);
+        }
+        if (!gctx)
+        {
+            fprintf(stderr, "[FSB] Cannot open GGUF: %s\n", path.c_str());
+            return false;
+        }
+
+        FILE* fp = std::fopen(path.c_str(), "rb");
+        if (!fp)
+        {
+            gguf_free(gctx);
+            if (tmp_ctx) ggml_free(tmp_ctx);
+            return false;
+        }
+        size_t data_base = gguf_get_data_offset(gctx);
+
+        bool ok = cffn_load(mhr_ffn_hand, gctx, tmp_ctx, fp, data_base, "mhr_proj_hand")
+                  && cffn_load(cam_ffn_hand, gctx, tmp_ctx, fp, data_base, "cam_proj_hand");
+
+        std::fclose(fp);
+        gguf_free(gctx);
+        if (tmp_ctx) ggml_free(tmp_ctx);
+        if (!ok)
+        {
+            fprintf(stderr, "[FSB] --refined-pose requested but %s has no mhr_proj_hand/"
+                            "cam_proj_hand tensors (re-export with --refined — see PLAN.md)\n",
+                    path.c_str());
+            return false;
+        }
+
+        printf("[FSB] Hand FFNs: MHR(%dx%d->%d) Cam(%dx%d->%d)\n",
+               mhr_ffn_hand.in_dim, mhr_ffn_hand.hid_dim, mhr_ffn_hand.out_dim,
+               cam_ffn_hand.in_dim, cam_ffn_hand.hid_dim, cam_ffn_hand.out_dim);
         return true;
     }
 
@@ -860,6 +965,189 @@ struct Pipeline::Impl
         timers.mhr_ffn += dt_ffn;
         printf("[FSB] MHR FFN:    %.1f ms\n", dt_ffn);
 
+        // ── Refined pose: hand-box regression + hand-crop decoder passes ───────
+        // (see PLAN.md, issue #15 "refined pose" plan). Off by default; adds a
+        // second decoder pass (fp32, hand-box regression) plus up to 2×B more
+        // decoder_hand.onnx forward passes (one per visible hand per person).
+        // The validity gate / pass-2 keypoint-prompted decoder / wrist-IK
+        // fusion that turn this into a corrected final body_pose run further
+        // below, after the per-person results (incl. keypoints_2d) exist.
+        std::vector<std::array<float,8>> hand_box_out(B);
+        std::vector<std::array<float,4>> hand_cls_out(B);
+        for (auto& a : hand_box_out) a.fill(0.f);
+        for (auto& a : hand_cls_out) a.fill(0.f);
+        // Hoisted to function scope: used again after the results-assembly loop
+        // below (gate / pass-2 keypoint prompt / wrist-IK / splice).
+        struct HandCropRef {
+            int person; bool is_left;
+            float orig_cx, orig_cy, orig_sz;   // hand crop geometry, original-image space
+        };
+        std::vector<HandCropRef> hand_refs;
+        std::vector<float> hand_mhr_raw, hand_cam_raw;
+        if (cfg.refined_pose && sess_decoder_handbox.session)
+        {
+            t0 = Clock::now();
+            Ort::Value hb_feat_t = Ort::Value::CreateTensor<float>(
+                                       mi, features.data(), features.size(), feat_shape.data(), 4);
+            Ort::Value hb_cond_t = Ort::Value::CreateTensor<float>(
+                                       mi, batch_cond.data(), batch_cond.size(), cond_shape.data(), 2);
+            Ort::Value hb_ray_t  = Ort::Value::CreateTensor<float>(
+                                       mi, batch_ray.data(), batch_ray.size(), ray_shape.data(), 4);
+            std::vector<Ort::Value> hb_inputs;
+            hb_inputs.push_back(std::move(hb_feat_t));
+            hb_inputs.push_back(std::move(hb_cond_t));
+            hb_inputs.push_back(std::move(hb_ray_t));
+
+            auto hb_out = sess_decoder_handbox.session->Run(
+                              Ort::RunOptions{nullptr},
+                              sess_decoder_handbox.input_names.data(),  hb_inputs.data(), hb_inputs.size(),
+                              sess_decoder_handbox.output_names.data(), sess_decoder_handbox.output_names.size());
+            // outputs: [pose_token (unused — bf16 decoder's is used instead), hand_box, hand_cls]
+            if (hb_out.size() >= 3)
+            {
+                const float* hb = hb_out[1].GetTensorData<float>();   // [B,2,4]
+                const float* hc = hb_out[2].GetTensorData<float>();   // [B,2,2]
+                for (int i = 0; i < B; ++i)
+                {
+                    std::memcpy(hand_box_out[i].data(), hb + (size_t)i * 8, 8 * sizeof(float));
+                    std::memcpy(hand_cls_out[i].data(), hc + (size_t)i * 4, 4 * sizeof(float));
+                }
+            }
+            printf("[FSB] handbox:    %.1f ms\n", ms(t0));
+
+            // ── Build left/right hand crops from the regressed boxes ───────────
+            // hand_box layout per person: [left_cx,cy,w,h, right_cx,cy,w,h],
+            // normalised to the 512x512 body crop [0,1]. Convert to original-
+            // image pixel center/size via the same affine used by compute_ray_cond
+            // (crop = scale*(orig-bbox_c) + CROP_SIZE/2), then to a square xyxy box.
+            // Left hand: Python flips the WHOLE source image before cropping so the
+            // network always sees a "right-looking" hand; we instead crop the
+            // unflipped box and flip the resulting tensor — equivalent (flip
+            // commutes with a symmetric crop+pad) and cheaper. The geometry fed
+            // to ray_cond/cond_info is mirrored around the full image width to
+            // stay consistent with the flipped pixel content.
+            std::vector<float> hbatch_crops, hbatch_cond, hbatch_ray;
+            hbatch_crops.reserve((size_t)2 * B * 3 * plane);
+            hbatch_cond.reserve((size_t)2 * B * 3);
+            hbatch_ray.reserve((size_t)2 * B * 2 * ray_plane);
+
+            for (int i = 0; i < B; ++i)
+            {
+                const float scale_i = float(CROP_SIZE) / crop_sz_v[i];
+                for (int h = 0; h < 2; ++h)   // 0 = left, 1 = right
+                {
+                    const bool is_left = (h == 0);
+                    const float* hb = hand_box_out[i].data() + h * 4;
+                    float box_cx = hb[0] * CROP_SIZE, box_cy = hb[1] * CROP_SIZE;
+                    float box_w  = hb[2] * CROP_SIZE, box_h  = hb[3] * CROP_SIZE;
+                    float box_sz = std::max(box_w, box_h);
+
+                    // crop-space → original-image-space (inverse of compute_ray_cond's
+                    // forward affine; see fixed_aspect_bbox_size/compute_ray_cond above)
+                    float orig_cx = (box_cx - CROP_SIZE * 0.5f) / scale_i + crop_cx_v[i];
+                    float orig_cy = (box_cy - CROP_SIZE * 0.5f) / scale_i + crop_cy_v[i];
+                    float orig_sz = box_sz / scale_i;
+
+                    float hx1 = orig_cx - orig_sz * 0.5f, hx2 = orig_cx + orig_sz * 0.5f;
+                    float hy1 = orig_cy - orig_sz * 0.5f, hy2 = orig_cy + orig_sz * 0.5f;
+
+                    float* crop_ptr = nullptr;
+                    hbatch_crops.resize(hbatch_crops.size() + 3 * plane);
+                    crop_ptr = hbatch_crops.data() + hbatch_crops.size() - 3 * plane;
+                    float hcx, hcy, hcsz;
+                    crop_and_normalise(bgr, hx1, hy1, hx2, hy2, crop_ptr, hcx, hcy, hcsz,
+                                       HAND_BBOX_SCALE_FACTOR);
+
+                    float geom_cx = hcx, geom_cam_cx = cx;
+                    if (is_left)
+                    {
+                        // Flip the crop tensor horizontally (per-row mirror, CHW layout)
+                        for (int c = 0; c < 3; ++c)
+                        {
+                            float* plane_ptr = crop_ptr + c * plane;
+                            for (int y = 0; y < CROP_SIZE; ++y)
+                            {
+                                float* row = plane_ptr + y * CROP_SIZE;
+                                std::reverse(row, row + CROP_SIZE);
+                            }
+                        }
+                        // Mirror the geometry around the FULL source image width so
+                        // ray_cond/cond_info stay consistent with the flipped pixels.
+                        geom_cx     = float(W) - hcx;
+                        geom_cam_cx = float(W) - cx;
+                    }
+
+                    hbatch_cond.resize(hbatch_cond.size() + 3);
+                    compute_condition_info(geom_cx, hcy, hcsz, fx, fy, geom_cam_cx, cy,
+                                           hbatch_cond.data() + hbatch_cond.size() - 3);
+
+                    hbatch_ray.resize(hbatch_ray.size() + 2 * ray_plane);
+                    compute_ray_cond(geom_cx, hcy, hcsz, fx, fy, geom_cam_cx, cy,
+                                     hbatch_ray.data() + hbatch_ray.size() - 2 * ray_plane);
+
+                    hand_refs.push_back({i, is_left, hcx, hcy, hcsz});
+                }
+            }
+
+            // ── decoder_hand.onnx: run all 2×B hand crops in one batch ─────────
+            t0 = Clock::now();
+            const int HB = (int)hand_refs.size();
+            std::vector<int64_t> himg_shape{HB, 3, CROP_SIZE, CROP_SIZE};
+            std::vector<int64_t> hcond_shape{HB, 3};
+            std::vector<int64_t> hray_shape {HB, 2, FEAT_HW, FEAT_HW};
+
+            Ort::Value hfeat_in_t = Ort::Value::CreateTensor<float>(
+                                        mi, hbatch_crops.data(), hbatch_crops.size(), himg_shape.data(), 4);
+            auto hand_backbone_out = sess_backbone.session->Run(
+                                         Ort::RunOptions{nullptr},
+                                         sess_backbone.input_names.data(),  &hfeat_in_t, 1,
+                                         sess_backbone.output_names.data(), 1);
+            const float* hfeat_ptr = hand_backbone_out[0].GetTensorData<float>();
+            size_t hfeat_elems = (size_t)HB * BACKBONE_DIM * FEAT_HW * FEAT_HW;
+            std::vector<float> hand_features(hfeat_ptr, hfeat_ptr + hfeat_elems);
+
+            std::vector<int64_t> hfeat_shape{HB, BACKBONE_DIM, FEAT_HW, FEAT_HW};
+            Ort::Value hd_feat_t = Ort::Value::CreateTensor<float>(
+                                       mi, hand_features.data(), hand_features.size(), hfeat_shape.data(), 4);
+            Ort::Value hd_cond_t = Ort::Value::CreateTensor<float>(
+                                       mi, hbatch_cond.data(), hbatch_cond.size(), hcond_shape.data(), 2);
+            Ort::Value hd_ray_t  = Ort::Value::CreateTensor<float>(
+                                       mi, hbatch_ray.data(), hbatch_ray.size(), hray_shape.data(), 4);
+            std::vector<Ort::Value> hd_inputs;
+            hd_inputs.push_back(std::move(hd_feat_t));
+            hd_inputs.push_back(std::move(hd_cond_t));
+            hd_inputs.push_back(std::move(hd_ray_t));
+
+            auto hd_out = sess_decoder_hand.session->Run(
+                              Ort::RunOptions{nullptr},
+                              sess_decoder_hand.input_names.data(),  hd_inputs.data(), hd_inputs.size(),
+                              sess_decoder_hand.output_names.data(), 1);
+            const float* hd_token_ptr = hd_out[0].GetTensorData<float>();
+            std::vector<float> hand_pose_tokens(hd_token_ptr, hd_token_ptr + (size_t)HB * DECODER_DIM);
+
+            hand_mhr_raw = cffn_run(mhr_ffn_hand, hand_pose_tokens.data(), HB);
+            hand_cam_raw = cffn_run(cam_ffn_hand, hand_pose_tokens.data(), HB);
+            printf("[FSB] hand decoder+ffn: %.1f ms  (%d hand crop(s))\n", ms(t0), HB);
+
+            // hand_mhr_raw/hand_cam_raw/hand_refs are used below (after the
+            // per-person results are assembled) for the validity gate, pass-2
+            // keypoint prompt, and wrist-IK fusion. Report per-hand sanity now.
+            for (int h = 0; h < HB; ++h)
+            {
+                const auto& ref = hand_refs[h];
+                const float* raw = hand_mhr_raw.data() + (size_t)h * mhr_ffn_hand.out_dim;
+                float max_abs = 0.f;
+                for (int k = 0; k < mhr_ffn_hand.out_dim; ++k) max_abs = std::max(max_abs, std::fabs(raw[k]));
+                printf("[FSB]   hand[%d] person=%d %s  max|raw|=%.3f  box=[%.3f %.3f %.3f %.3f]\n",
+                       h, ref.person, ref.is_left ? "left " : "right",
+                       max_abs,
+                       hand_box_out[ref.person][(ref.is_left?0:4)+0],
+                       hand_box_out[ref.person][(ref.is_left?0:4)+1],
+                       hand_box_out[ref.person][(ref.is_left?0:4)+2],
+                       hand_box_out[ref.person][(ref.is_left?0:4)+3]);
+            }
+        }
+
         // ── body model (optional) ─────────────────────────────────────────────
         std::vector<float> all_verts, all_skel;
         bool use_lbs_skel = false;  // true if skeleton from LBS (float32, [127,3])
@@ -996,7 +1284,8 @@ struct Pipeline::Impl
                                     raw_i + 266,  /* shape */
                                     cfg.zero_face_params ? zero_face : raw_i + 447,  /* face */
                                     verts_out,
-                                    joints_out);
+                                    joints_out,
+                                    nullptr);
                 }
                 printf("[FSB] LBS person %d done\n", i);
             }
@@ -1016,6 +1305,13 @@ struct Pipeline::Impl
             const float* p = mhr_raw.data() + i * NPOSE;
 
             r.bbox = { d.x1, d.y1, d.x2, d.y2 };
+
+            if (cfg.refined_pose && !hand_box_out.empty())
+            {
+                r.has_hand_box = true;
+                r.hand_box     = hand_box_out[i];
+                r.hand_box_cls = hand_cls_out[i];
+            }
 
             // ── Second-pass raw fields ────────────────────────────────────────
             // Store the raw MHR FFN output (first 266 floats = global_rot_6d[6]
@@ -1180,6 +1476,389 @@ struct Pipeline::Impl
                     r.keypoints_2d = std::move(kps_2d);
                 }
             }
+        }
+
+        // ── Refined pose: validity gate + pass 2 + wrist-IK fusion + splice ────
+        // (see PLAN.md, issue #15 "refined pose" plan). Mirrors sam3d_body.py's
+        // run_inference Steps 3-5 ("replace hand pose estimation from the body
+        // decoder" / "Doing IK"), with two documented simplifications:
+        //   - the validity gate uses box-size + 2D-wrist-distance only (skips
+        //     Python's rotation-agreement and full-70-keypoint-in-crop criteria)
+        //   - kept everything else faithful, including the closed-form wrist-IK
+        //     rotation solve (this is what the LBS out_joint_quats extension —
+        //     see model_loader_transform_joints.c — was added for).
+        if (cfg.refined_pose && sess_decoder_prompted.session && lbs_data && !kp_mapping.empty())
+        {
+            t0 = Clock::now();
+            static constexpr int KP_RIGHT_WRIST = 41, KP_LEFT_WRIST = 62;
+            static constexpr int KP_RIGHT_ELBOW = 8,  KP_LEFT_ELBOW = 7;
+            static constexpr float HAND_BOX_SIZE_THRESH   = 64.f;    // px, original image
+            static constexpr float HAND_WRIST_DIST_THRESH = 0.25f;   // normalised by hand crop size
+
+            // ── per-hand-crop own FK: wrist 2D (full-image, unflipped) + wrist quat ──
+            struct HandFK {
+                bool ok = false;
+                std::array<float,133> body_euler{};
+                std::array<float,3>   global_rot_euler{};
+                std::array<float,108> hand108{};
+                std::array<float,28>  scale28{};
+                std::array<float,45>  shape45{};
+                std::array<float,2>   wrist2d{};      // full-image px, unflipped
+                std::array<float,4>   wrist_quat{};   // XYZW, unflipped model space
+                bool valid = false;
+            };
+            const int HB = (int)hand_refs.size();
+            std::vector<HandFK> hfk(HB);
+
+            std::vector<float> hv_scratch((size_t)lbs_data->n_verts * 3);
+            std::vector<float> hj_scratch((size_t)lbs_data->n_joints * 3);
+            std::vector<float> hq_scratch((size_t)lbs_data->n_joints * 4);
+            static const float zero_face72[72] = {};
+
+            for (int h = 0; h < HB; ++h)
+            {
+                const auto& ref = hand_refs[h];
+                HandFK& F = hfk[h];
+                const float* raw  = hand_mhr_raw.data() + (size_t)h * mhr_ffn_hand.out_dim;
+                const float* camr = hand_cam_raw.data() + (size_t)h * 3;
+
+                rot6d_to_euler(raw, F.global_rot_euler.data());
+                compact_cont_to_body_params(raw + 6, F.body_euler.data());
+                std::copy(raw + 339, raw + 339 + 108, F.hand108.begin());
+                std::copy(raw + 311, raw + 311 + 28,  F.scale28.begin());
+                std::copy(raw + 266, raw + 266 + 45,  F.shape45.begin());
+
+                // head_camera_hand uses DEFAULT_SCALE_FACTOR_HAND=10 (model_config.yaml)
+                // in Python's perspective_projection: bs = bbox_size*s*default_scale_factor
+                // (camera_head.py:85). Hand-verified against real captured Python values
+                // (sys.settrace on camera_project_hand, forced bbox) — this formula with
+                // *10 reproduces Python's pred_cam_t to ~0.05 (small remaining gap traced
+                // to the hand-box regression's own crop-normalised cx/cy differing by a
+                // few percent from Python's, amplified ~3x by the body-crop zoom factor —
+                // see PLAN.md). An earlier attempt at *10 without HAND_CAM_SCALE_FACTOR
+                // named/isolated like this produced wildly wrong (off-screen) results;
+                // re-verified step-by-step via the camdbg printf below this time.
+                static constexpr float HAND_CAM_SCALE_FACTOR = 10.f;
+                float geom_cx     = ref.is_left ? (float(W) - ref.orig_cx) : ref.orig_cx;
+                float geom_cam_cx = ref.is_left ? (float(W) - cx)          : cx;
+                float s_val = -camr[0], t_x = camr[1], t_y = -camr[2];
+                float bs    = ref.orig_sz * s_val * HAND_CAM_SCALE_FACTOR + 1e-8f;
+                float pred_cam_t[3] = {
+                    t_x + 2.f*(geom_cx - geom_cam_cx)/bs,
+                    t_y + 2.f*(ref.orig_cy - cy)/bs,
+                    2.f*fx/bs
+                };
+                printf("[FSB]   camdbg h=%d %s: raw_cam=(%.6f,%.6f,%.6f) orig_cx=%.3f orig_cy=%.3f "
+                       "orig_sz=%.3f fx=%.3f geom_cam_cx=%.3f cy=%.3f s_val=%.6f bs=%.4f "
+                       "pred_cam_t=(%.4f,%.4f,%.4f)\n",
+                       h, ref.is_left?"left":"right", camr[0], camr[1], camr[2],
+                       ref.orig_cx, ref.orig_cy, ref.orig_sz, fx, geom_cam_cx, cy, s_val, bs,
+                       pred_cam_t[0], pred_cam_t[1], pred_cam_t[2]);
+
+                ModelParams204 mp = build_model_params(F.global_rot_euler.data(), F.body_euler.data(), nullptr, true);
+                apply_hand_pose(mp.data, F.hand108.data(),
+                                lbs_data->hand_pose_mean, lbs_data->hand_pose_comps,
+                                lbs_data->hand_joint_idxs_left, lbs_data->hand_joint_idxs_right);
+                if (lbs_data->scale_mean && lbs_data->scale_comps)
+                {
+                    int ns = lbs_data->n_scale_out, npc = lbs_data->n_scale_pc;
+                    for (int j = 0; j < ns; ++j) mp.data[136+j] = lbs_data->scale_mean[j];
+                    for (int k = 0; k < npc; ++k)
+                        for (int j = 0; j < ns; ++j)
+                            mp.data[136+j] += F.scale28[k] * lbs_data->scale_comps[k*ns+j];
+                }
+
+                if (!mhr_lbs_compute(lbs_data, mp.data, F.shape45.data(), zero_face72,
+                                     hv_scratch.data(), hj_scratch.data(), hq_scratch.data()))
+                    continue;
+
+                int wrist_joint = ref.is_left ? 78 : 42;   // l_wrist / r_wrist (mhr_joint_table.h)
+                std::copy(hq_scratch.begin() + wrist_joint*4, hq_scratch.begin() + wrist_joint*4 + 4,
+                          F.wrist_quat.begin());
+
+                // A hand crop's OWN predicted keypoints always report the wrist at
+                // kps_right_wrist_idx (41), regardless of which hand it is — every
+                // crop (right natural, left flipped-to-look-right) is normalised to
+                // look right-handed before being fed to the network, and the network
+                // has no notion of "this is actually the left hand" to report
+                // differently. Confirmed against sam3d_body.py run_inference lines
+                // ~1350-1354: both right_kps_full and left_kps_full index the SAME
+                // kps_right_wrist_idx into their respective hand crop's own output;
+                // only the BODY PASS's own (genuinely anatomical) keypoints use 41
+                // vs 62 by side. Using KP_LEFT_WRIST here for the left crop (an
+                // earlier version of this code did) was a real bug.
+                //
+                // The wrist keypoint's 3D position in the hand crop's own decode is
+                // (empirically, essentially exact float32 zero — confirmed by hooking
+                // camera_project_hand and printing pred_keypoints_3d[:,41] on a real
+                // image) the ORIGIN: head_pose_hand's MHR forward is wrist-rooted for
+                // this keypoint, unlike the body-rooted (pelvis) skeleton mhr_lbs_data
+                // here represents. So skip the kp_mapping/LBS position lookup entirely
+                // for this specific point and project the origin directly through
+                // pred_cam_t — this is NOT an approximation, it matches Python's real
+                // output to <1px (hand-verified against captured ground truth). Using
+                // mhr_lbs_compute's body-rooted skeleton here (an earlier version of
+                // this code did) was a real bug — see PLAN.md, this also means the
+                // wrist_quat used below for the IK fusion may have the same rooting
+                // mismatch and needs the same scrutiny (flagged, not yet fixed).
+                float dz = pred_cam_t[2], dx = pred_cam_t[0], dy = pred_cam_t[1];
+                if (dz < 1e-4f) dz = 1e-4f;
+                float wx = dx/dz*fx + geom_cam_cx;
+                float wy = dy/dz*fy + cy;
+                if (ref.is_left) wx = float(W) - wx - 1.f;   // unflip back to normal image space
+                F.wrist2d = {wx, wy};
+                F.ok = true;
+
+                int body_wrist_kp = ref.is_left ? KP_LEFT_WRIST : KP_RIGHT_WRIST;
+                bool valid_box = ref.orig_sz > HAND_BOX_SIZE_THRESH;
+                bool valid_dist = false;
+                float dbg_dist = -1.f, dbg_bodyx = -1.f, dbg_bodyy = -1.f;
+                if (results[ref.person].keypoints_2d.size() >= (size_t)(body_wrist_kp+1)*2)
+                {
+                    // Python normalises each hand's distance by the OTHER hand's own
+                    // bbox_scale (run_inference lines ~1363-1368: right_kps_dist uses
+                    // batch_lhand's scale, left_kps_dist uses batch_rhand's scale) —
+                    // faithfully replicated here, not "fixed", even though it reads
+                    // like it could be an upstream quirk. Falls back to this hand's
+                    // own orig_sz if the sibling hand crop wasn't built (e.g. only
+                    // one hand's box passed the earlier size check upstream — doesn't
+                    // currently happen since both hands are always built, but keep
+                    // the fallback for robustness).
+                    float norm_sz = ref.orig_sz;
+                    for (const auto& sib : hand_refs)
+                        if (sib.person == ref.person && sib.is_left != ref.is_left) { norm_sz = sib.orig_sz; break; }
+
+                    const float* body_wrist2d = &results[ref.person].keypoints_2d[body_wrist_kp*2];
+                    float ddx = wx - body_wrist2d[0], ddy = wy - body_wrist2d[1];
+                    float dist = std::sqrt(ddx*ddx + ddy*ddy) / std::max(1.f, norm_sz);
+                    valid_dist = dist < HAND_WRIST_DIST_THRESH;
+                    dbg_dist = dist; dbg_bodyx = body_wrist2d[0]; dbg_bodyy = body_wrist2d[1];
+                }
+                F.valid = valid_box && valid_dist;
+                // Dev escape hatch for gate-threshold tuning/debugging without a
+                // rebuild — bypasses only the distance check, box-size still applies.
+                if (getenv("FSB_FORCE_HAND_VALID")) F.valid = valid_box;
+                printf("[FSB]   gate-debug h=%d person=%d %s: orig_sz=%.1f valid_box=%d "
+                       "hand_wrist2d=(%.1f,%.1f) body_wrist2d=(%.1f,%.1f) dist_norm=%.3f valid_dist=%d\n",
+                       h, ref.person, ref.is_left?"left":"right", ref.orig_sz, valid_box,
+                       wx, wy, dbg_bodyx, dbg_bodyy, dbg_dist, valid_dist);
+            }
+            printf("[FSB] hand FK + gate: %.1f ms  (%d/%d hand(s) valid)\n", ms(t0),
+                   (int)std::count_if(hfk.begin(), hfk.end(), [](const HandFK& f){ return f.valid; }), HB);
+
+            // ── per-person: keypoint prompt → decoder_prompted → decode → splice ──
+            t0 = Clock::now();
+            for (int i = 0; i < B; ++i)
+            {
+                MHRResult& r = results[i];
+                int left_h = -1, right_h = -1;
+                for (int h = 0; h < HB; ++h)
+                    if (hand_refs[h].person == i) (hand_refs[h].is_left ? left_h : right_h) = h;
+
+                // keypoint_prompt[4,3]: right_wrist, left_wrist, right_elbow, left_elbow.
+                // Coords are crop-normalised to the BODY pass's own crop [-0.5,0.5]
+                // then shifted to [0,1]; label==-2 marks an invalid/unused slot.
+                float kp_prompt[4][3];
+                auto set_prompt = [&](int slot, float full_x, float full_y, float label, bool valid)
+                {
+                    if (!valid) { kp_prompt[slot][0]=0.f; kp_prompt[slot][1]=0.f; kp_prompt[slot][2]=-2.f; return; }
+                    float nx = (full_x - crop_cx_v[i]) / crop_sz_v[i];
+                    float ny = (full_y - crop_cy_v[i]) / crop_sz_v[i];
+                    bool in_range = nx>=-0.5f && nx<=0.5f && ny>=-0.5f && ny<=0.5f;
+                    if (!in_range) { kp_prompt[slot][0]=0.f; kp_prompt[slot][1]=0.f; kp_prompt[slot][2]=-2.f; return; }
+                    kp_prompt[slot][0] = nx + 0.5f;
+                    kp_prompt[slot][1] = ny + 0.5f;
+                    kp_prompt[slot][2] = label;
+                };
+                bool right_valid = right_h >= 0 && hfk[right_h].valid;
+                bool left_valid  = left_h  >= 0 && hfk[left_h].valid;
+                set_prompt(0, right_valid ? hfk[right_h].wrist2d[0] : 0.f,
+                             right_valid ? hfk[right_h].wrist2d[1] : 0.f,
+                             (float)KP_RIGHT_WRIST, right_valid);
+                set_prompt(1, left_valid ? hfk[left_h].wrist2d[0] : 0.f,
+                             left_valid ? hfk[left_h].wrist2d[1] : 0.f,
+                             (float)KP_LEFT_WRIST, left_valid);
+                bool have_kp2d = r.keypoints_2d.size() >= 70*2;
+                set_prompt(2, have_kp2d ? r.keypoints_2d[KP_RIGHT_ELBOW*2+0] : 0.f,
+                             have_kp2d ? r.keypoints_2d[KP_RIGHT_ELBOW*2+1] : 0.f,
+                             (float)KP_RIGHT_ELBOW, right_valid && have_kp2d);
+                set_prompt(3, have_kp2d ? r.keypoints_2d[KP_LEFT_ELBOW*2+0] : 0.f,
+                             have_kp2d ? r.keypoints_2d[KP_LEFT_ELBOW*2+1] : 0.f,
+                             (float)KP_LEFT_ELBOW, left_valid && have_kp2d);
+
+                // prev_estimate[522] = cat(pred_pose_raw[266], shape[45], scale[28], hand[108], face[72], pred_cam_raw[3])
+                float prev_est[522];
+                float* pe = prev_est;
+                std::memcpy(pe, r.pred_pose_raw.data(), 266*sizeof(float)); pe += 266;
+                std::memcpy(pe, r.shape.data(),      45*sizeof(float));     pe += 45;
+                std::memcpy(pe, r.scale.data(),      28*sizeof(float));     pe += 28;
+                std::memcpy(pe, r.hand_pose.data(), 108*sizeof(float));     pe += 108;
+                std::memcpy(pe, r.face_params.data(),72*sizeof(float));     pe += 72;
+                std::memcpy(pe, r.pred_cam_raw.data(),3*sizeof(float));
+
+                std::vector<int64_t> f_sh{1, BACKBONE_DIM, FEAT_HW, FEAT_HW};
+                std::vector<int64_t> c_sh{1, 3};
+                std::vector<int64_t> r_sh{1, 2, FEAT_HW, FEAT_HW};
+                std::vector<int64_t> k_sh{1, 4, 3};
+                std::vector<int64_t> p_sh{1, 1, 522};
+
+                Ort::Value pf_t = Ort::Value::CreateTensor<float>(
+                                      mi, features.data() + (size_t)i*BACKBONE_DIM*FEAT_HW*FEAT_HW,
+                                      (size_t)BACKBONE_DIM*FEAT_HW*FEAT_HW, f_sh.data(), 4);
+                Ort::Value pc_t = Ort::Value::CreateTensor<float>(
+                                      mi, batch_cond.data() + (size_t)i*3, 3, c_sh.data(), 2);
+                Ort::Value pr_t = Ort::Value::CreateTensor<float>(
+                                      mi, batch_ray.data() + (size_t)i*2*ray_plane, 2*ray_plane, r_sh.data(), 4);
+                Ort::Value pk_t = Ort::Value::CreateTensor<float>(mi, &kp_prompt[0][0], 12, k_sh.data(), 3);
+                Ort::Value pp_t = Ort::Value::CreateTensor<float>(mi, prev_est, 522, p_sh.data(), 3);
+
+                std::vector<Ort::Value> p2_inputs;
+                p2_inputs.push_back(std::move(pf_t));
+                p2_inputs.push_back(std::move(pc_t));
+                p2_inputs.push_back(std::move(pr_t));
+                p2_inputs.push_back(std::move(pk_t));
+                p2_inputs.push_back(std::move(pp_t));
+
+                auto p2_out = sess_decoder_prompted.session->Run(
+                                  Ort::RunOptions{nullptr},
+                                  sess_decoder_prompted.input_names.data(),  p2_inputs.data(), p2_inputs.size(),
+                                  sess_decoder_prompted.output_names.data(), 1);
+                const float* p2_token = p2_out[0].GetTensorData<float>();
+
+                std::vector<float> p2_mhr = cffn_run(mhr_ffn, p2_token, 1);
+                std::vector<float> p2_cam = cffn_run(cam_ffn, p2_token, 1);
+                const float* p2 = p2_mhr.data();
+
+                // Pass 2's decode REPLACES the pass-1 output wholesale (matches Python:
+                // output.update({"mhr": pose_output}) is unconditional — only the
+                // wrist/hand/scale/shape splice below is gated by per-hand validity).
+                std::memcpy(r.pred_pose_raw.data(), p2, 266*sizeof(float));
+                std::memcpy(r.pred_cam_raw.data(),  p2_cam.data(), 3*sizeof(float));
+                float p2_global_rot_euler[3];
+                rot6d_to_euler(p2, p2_global_rot_euler);
+                r.global_rot = { p2_global_rot_euler[2], p2_global_rot_euler[1], p2_global_rot_euler[0] };
+                std::array<float,133> p2_body_euler{};
+                compact_cont_to_body_params(p2 + 6, p2_body_euler.data());
+                r.shape.assign(p2 + 266, p2 + 266 + 45);
+                r.scale.assign(p2 + 311, p2 + 311 + 28);
+                r.hand_pose.assign(p2 + 339, p2 + 339 + 108);
+                r.face_params.assign(p2 + 447, p2 + 447 + 72);
+                {
+                    float s_val = -p2_cam[0], t_x = p2_cam[1], t_y = -p2_cam[2];
+                    float bw = r.bbox[2]-r.bbox[0], bh = r.bbox[3]-r.bbox[1];
+                    float bbox_cx = (r.bbox[0]+r.bbox[2])*0.5f, bbox_cy = (r.bbox[1]+r.bbox[3])*0.5f;
+                    float bs = fixed_aspect_bbox_size(bw,bh)*s_val + 1e-8f;
+                    r.pred_cam_t = { t_x + 2.f*(bbox_cx-cx)/bs, t_y + 2.f*(bbox_cy-cy)/bs, 2.f*fx/bs };
+                }
+
+                // ── wrist-IK fusion (only for hands that passed the gate) ──────────
+                if (right_valid || left_valid)
+                {
+                    ModelParams204 mp2 = build_model_params(p2_global_rot_euler, p2_body_euler.data(), nullptr, true);
+                    // hand/scale not needed for FK (arms only), zero_face/zero-shape are fine —
+                    // only joint rotations are used, not vertices.
+                    std::vector<float> zshape((size_t)lbs_data->n_shape_pc, 0.f);
+                    std::vector<float> v2((size_t)lbs_data->n_verts*3), j2((size_t)lbs_data->n_joints*3),
+                                       q2((size_t)lbs_data->n_joints*4);
+                    if (mhr_lbs_compute(lbs_data, mp2.data, zshape.data(), zero_face72,
+                                        v2.data(), j2.data(), q2.data()))
+                    {
+                        for (int lr = 0; lr < 2; ++lr)   // 0=right, 1=left
+                        {
+                            bool valid  = lr==0 ? right_valid : left_valid;
+                            int  h      = lr==0 ? right_h     : left_h;
+                            if (!valid) continue;
+
+                            int lowarm_j     = lr==0 ? 40 : 76;
+                            int wristtwist_j = lr==0 ? 41 : 77;
+                            float lowarm_R[9]; quat_to_mat3(q2.data() + lowarm_j*4, lowarm_R);
+                            float pre_R[9];    quat_to_mat3(lbs_data->joint_prerotations + wristtwist_j*4, pre_R);
+                            float zero_rot_R[9]; mat3_mul(lowarm_R, pre_R, zero_rot_R);
+
+                            float pred_global_R[9]; quat_to_mat3(hfk[h].wrist_quat.data(), pred_global_R);
+
+                            // fused_local = zero_rot^T @ pred_global  (see PLAN.md derivation)
+                            float zero_rot_T[9]; mat3_transpose(zero_rot_R, zero_rot_T);
+                            float fused_R[9]; mat3_mul(zero_rot_T, pred_global_R, fused_R);
+
+                            float wx, wz, wy;
+                            rotmat_to_euler_xzy(fused_R, &wx, &wz, &wy);
+                            fix_wrist_euler(wx, wz, wy);
+
+                            // body_pose indices: right=[41,43,42], left=[31,33,32]
+                            static const int idx_r[3] = {41,43,42}, idx_l[3] = {31,33,32};
+                            const int* idx = lr==0 ? idx_r : idx_l;
+                            p2_body_euler[idx[0]] = wx;
+                            p2_body_euler[idx[1]] = wz;
+                            p2_body_euler[idx[2]] = wy;
+
+                            // hand[108] half + scale[8]/[9] swap (see run_inference lines ~1545-1569)
+                            int src_off = lr==0 ? 54 : 0;   // right uses hand[54:], left uses hand[:54]
+                            std::copy(hfk[h].hand108.begin()+src_off, hfk[h].hand108.begin()+src_off+54,
+                                      r.hand_pose.begin() + (lr==0 ? 54 : 0));
+                            if (r.scale.size() >= 10)
+                                r.scale[lr==0 ? 8 : 9] = hfk[h].scale28[lr==0 ? 8 : 9];
+                        }
+                    }
+                }
+                r.body_pose.assign(p2_body_euler.begin(), p2_body_euler.end());
+
+                // Rebuild derived fields (mhr_model_params, vertices/keypoints) from
+                // the final spliced pose, mirroring the existing result-assembly code.
+                ModelParams204 mp_final = build_model_params(p2_global_rot_euler, p2_body_euler.data(), nullptr, true);
+                apply_hand_pose(mp_final.data, r.hand_pose.data(),
+                                lbs_data->hand_pose_mean, lbs_data->hand_pose_comps,
+                                lbs_data->hand_joint_idxs_left, lbs_data->hand_joint_idxs_right);
+                if (lbs_data->scale_mean && lbs_data->scale_comps)
+                {
+                    int ns = lbs_data->n_scale_out, npc = lbs_data->n_scale_pc;
+                    for (int j = 0; j < ns; ++j) mp_final.data[136+j] = lbs_data->scale_mean[j];
+                    for (int k = 0; k < npc; ++k)
+                        for (int j = 0; j < ns; ++j)
+                            mp_final.data[136+j] += r.scale[k] * lbs_data->scale_comps[k*ns+j];
+                }
+                std::memcpy(r.mhr_model_params.data(), mp_final.data, 204*sizeof(float));
+
+                if (!r.pred_vertices.empty())
+                {
+                    static const float zero_face_out[72] = {};
+                    std::vector<float> fverts((size_t)lbs_data->n_verts*3), fjoints((size_t)lbs_data->n_joints*3);
+                    if (mhr_lbs_compute(lbs_data, mp_final.data, r.shape.data(),
+                                        cfg.zero_face_params ? zero_face_out : r.face_params.data(),
+                                        fverts.data(), fjoints.data(), nullptr))
+                    {
+                        r.pred_vertices = fverts;
+                        r.skeleton_3d   = fjoints;
+
+                        std::vector<float> kps3d(70*3, 0.f);
+                        for (const auto& e : kp_mapping)
+                        {
+                            for (int c = 0; c < 3; ++c)
+                            {
+                                float src = (e.col < 18439) ? fverts[e.col*3+c] : fjoints[(e.col-18439)*3+c];
+                                kps3d[e.row*3+c] += src * e.val;
+                            }
+                        }
+                        r.keypoints_3d = kps3d;
+                        std::vector<float> kps2d(70*2);
+                        for (int k = 0; k < 70; ++k)
+                        {
+                            float dz = kps3d[k*3+2] + r.pred_cam_t[2];
+                            float dx = kps3d[k*3+0] + r.pred_cam_t[0];
+                            float dy = kps3d[k*3+1] + r.pred_cam_t[1];
+                            if (dz < 1e-4f) dz = 1e-4f;
+                            kps2d[k*2+0] = dx/dz*fx + cx;
+                            kps2d[k*2+1] = dy/dz*fy + cy;
+                        }
+                        r.keypoints_2d = kps2d;
+                    }
+                }
+
+                if (right_valid || left_valid)
+                    printf("[FSB]   person=%d pass-2 applied  right_valid=%d left_valid=%d\n",
+                           i, right_valid, left_valid);
+            }
+            printf("[FSB] pass-2 + IK + splice: %.1f ms  (%d person(s))\n", ms(t0), B);
         }
 
         printf("[FSB] total: %.1f ms  (%d persons)\n", ms(t_total), B);

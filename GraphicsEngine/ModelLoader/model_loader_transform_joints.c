@@ -1427,7 +1427,8 @@ int mhr_lbs_compute(const struct MHR_LBS_Data *d,
                     const float *shape_coeffs,  /* [n_shape_pc] */
                     const float *face_coeffs,   /* [n_face_pc]  */
                     float       *out_verts,     /* [n_verts*3], caller-alloc */
-                    float       *out_joints)    /* [n_joints*3], optional */
+                    float       *out_joints,    /* [n_joints*3], optional */
+                    float       *out_joint_quats) /* [n_joints*4] XYZW, optional */
 {
     if (!d || !model_params || !shape_coeffs || !face_coeffs || !out_verts)
         return 0;
@@ -1701,6 +1702,12 @@ int mhr_lbs_compute(const struct MHR_LBS_Data *d,
             out_joints[j*3+1] = -g_t[j*3+1] * 0.01f;
             out_joints[j*3+2] = -g_t[j*3+2] * 0.01f;
         }
+    }
+
+    /* Step 8b — output joint global rotations (g_q), UNFLIPPED — matches
+     * Python's joint_global_rots convention (see header comment). */
+    if (out_joint_quats) {
+        memcpy(out_joint_quats, g_q, (size_t)nj * 4 * sizeof(float));
     }
 
     //fprintf(stderr,"[LBS] output joints done, returning\n");
