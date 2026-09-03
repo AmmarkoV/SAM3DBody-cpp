@@ -271,6 +271,9 @@ inline bool path_looks_like_libreyolo(const std::string& p)
 // both of those decide what to load by probing onnx_dir, so they need the files
 // to be on disk before they run.
 //
+// refined_pose=true also fetches the 'refined' profile (the 28 iterative
+// decoder_* ONNX graphs + pipeline_refined.gguf that --refined-pose loads).
+//
 // Two details that are easy to get wrong:
 //
 //   * The profile comes from the user's INTENT (--cuda), never from what is on
@@ -289,7 +292,7 @@ inline bool path_looks_like_libreyolo(const std::string& p)
 // disables it outright; fetch_model.sh itself refuses to download when it has no
 // terminal to prompt on, which keeps ROS nodes and CI jobs from silently pulling
 // gigabytes.
-inline void ensure_models(CommonConfig& c)
+inline void ensure_models(CommonConfig& c, bool refined_pose = false)
 {
     const bool cpu = (c.cuda_device < 0);
     const char* profile;
@@ -319,6 +322,29 @@ inline void ensure_models(CommonConfig& c)
     } else if (!c.use_trt && !c.backbone_name_set) {
         sentinels.insert(sentinels.end(), {
             "backbone.onnx", "backbone.onnx.data", "decoder.onnx" });
+    }
+    if (refined_pose) {
+        // --refined-pose's iterative decoders (the 'refined' profile in
+        // tools/fetch_model.sh) — 28 per-layer ONNX graphs plus the separate
+        // hand-head GGUF. Without them the pipeline load fails outright, so
+        // fetch them upfront like every other required model.
+        sentinels.insert(sentinels.end(), {
+            "pipeline_refined.gguf",
+            "decoder_hand_pre.onnx", "decoder_hand_layer0.onnx",
+            "decoder_hand_layer1.onnx", "decoder_hand_layer2.onnx",
+            "decoder_hand_layer3.onnx", "decoder_hand_layer4.onnx",
+            "decoder_hand_layer5.onnx", "decoder_hand_normfinal.onnx",
+            "decoder_hand_update.onnx",
+            "decoder_prompted_pre.onnx", "decoder_prompted_layer0.onnx",
+            "decoder_prompted_layer1.onnx", "decoder_prompted_layer2.onnx",
+            "decoder_prompted_layer3.onnx", "decoder_prompted_layer4.onnx",
+            "decoder_prompted_layer5.onnx", "decoder_prompted_normfinal.onnx",
+            "decoder_prompted_update.onnx",
+            "decoder_pass1_pre.onnx", "decoder_pass1_layer0.onnx",
+            "decoder_pass1_layer1.onnx", "decoder_pass1_layer2.onnx",
+            "decoder_pass1_layer3.onnx", "decoder_pass1_layer4.onnx",
+            "decoder_pass1_layer5.onnx", "decoder_pass1_normfinal.onnx",
+            "decoder_pass1_update.onnx", "decoder_pass1_handbox.onnx" });
     }
 
     // Where the executable lives, so we can find both the repo's onnx/ and the
@@ -381,11 +407,14 @@ inline void ensure_models(CommonConfig& c)
         return;
     }
 
+    const std::string profiles =
+        std::string(profile) + (refined_pose ? " refined" : "");
+
     std::fprintf(stderr,
         "[cli] models missing from '%s' — running '%s %s' to fetch them…\n",
-        c.onnx_dir.c_str(), script.c_str(), profile);
+        c.onnx_dir.c_str(), script.c_str(), profiles.c_str());
 
-    const std::string cmd = "bash '" + script + "' " + profile +
+    const std::string cmd = "bash '" + script + "' " + profiles +
                             " --onnx-dir '" + c.onnx_dir + "'";
     if (std::system(cmd.c_str()) != 0 || missing()) {
         std::fprintf(stderr,

@@ -706,7 +706,9 @@ int main(int argc, const char** argv) {
         if (!strcmp(argv[i], "--headless"))                 { headless = true; continue; }
         if (!strcmp(argv[i], "--no-drop"))                  { no_drop = true; continue; }
     }
-    ensure_models(cc);              // fetch the models if onnx/ is empty
+    ensure_models(cc, refined_pose);  // fetch the models if onnx/ is empty
+                                      // (incl. the 'refined' profile under
+                                      // --refined-pose)
     resolve_detector_defaults(cc);  // "auto" → libreyolo when available; sets the
                                     // per-detector default threshold too
     resolve_backbone_defaults(cc);  // CUDA: prefer backbone_fp16.onnx if present

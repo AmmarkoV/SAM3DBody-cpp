@@ -47,6 +47,11 @@ bash tools/fetch_model.sh shared cuda    # ~5.2 GB
 TensorRT, or `all` for every variant. Re-running only fetches what is absent, and
 an interrupted download resumes.
 
+`--refined-pose` additionally needs the `refined` profile (~607 MB of iterative
+decoder graphs + `pipeline_refined.gguf` — fetched automatically on first run
+with the flag, or by hand with `bash tools/fetch_model.sh cuda refined`; see
+"Refined pose" under *Running*).
+
 | File | Size | Description |
 |------|------|-------------|
 | `onnx/backbone.onnx` + `.data` | ~4.8 GB | DINOv3-ViT-H/14+ encoder (BF16, CUDA EP only) |
@@ -359,9 +364,62 @@ Full option list:
 --bw-cutoff HZ     Butterworth cutoff frequency in Hz (default 6.0)
 --butterworth-root-rotation  Filter global_rot in quaternion space (1st-order SLERP-EMA, see "Output filtering")
 --rot-clamp DEG    Geodesic SLERP-step clamp on global_rot in degrees/frame (default 1; 0 = no clamp)
+--refined-pose     Extra iterative pose-refinement passes (see "Refined pose" below).
+                   fast_sam_3dbody_render only; off by default
 --info             Print pipeline info and exit
 --help             Show this message
 ```
+
+### Refined pose (`--refined-pose`)
+
+Opt-in extra inference passes that mirror the official `sam-3d-body` pipeline's
+multi-stage refinement (issue #15 / `PLAN.md` / `POSEREFINE.md`). Instead of the
+single decoder forward pass, each person gets:
+
+1. an iterative **pass-1 body decode** that also regresses per-hand crop boxes,
+2. a **per-hand crop decode** for each visible hand (the left crop is flipped
+   to look right-handed, exactly like the reference implementation),
+3. a keypoint-prompted **pass-2 body decode**, followed by a **wrist-IK splice**
+   that replaces the body pose's wrist rotations and hand/finger pose with the
+   hand crops' estimates (scale/shape params included, with the reference's
+   validity gates).
+
+This closes the largest known gaps vs the official Python output: wrist
+orientation, hand-box placement, and hand/finger articulation. Residual
+differences remain — the C++ decoders run fp32 ONNX exports of bf16-trained
+weights, so per-joint regression noise still compounds through the arm chains
+(see `POSEREFINE.md` for the measurement history).
+
+The flag is accepted by `fast_sam_3dbody_render` (the binary used by
+`scripts/webcam.sh`, which forwards extra arguments):
+
+```bash
+./build/fast_sam_3dbody_render --from video.mp4 --refined-pose
+./scripts/webcam.sh --refined-pose
+```
+
+**Required files:** 28 extra per-layer decoder ONNX graphs plus
+`pipeline_refined.gguf` (~607 MB in total, the `refined` profile of
+`tools/fetch_model.sh`). They are fetched automatically on startup when the
+flag is set and any of them is missing (same lazy mechanism as the base
+models), or explicitly with:
+
+```bash
+bash tools/fetch_model.sh cuda refined
+```
+
+**Quality / performance tradeoff** (measured on `issue15.jpg`, 1080×1382,
+1 person, RTX 4080 SUPER):
+
+| mode            | latency / frame | notes                                        |
+|-----------------|-----------------|----------------------------------------------|
+| default         | ~0.71 s         | single decoder pass, no hand refinement      |
+| `--refined-pose`| ~0.89 s         | +~0.18 s: 2 hand-crop decodes + pass-2 + IK  |
+
+That is roughly 1.1–1.4 fps for live webcam input — the flag is currently best
+suited to recorded video, BVH export, and quality testing rather than fluid
+live use. The extra cost scales with the number of visible hands per person
+(up to two hand-crop decode loops per person per frame).
 
 ### Python lightweight frontend
 

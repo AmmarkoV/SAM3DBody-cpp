@@ -14,7 +14,7 @@
 #   refined  extra files for --refined-pose (see PLAN.md,
 #            issue #15 "refined pose" plan) — opt-in, not part
 #            of 'all'; combine with a base profile, e.g.
-#            'tools/fetch_model.sh cuda refined'              ~373 MB
+#            'tools/fetch_model.sh cuda refined'              ~607 MB
 #
 # Called by hand, from scripts/setup.sh, and lazily at runtime by
 # ensure_models() when a binary starts up with models missing.
@@ -85,9 +85,41 @@ MANIFEST=(
   # not part of 'all'. pipeline.gguf's own entry above is untouched by
   # this: the hand-decoder heads live in a SEPARATE pipeline_refined.gguf
   # specifically so that entry never has to change for non-refined users.
-  "refined|decoder_hand.onnx|97360225|62dd39a0b0f1a81e0b33044f8efa82c68d23cdc09f31e24ce1d395d6e3949a1c"
-  "refined|decoder_handbox_fp32.onnx|184047928|9d661bf9885580c3c71dcc9dcbe89ec96dfc47f0796289c0d92bd4caa47494c7"
-  "refined|decoder_prompted.onnx|92124099|0a8059084a3f849d1b96915bc8116dcc1b1ce43a3d11ccf8a8c1d6492f2a4597"
+  #
+  # The 28 decoder_* ONNX graphs are the iterative per-layer exports driven
+  # by the C++ pass-1/pass-2/hand-crop refinement loops (9 decoder_hand,
+  # 9 decoder_prompted, 10 decoder_pass1 incl. the hand-box head) — the
+  # earlier single-shot decoder_hand.onnx / decoder_prompted.onnx /
+  # decoder_handbox_fp32.onnx are no longer loaded and were removed from
+  # this manifest.
+  "refined|decoder_hand_pre.onnx|22468206|c1fd55aca1f81d2fd49cc62404bf1f8c0915bc5f6339b32823a05dbdbd0a7383"
+  "refined|decoder_hand_layer0.onnx|26313271|96158003c438be953e09fb72c8657069fd32a5f893efba1113a47a5a7d84a938"
+  "refined|decoder_hand_layer1.onnx|26313271|cdd05ce2116ae2711b9f02f78a2cdb4c32dfa5a1456c3f9f3c1726b63e041336"
+  "refined|decoder_hand_layer2.onnx|26313271|c5ddf7c21bfd4125820158ad99d41b00fa4df2f59a0502f178bf66e545f46f11"
+  "refined|decoder_hand_layer3.onnx|26313271|a59d0bca06f96921af5175058f078809b197ee4680fb0a592c89ea099df76181"
+  "refined|decoder_hand_layer4.onnx|26313271|d6761be5667baaf8d82d0e8a0ebe137b6829a8093e1499a7462f51dd254adfd5"
+  "refined|decoder_hand_layer5.onnx|26313271|55ca5380f57cac98b5d1761fc19eaa3967c62f74d54b381ef6379f306130acbf"
+  "refined|decoder_hand_normfinal.onnx|8739|5cc6b57b5ba06ddddd208620f0ed6715376615e22fe67db7b60acd8a17856529"
+  "refined|decoder_hand_update.onnx|13700938|8e45a18bb37b93506ec2664552f4d04f251a9177a6c2c928b31fa9c12fb9e7cf"
+  "refined|decoder_prompted_pre.onnx|22839099|feb0ff78efcf2b99b2fd17cc39d6f060d059ce43e03c6c03e5e228466418384e"
+  "refined|decoder_prompted_layer0.onnx|26313271|f63530c8efcca70872fcc8f086b9e3af202c29f7978052d1ebc82976cbec31ed"
+  "refined|decoder_prompted_layer1.onnx|26313271|e4d8de10105d024aefd176e0e176b3cf344dc5fc99b82fa311889671314c4c3d"
+  "refined|decoder_prompted_layer2.onnx|26313271|b1b153db078c35352252093ad0616672d3fa5d1698b0aab28df485ce87d36a67"
+  "refined|decoder_prompted_layer3.onnx|26313271|63d1b61ed26485c5f6689ca0f1ba8a28ce37c8ac0f58a7a9944fa5e686c715ae"
+  "refined|decoder_prompted_layer4.onnx|26313271|33fd82d4b6bc4ca911ad9b1e278750885f05cb2a1a07fde571c2f1b7ad621f1d"
+  "refined|decoder_prompted_layer5.onnx|26313271|5d756b0dc7328cc42d727e4b40b735f7c74c831dce72f461594f3c5e8898cff5"
+  "refined|decoder_prompted_normfinal.onnx|8739|9464b34a1c2018194415fcd3799c21ed14d9ce9900fcb0124b24fcce912f95ba"
+  "refined|decoder_prompted_update.onnx|13700977|c0332d2bf148a339acc401ce1c87aff9235362472234a951b94e3655e9bd681b"
+  "refined|decoder_pass1_pre.onnx|22468556|6bfec00c648fd0a52e09987995140b7f9b09fbd68922eccd8f54dec759644bf4"
+  "refined|decoder_pass1_layer0.onnx|26313271|15228ab564fecb288f4724da79c29847972c48ac78e8e08aa97b9e891d1edd97"
+  "refined|decoder_pass1_layer1.onnx|26313271|f0950409d012c4ff4d77a321bc5e59f1f06815c1e3b02e5d57fc3ba54e13f4ec"
+  "refined|decoder_pass1_layer2.onnx|26313271|e70e96579cf74687cc33973d8c3513ecf9befa03ac05f1e7ce54d1b72e1c7fe3"
+  "refined|decoder_pass1_layer3.onnx|26313271|24e755a100c5f4ea3e480b75300eff3533bce8a0959dd5f9864f13145551f76d"
+  "refined|decoder_pass1_layer4.onnx|26313271|880d7bfd80f8292727c30a804283d17dab1edabd8d650394a81c39f80eb047d4"
+  "refined|decoder_pass1_layer5.onnx|26313271|2485df418ec1bb8cfff05e968405f1458718681b292c432b0d5e398ec1febcf5"
+  "refined|decoder_pass1_normfinal.onnx|8739|ba75620503fe950a2c85e4042183119e9ba9c6c3aa2565c46650dcf43f862515"
+  "refined|decoder_pass1_update.onnx|13700938|b0fa19f7455ac0b15630617ed608396d6c8995adb86c1da4e7efec8dedf53a7f"
+  "refined|decoder_pass1_handbox.onnx|8432332|f481ef0fdbc1f0b2da44b197ebbdb746739a64cd998b97cca3a59786e0a60924"
   "refined|pipeline_refined.gguf|14764576|88ec6f7bdbf8519f5016c87cbb9c72b4db50e0ea2d71f298593f00a8999b9951"
 )
 
