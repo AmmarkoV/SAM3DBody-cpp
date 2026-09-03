@@ -2139,6 +2139,17 @@ struct Pipeline::Impl
                 std::memcpy(r.pred_cam_raw.data(),  p2_cam.data(), 3*sizeof(float));
                 float p2_global_rot_euler[3];
                 rot6d_to_euler(p2, p2_global_rot_euler);
+                // Snapshot pass-1's own body_pose/global_rot before they get overwritten
+                // below, for the wrist-IK "zero rotation" FK reference -- see POSEREFINE.md
+                // "design a robust fusion formula": pass-1's simpler single-shot decode is
+                // used here instead of pass-2's, since the fusion's zero_rot_R is a DEEP
+                // chain-composed rotation (root..lowarm, 6-7 joints) where pass-2's own
+                // residual per-joint error compounds multiplicatively into a much larger
+                // final error than any single joint's own precision would suggest.
+                std::array<float,133> pass1_body_euler_snapshot;
+                std::copy(r.body_pose.begin(), r.body_pose.end(), pass1_body_euler_snapshot.begin());
+                // r.global_rot is stored [rz,ry,rx]; build_model_params wants [rx,ry,rz].
+                float pass1_global_rot_rxryrz[3] = { r.global_rot[2], r.global_rot[1], r.global_rot[0] };
                 printf("[FSB]   pass1v2dbg person=%d pass1_global_rot=(%.3f,%.3f,%.3f) "
                        "pass2_global_rot=(%.3f,%.3f,%.3f) pass1_cam_t=(%.3f,%.3f,%.3f) "
                        "pass2_cam=(s=%.3f,tx=%.3f,ty=%.3f)\n",
@@ -2199,13 +2210,42 @@ struct Pipeline::Impl
                 // ── wrist-IK fusion (only for hands that passed the gate) ──────────
                 if (right_valid || left_valid)
                 {
-                    ModelParams204 mp2 = build_model_params(p2_global_rot_euler, p2_body_euler.data(), nullptr, true);
+                    // Build the "zero rotation" FK reference from pass-1's own body pose,
+                    // not pass-2's (see POSEREFINE.md "design a robust fusion formula").
+                    // zero_rot_R is a deep chain-composed rotation (root..lowarm, 6-7
+                    // joints) where residual per-joint decode error compounds
+                    // multiplicatively; empirically confirmed pass-1's body pose gives a
+                    // meaningfully smaller error here than pass-2's (117deg -> 83deg on
+                    // the zero_rot_R matrix itself, 67deg -> 44.5deg on the final spliced
+                    // wrist angle, for the test case this was diagnosed against) — a real,
+                    // measured improvement, not a full fix (the underlying chain-compounding
+                    // sensitivity remains). Set FSB_ZERO_ROT_PASS2 to revert to the
+                    // (worse) pass-2-based reference for comparison/debugging.
+                    bool use_pass1_for_zero_rot = getenv("FSB_ZERO_ROT_PASS2") == nullptr;
+                    ModelParams204 mp2 = use_pass1_for_zero_rot
+                        ? build_model_params(pass1_global_rot_rxryrz, pass1_body_euler_snapshot.data(), nullptr, true)
+                        : build_model_params(p2_global_rot_euler, p2_body_euler.data(), nullptr, true);
                     // hand/scale not needed for FK (arms only), zero_face/zero-shape are fine —
                     // only joint rotations are used, not vertices.
                     std::vector<float> zshape((size_t)lbs_data->n_shape_pc, 0.f);
                     // DIAGNOSTIC: test whether using the REAL (non-zero) shape changes the
                     // FK's joint rotations -- see POSEREFINE.md wrist-IK bug hunt.
                     const float* shape_for_q2 = getenv("FSB_Q2_REAL_SHAPE") ? r.shape.data() : zshape.data();
+                    // DIAGNOSTIC: Python's real reference FK for this step uses the ACTUAL
+                    // decoded hand pose from both hand crops (updated_hand_pose, built
+                    // UNCONDITIONALLY regardless of gate validity), not zeroed hand joints.
+                    // Test whether applying that here changes lowarm_R.
+                    if (getenv("FSB_Q2_REAL_HAND") && left_h >= 0 && right_h >= 0)
+                    {
+                        std::array<float,108> updated_hand_pose_test{};
+                        std::copy(hfk[left_h].hand108.begin(), hfk[left_h].hand108.begin()+54,
+                                  updated_hand_pose_test.begin());
+                        std::copy(hfk[right_h].hand108.begin()+54, hfk[right_h].hand108.begin()+108,
+                                  updated_hand_pose_test.begin()+54);
+                        apply_hand_pose(mp2.data, updated_hand_pose_test.data(),
+                                         lbs_data->hand_pose_mean, lbs_data->hand_pose_comps,
+                                         lbs_data->hand_joint_idxs_left, lbs_data->hand_joint_idxs_right);
+                    }
                     std::vector<float> v2((size_t)lbs_data->n_verts*3), j2((size_t)lbs_data->n_joints*3),
                                        q2((size_t)lbs_data->n_joints*4);
                     if (mhr_lbs_compute(lbs_data, mp2.data, shape_for_q2, zero_face72,
@@ -2222,6 +2262,17 @@ struct Pipeline::Impl
                             float lowarm_R[9]; quat_to_mat3(q2.data() + lowarm_j*4, lowarm_R);
                             float pre_R[9];    quat_to_mat3(lbs_data->joint_prerotations + wristtwist_j*4, pre_R);
                             float zero_rot_R[9]; mat3_mul(lowarm_R, pre_R, zero_rot_R);
+
+                            // Attempted robust correction (see POSEREFINE.md "design a
+                            // robust fusion formula"): rotate zero_rot_R's forearm axis
+                            // (empirically its local +Z / 3rd column) to match the
+                            // keypoint-derived elbow->wrist direction. Implemented and
+                            // tested empirically against Python's real captured values —
+                            // did NOT give a clear, consistent improvement (helped the
+                            // pass-2-based zero_rot_R case, made the pass-1-based case
+                            // slightly worse) — removed rather than shipped unvalidated.
+                            // mat3_rotate_a_to_b() is kept in preprocess.hpp in case this
+                            // is revisited with a better-motivated correction.
 
                             float pred_global_R[9]; quat_to_mat3(hfk[h].wrist_quat.data(), pred_global_R);
 

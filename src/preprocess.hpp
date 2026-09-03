@@ -435,6 +435,42 @@ inline void mat3_transpose(const float A[9], float At[9])
             At[c*3+r] = A[r*3+c];
 }
 
+// Minimal rotation matrix R such that R @ a = b, for unit vectors a, b
+// (Rodrigues' rotation formula about axis = normalize(cross(a,b))). Used by
+// the robust wrist-IK fusion (see POSEREFINE.md "design a robust fusion
+// formula") to correct an FK-chain-derived rest-pose frame's forearm axis
+// to match the keypoint-derived elbow->wrist direction, without disturbing
+// the frame's twist/roll about that axis.
+inline void mat3_rotate_a_to_b(const float a[3], const float b[3], float R[9])
+{
+    float cx = a[1]*b[2]-a[2]*b[1], cy = a[2]*b[0]-a[0]*b[2], cz = a[0]*b[1]-a[1]*b[0];
+    float s = std::sqrt(cx*cx+cy*cy+cz*cz);
+    float c = a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+    if (s < 1e-8f)
+    {
+        // a and b are (anti)parallel; identity if aligned, else any 180-deg
+        // rotation about a perpendicular axis. Aligned case is by far the
+        // common one here (correction is a small nudge), so just handle that.
+        if (c > 0.f) { R[0]=1;R[1]=0;R[2]=0; R[3]=0;R[4]=1;R[5]=0; R[6]=0;R[7]=0;R[8]=1; return; }
+        // Fallback for the (rare, degenerate) anti-parallel case: pick any
+        // perpendicular axis and rotate 180 degrees about it.
+        float perp[3] = { std::fabs(a[0])<0.9f ? 1.f:0.f, std::fabs(a[0])<0.9f ? 0.f:1.f, 0.f };
+        float ax = a[1]*perp[2]-a[2]*perp[1], ay = a[2]*perp[0]-a[0]*perp[2], az = a[0]*perp[1]-a[1]*perp[0];
+        float an = std::sqrt(ax*ax+ay*ay+az*az) + 1e-8f;
+        ax/=an; ay/=an; az/=an;
+        R[0]=2*ax*ax-1; R[1]=2*ax*ay;   R[2]=2*ax*az;
+        R[3]=2*ax*ay;   R[4]=2*ay*ay-1; R[5]=2*ay*az;
+        R[6]=2*ax*az;   R[7]=2*ay*az;   R[8]=2*az*az-1;
+        return;
+    }
+    float kx=cx/s, ky=cy/s, kz=cz/s;              // rotation axis, unit
+    float ang = std::atan2(s, c);
+    float ca = std::cos(ang), sa = std::sin(ang), t = 1.f-ca;
+    R[0]=t*kx*kx+ca;    R[1]=t*kx*ky-sa*kz; R[2]=t*kx*kz+sa*ky;
+    R[3]=t*kx*ky+sa*kz; R[4]=t*ky*ky+ca;    R[5]=t*ky*kz-sa*kx;
+    R[6]=t*kx*kz-sa*ky; R[7]=t*ky*kz+sa*kx; R[8]=t*kz*kz+ca;
+}
+
 // Geodesic angle between two rotation matrices (radians). Mirrors Python's
 // rotation_angle_difference: angle = acos((trace(A@B^T) - 1) / 2).
 inline float mat3_angle_diff(const float A[9], const float B[9])
