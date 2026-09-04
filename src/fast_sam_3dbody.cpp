@@ -251,7 +251,13 @@ struct OrtSession
                     OrtTensorRTProviderOptions tp{};
                     tp.device_id             = device;
                     tp.trt_fp16_enable       = fp16_io ? 1 : 0;
-                    tp.trt_max_workspace_size = (size_t)2 << 30;   // 2 GB build scratch
+                    // 2 GB build scratch was excessive for these small models (backbone
+                    // is <1 MB, YOLO <85 MB) and left no VRAM headroom on small GPUs
+                    // (e.g. 6 GB laptop cards): with up to 3 TRT sessions (backbone,
+                    // body, YOLO) each capped at 2 GB plus --refined-pose's ~27 extra
+                    // CUDA-EP decoder sessions, the CUDA arena ran out mid-inference
+                    // (bfc_arena.cc alloc failures on tiny buffers). 256 MB is ample.
+                    tp.trt_max_workspace_size = (size_t)256 << 20;
                     // The legacy options struct is zero-initialised, but TRT
                     // rejects 0 for these two (they must be positive) — set ORT's
                     // documented defaults explicitly to silence the warnings.
