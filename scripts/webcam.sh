@@ -9,8 +9,8 @@ source "$THISDIR/../tools/project_env.sh"
 source "$THISDIR/../tools/trt_env.sh"
 
 # All args are forwarded as-is to fast_sam_3dbody_render, e.g.:
-#   --color   tint each detected person with a distinct rainbow color in the
-#             3D mesh overlay, instead of the flat default color.
+#   --color R G B   tint every mesh in the 3D overlay with one RGB color
+#                   (0-255 each), e.g. --color 255 255 0 for yellow.
 
 ./build/fast_sam_3dbody_render --onnx-dir ./onnx --gguf ./onnx/pipeline.gguf --yolo ./onnx/yolo.onnx --mesh ./body_mesh.tri --lbs  onnx/body_model.lbs --from /dev/video0 $@  > /tmp/render_raw.txt 
 

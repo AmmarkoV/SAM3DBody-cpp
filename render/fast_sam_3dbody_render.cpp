@@ -5,15 +5,15 @@
 // Usage:
 //   fast_sam_3dbody_render --onnx-dir DIR --gguf pipeline.gguf
 //       --yolo yolo.onnx [--mesh body_mesh.tri] [--from 0|path]
-//       [--size W H] [--fps Z] [--mjpg] [--color] [--export-mesh PREFIX] [--export-mesh-stride N]
+//       [--size W H] [--fps Z] [--mjpg] [--color R G B] [--export-mesh PREFIX] [--export-mesh-stride N]
 //
 // --mjpg requests motion-JPEG from the webcam so UVC cameras can sustain higher
 //   fps at high resolution (uncompressed YUYV is USB-bandwidth limited); it also
 //   prints the fourcc/resolution/fps the driver actually negotiated.
 //
-// --color gives each detected person a distinct rainbow tint (golden-angle hue
-//   step) instead of the flat default mesh_color, so overlapping people in the
-//   overlay are easy to tell apart.
+// --color R G B (0-255 each) tints every mesh overlay with that one color,
+//   e.g. --color 255 255 0 for yellow. Same effect as --mesh-color R G B,
+//   which instead takes 0-1 floats.
 //
 // --export-mesh writes the deformed body mesh per frame as
 //   PREFIX_p<person>_<frame>.obj in world Y-up space with the pelvis at the BVH
@@ -48,7 +48,6 @@ extern "C" {
 #include <cstdio>
 #include <cstdlib>   // getenv (FSB_LBS_DUMP gate)
 #include <cstring>
-#include <cmath>     // fmod/fabs (--color palette)
 #include <string>
 #include <vector>
 #include <time.h>
@@ -594,26 +593,14 @@ static inline void apply_bw_bank(std::vector<ButterWorthWrap>& bank,
         data[i] = filter_wrap(&bank[i], data[i]);
 }
 
-// Distinct, saturated per-person tint for --color: golden-angle hue step keeps
-// consecutive person indices visually far apart instead of a linear ramp
-// clustering nearby hues together.
-static void person_palette_color(int person_idx, float rgb[3])
-{
-    const float golden_angle = 137.508f;
-    float h = std::fmod(person_idx * golden_angle, 360.0f);
-    const float s = 0.65f, v = 0.95f;
-    const float c = v * s;
-    const float x = c * (1.0f - std::fabs(std::fmod(h / 60.0f, 2.0f) - 1.0f));
-    const float m = v - c;
-    float r1, g1, b1;
-    if      (h <  60.f) { r1 = c;  g1 = x;  b1 = 0.f; }
-    else if (h < 120.f) { r1 = x;  g1 = c;  b1 = 0.f; }
-    else if (h < 180.f) { r1 = 0.f;g1 = c;  b1 = x;  }
-    else if (h < 240.f) { r1 = 0.f;g1 = x;  b1 = c;  }
-    else if (h < 300.f) { r1 = x;  g1 = 0.f;b1 = c;  }
-    else                { r1 = c;  g1 = 0.f;b1 = x;  }
-    rgb[0] = r1 + m; rgb[1] = g1 + m; rgb[2] = b1 + m;
-}
+// --mesh-color / --color feed straight into the uColor uniform, which the
+// shader multiplies by a [0.3,1.0] diffuse term (default.frag).  A channel
+// above 1.0 (e.g. a --mesh-color caller passing 0-255 by mistake) then stays
+// saturated across that whole diffuse range once the GPU clamps it on write,
+// so the mesh loses its shading gradient and, at low --transparency opacity,
+// reads as an almost invisible flat tint instead of a shaded body. Clamping
+// here keeps every caller in the [0,1] range the shader expects.
+static inline float clamp01(float v) { return v < 0.f ? 0.f : (v > 1.f ? 1.f : v); }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 
@@ -624,8 +611,7 @@ int main(int argc, const char** argv) {
     std::string mesh_path = "./body_mesh.tri";
     std::string vert_path = "render/default.vert";
     std::string frag_path = "render/default.frag";
-    float       mesh_color[3] = {0.65f, 0.75f, 0.9f};  // same for everyone for now
-    bool        colorize      = false;  // --color: distinct rainbow tint per detected person
+    float       mesh_color[3] = {0.65f, 0.75f, 0.9f};  // same for everyone for now; --color R G B (0-255) overrides
     float       shininess     = 0.0f;   // 0 = matte; --shiny turns on the chrome look
     float       transparency  = 0.7f;   // mesh opacity (--transparency)
     std::string lbs_path  = "";
@@ -707,8 +693,13 @@ int main(int argc, const char** argv) {
             continue;
         }
         if (!strcmp(argv[i], "--mesh-color") && i+3 < argc)
-            { mesh_color[0]=std::stof(argv[++i]); mesh_color[1]=std::stof(argv[++i]);
-              mesh_color[2]=std::stof(argv[++i]); continue; }
+            { mesh_color[0]=clamp01(std::stof(argv[++i])); mesh_color[1]=clamp01(std::stof(argv[++i]));
+              mesh_color[2]=clamp01(std::stof(argv[++i])); continue; }
+        // --color R G B: same uniform tint as --mesh-color, but in the more
+        // familiar 0-255 8-bit range, e.g. --color 255 255 0 for yellow.
+        if (!strcmp(argv[i], "--color") && i+3 < argc)
+            { mesh_color[0]=clamp01(std::stof(argv[++i])/255.0f); mesh_color[1]=clamp01(std::stof(argv[++i])/255.0f);
+              mesh_color[2]=clamp01(std::stof(argv[++i])/255.0f); continue; }
         if (!strcmp(argv[i], "--transparency") && i+1 < argc)
             { transparency = 1.0f - std::stof(argv[++i]); continue; }  // value is transparency; uAlpha is opacity
         // --shiny enables the reflective look at a default strength; an optional
@@ -726,7 +717,6 @@ int main(int argc, const char** argv) {
         if (!strcmp(argv[i], "--fps") && i+1 < argc)
             { cap_fps = std::stod(argv[++i]); continue; }
         if (!strcmp(argv[i], "--mjpg")) { use_mjpg = true; continue; }
-        if (!strcmp(argv[i], "--color")) { colorize = true; continue; }
         if (!strcmp(argv[i], "--dev-face"))    { zero_face      = false; continue; }
         if (!strcmp(argv[i], "--refined-pose")){ refined_pose   = true;  continue; }
         if (!strcmp(argv[i], "--butterworth"))              { use_butterworth  = true; continue; }
@@ -1189,16 +1179,10 @@ int main(int argc, const char** argv) {
             ++person_idx;   // counts every detection, so .obj indices are stable
             if (!lbs) continue;
 
-            // Mesh tint — uniform for the whole body.  --color assigns each
-            // detected person a distinct rainbow tint instead of the flat
-            // mesh_color, so overlapping people are easy to tell apart.
-            if (colorize) {
-                float tint[3];
-                person_palette_color(person_idx, tint);
-                glUniform3fv(color_loc, 1, tint);
-            } else {
-                glUniform3fv(color_loc, 1, mesh_color);
-            }
+            // Mesh tint — uniform for the whole body and every detected
+            // person; override with --color R G B (0-255) or --mesh-color
+            // R G B (0-1).
+            glUniform3fv(color_loc, 1, mesh_color);
 
             // Decode scale PCA into model_params[136:204] if available.
             // Python: scales = scale_mean + scale_params @ scale_comps  ([28]→[68])

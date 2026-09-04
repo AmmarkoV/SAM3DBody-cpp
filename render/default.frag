@@ -1,7 +1,7 @@
 #version 330 core
 in  vec3 vNorm;
 in  vec3 vViewNorm;
-uniform vec3      uColor;       // mesh tint (set per-person from the renderer)
+uniform vec3      uColor;       // mesh tint, 0-1 per channel (--mesh-color / --color)
 uniform sampler2D uScene;       // the background camera image
 uniform vec2      uResolution;  // viewport size, to map gl_FragCoord -> UV
 uniform float     uShiny;       // 0 = matte (original look), 1 = full chrome
@@ -29,6 +29,9 @@ void main() {
     float fres = pow(1.0 - clamp(abs(vn.z), 0.0, 1.0), 2.0);
     float k    = uShiny * mix(0.55, 1.0, fres);
 
-    vec3 col = mix(base, refl, k);
+    // Tint the reflection with uColor too (colored metal, not a plain
+    // mirror) so --color stays visible at every --shiny level instead of
+    // fading out to a neutral reflection as k -> 1.
+    vec3 col = mix(base, refl * uColor, k);
     fragColor = vec4(col, uAlpha);
 }
