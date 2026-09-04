@@ -51,6 +51,19 @@ Colormap cmap;
 static Atom wm_delete_window = 0;
 static volatile sig_atomic_t close_requested = 0;
 
+#define GLX3_DEFAULT_WINDOW_TITLE "SAM3DBody-cpp OpenGL3.x+ Visualization"
+static char window_title[256] = GLX3_DEFAULT_WINDOW_TITLE;
+
+void glx3_set_window_title(const char *title)
+{
+    if (title == 0 || title[0] == '\0')
+    {
+        snprintf(window_title, sizeof(window_title), "%s", GLX3_DEFAULT_WINDOW_TITLE);
+        return;
+    }
+    snprintf(window_title, sizeof(window_title), "%s", title);
+}
+
 
 #define NORMAL   "\033[0m"
 #define BLACK   "\033[30m"      /* Black */
@@ -254,7 +267,17 @@ int start_glx3_stuffWindowed(int WIDTH,int HEIGHT,int argc,const char **argv)
     // Done with the visual info data
     XFree( vi );
 
-    XStoreName( display, win, "SAM3DBody-cpp OpenGL3.x+ Visualization" );
+    XStoreName( display, win, window_title );
+
+    // Modern window managers (GNOME/KDE/etc.) prefer _NET_WM_NAME over the
+    // legacy WM_NAME set above, and expect it as UTF8_STRING.
+    Atom net_wm_name   = XInternAtom( display, "_NET_WM_NAME", False );
+    Atom utf8_string    = XInternAtom( display, "UTF8_STRING",  False );
+    if ( net_wm_name != None && utf8_string != None )
+        XChangeProperty( display, win, net_wm_name, utf8_string, 8,
+                          PropModeReplace,
+                          (const unsigned char *) window_title,
+                          (int) strlen(window_title) );
 
     /* Subscribe to WM_DELETE_WINDOW so the close button delivers a
      * ClientMessage we can intercept instead of having the WM cut our X

@@ -9,6 +9,14 @@
 int disableVSync();
 
 /**
+* @brief Set the title to give the window the next time it is created.
+* Must be called before start_glx3_stuff(); passing NULL/empty resets to the
+* built-in default ("SAM3DBody-cpp OpenGL3.x+ Visualization").
+* @ingroup X11
+*/
+void glx3_set_window_title(const char *title);
+
+/**
 * @brief create a glx window that can serve OpenGL draw requests
 * @ingroup X11
 * @param width , The width of the window in pixels

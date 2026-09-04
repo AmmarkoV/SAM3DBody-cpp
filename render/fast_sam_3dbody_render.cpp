@@ -20,6 +20,9 @@
 //   root position, so the .obj and .bvh overlay 1:1 in Blender for armature
 //   verification (import both with default axis settings, no rotation needed).
 //
+// --title STR sets the GL window's title (WM_NAME / _NET_WM_NAME), e.g.
+//   --title "Camera 1". Defaults to "SAM3DBody-cpp OpenGL3.x+ Visualization".
+//
 // Controls: close the window to exit.
 
 // GLEW must come before any other GL header.
@@ -666,6 +669,7 @@ int main(int argc, const char** argv) {
                                // webcams sustain higher fps at high resolution)
     bool   no_drop    = false; // --no-drop: process every captured frame (lockstep),
                                // disabling the live-source stale-frame skipping
+    std::string window_title;  // --title: overrides the GL window's title
 
     // Common flags go through the shared parser; binary-specific flags
     // (--mesh, --lbs, --save-frames, --render-size, --size, --fps, --mjpg,
@@ -686,6 +690,7 @@ int main(int argc, const char** argv) {
         A1("--fx",          focal_x,            std::stof)
         A1("--fy",          focal_y,            std::stof)
         A1("--boxes",       boxes_path,         std::string)
+        A1("--title",       window_title,       std::string)
 #undef A1
         if (!strcmp(argv[i], "--export-mesh-stride") && i+1 < argc) {
             export_mesh_stride = std::stoi(argv[++i]);
@@ -891,6 +896,7 @@ int main(int argc, const char** argv) {
     //                pre-EGL way to get offscreen GL on Linux/X11 and the
     //                fixed-pipeline glReadPixels we use to save frames works
     //                identically on them.
+    if (!window_title.empty()) glx3_set_window_title(window_title.c_str());
     if (!start_glx3_stuff(W, H, headless ? 0 : 1, argc, argv)) {
         fprintf(stderr, "Failed to start GLX %s\n",
                 headless ? "Pbuffer" : "window"); return 1;
