@@ -74,6 +74,17 @@ void glx3_set_window_title(const char *title)
 #define GLX_CONTEXT_MINOR_VERSION_ARB       0x2092
 typedef GLXContext (*glXCreateContextAttribsARBProc)(Display*, GLXFBConfig, GLXContext, Bool, const int*);
 
+/* Swap-interval extensions (not part of the core GLX/glx.h headers we build
+ * against).  Three ways vendors expose "sync buffer swap to vblank",
+ * newest/most-capable first:
+ *   EXT_swap_control  — per-drawable, 0 disables, >=1 syncs (nvidia, mesa)
+ *   MESA_swap_control — like EXT but returns an int status
+ *   SGI_swap_control   — oldest, global rather than per-drawable
+ * We probe in that order and use whichever the server advertises. */
+typedef int (*glXSwapIntervalEXTProc)(Display*, GLXDrawable, int);
+typedef int (*glXSwapIntervalMESAProc)(unsigned int);
+typedef int (*glXSwapIntervalSGIProc)(int);
+
 
 
 void fatalErrorGLX3(char *message)
@@ -385,8 +396,50 @@ int start_glx3_stuffWindowed(int WIDTH,int HEIGHT,int argc,const char **argv)
     printf( "Making context current\n" );
     glXMakeCurrent( display, win, ctx );
 
-
-
+    /* Force buffer swaps to sync to vblank.  Without this the swap interval
+     * is whatever the driver/desktop defaults to (frequently *off* on plain
+     * X11 with no compositor) — glXSwapBuffers() can then flip mid-scanout,
+     * showing the top part of one frame and the bottom part of the next in
+     * the same displayed image.  On a live webcam feed with per-frame motion
+     * that reads as an occasional "corrupted"/half-updated frame, which is
+     * a display-timing artifact rather than a bad texture upload — the
+     * upload path (upload_bg_frame in fast_sam_3dbody_render.cpp) always
+     * writes a complete, validated frame before this draw, never a partial
+     * one. Request interval=1 (sync every vblank) via whichever extension
+     * the server advertises. */
+    if ( isExtensionSupported( glxExts, "GLX_EXT_swap_control" ) )
+    {
+        glXSwapIntervalEXTProc glXSwapIntervalEXT = (glXSwapIntervalEXTProc)
+            glXGetProcAddressARB( (const GLubyte *) "glXSwapIntervalEXT" );
+        if (glXSwapIntervalEXT) {
+            glXSwapIntervalEXT( display, win, 1 );
+            printf( "VSync enabled via GLX_EXT_swap_control\n" );
+        }
+    }
+    else if ( isExtensionSupported( glxExts, "GLX_MESA_swap_control" ) )
+    {
+        glXSwapIntervalMESAProc glXSwapIntervalMESA = (glXSwapIntervalMESAProc)
+            glXGetProcAddressARB( (const GLubyte *) "glXSwapIntervalMESA" );
+        if (glXSwapIntervalMESA) {
+            glXSwapIntervalMESA( 1 );
+            printf( "VSync enabled via GLX_MESA_swap_control\n" );
+        }
+    }
+    else if ( isExtensionSupported( glxExts, "GLX_SGI_swap_control" ) )
+    {
+        glXSwapIntervalSGIProc glXSwapIntervalSGI = (glXSwapIntervalSGIProc)
+            glXGetProcAddressARB( (const GLubyte *) "glXSwapIntervalSGI" );
+        if (glXSwapIntervalSGI) {
+            glXSwapIntervalSGI( 1 );
+            printf( "VSync enabled via GLX_SGI_swap_control\n" );
+        }
+    }
+    else
+    {
+        printf( "No GLX swap-control extension found — swap interval left at "
+                "driver default; tearing (a frame that looks half-updated) "
+                "is possible.\n" );
+    }
 
 // glClearColor( 0, 0.0, 0, 1 );
 // glClear( GL_COLOR_BUFFER_BIT );
