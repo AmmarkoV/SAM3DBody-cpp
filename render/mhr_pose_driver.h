@@ -10,6 +10,8 @@
 
 #include <string.h>  // memcpy
 #include <math.h>    // sqrtf
+#include <vector>
+#include <algorithm> // std::find
 #include "../GraphicsEngine/ModelLoader/model_loader_tri.h"
 
 // Total number of vertices and floats in the MHR body mesh.
@@ -107,6 +109,95 @@ static inline void mhr_update_mesh_normals(struct TRI_Model *model)
             n[i*3+0] = x / len;
             n[i*3+1] = y / len;
             n[i*3+2] = z / len;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MHR_VertexAdjacency / mhr_build_vertex_adjacency / mhr_smooth_mesh_normals
+//
+// The per-vertex normals from mhr_update_mesh_normals() are already a
+// correct area-weighted average of each vertex's OWN adjacent faces — but on
+// a body-sized mesh a cylindrical part (forearm, calf, thigh) only has ~12-18
+// sides around its circumference, so each ring of triangles still turns the
+// normal by a visible number of degrees from one triangle to the next.  The
+// eye reads that as "fluting": a series of parallel light/dark stripes
+// running down the limb, distinct from the earlier stale-pose banding bug.
+//
+// The standard fix (as used by e.g. MeshLab's "smooth vertex normals") is to
+// widen the averaging beyond one vertex's immediate faces to its 1-ring
+// topological neighbours, blurring the normal field just enough to hide the
+// facets while a genuinely low-poly silhouette/outline is untouched (only
+// normals are smoothed, not positions).  The mesh topology (indices) never
+// changes frame to frame, so the adjacency list is built ONCE at load time;
+// only the O(edges) averaging pass repeats per frame (~110K int/float ops
+// for 2 iterations over this mesh — negligible next to inference cost).
+// ---------------------------------------------------------------------------
+struct MHR_VertexAdjacency
+{
+    std::vector<unsigned int> offsets;    // size numVerts+1
+    std::vector<unsigned int> neighbors;  // size offsets[numVerts]
+};
+
+static inline void mhr_build_vertex_adjacency(const struct TRI_Model *model,
+                                               MHR_VertexAdjacency     &adj)
+{
+    const unsigned int numVerts = model->header.numberOfVertices / 3;
+    const unsigned int numTris  = model->header.numberOfIndices / 3;
+
+    std::vector<std::vector<unsigned int>> tmp(numVerts);
+    auto addEdge = [&](unsigned int a, unsigned int b) {
+        std::vector<unsigned int> &v = tmp[a];
+        if (std::find(v.begin(), v.end(), b) == v.end()) v.push_back(b);
+    };
+    for (unsigned int t = 0; t < numTris; ++t)
+    {
+        unsigned int i0 = model->indices[t*3+0];
+        unsigned int i1 = model->indices[t*3+1];
+        unsigned int i2 = model->indices[t*3+2];
+        addEdge(i0, i1); addEdge(i1, i0);
+        addEdge(i1, i2); addEdge(i2, i1);
+        addEdge(i2, i0); addEdge(i0, i2);
+    }
+
+    adj.offsets.assign(numVerts + 1, 0);
+    unsigned int total = 0;
+    for (unsigned int v = 0; v < numVerts; ++v) { adj.offsets[v] = total; total += (unsigned int)tmp[v].size(); }
+    adj.offsets[numVerts] = total;
+
+    adj.neighbors.resize(total);
+    for (unsigned int v = 0; v < numVerts; ++v)
+        std::copy(tmp[v].begin(), tmp[v].end(), adj.neighbors.begin() + adj.offsets[v]);
+}
+
+static inline void mhr_smooth_mesh_normals(struct TRI_Model           *model,
+                                            const MHR_VertexAdjacency  &adj,
+                                            std::vector<float>         &scratch,
+                                            int                         iterations)
+{
+    const unsigned int numVerts = model->header.numberOfVertices / 3;
+    scratch.resize((size_t)numVerts * 3);
+    float *n = model->normal;
+
+    for (int it = 0; it < iterations; ++it)
+    {
+        memcpy(scratch.data(), n, (size_t)numVerts * 3 * sizeof(float));
+        for (unsigned int v = 0; v < numVerts; ++v)
+        {
+            unsigned int b = adj.offsets[v], e = adj.offsets[v+1];
+            float sx = scratch[v*3+0], sy = scratch[v*3+1], sz = scratch[v*3+2];
+            for (unsigned int k = b; k < e; ++k)
+            {
+                unsigned int nb = adj.neighbors[k];
+                sx += scratch[nb*3+0]; sy += scratch[nb*3+1]; sz += scratch[nb*3+2];
+            }
+            float len = sqrtf(sx*sx + sy*sy + sz*sz);
+            if (len > 1e-12f)
+            {
+                n[v*3+0] = sx / len;
+                n[v*3+1] = sy / len;
+                n[v*3+2] = sz / len;
+            }
         }
     }
 }

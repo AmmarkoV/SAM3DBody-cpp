@@ -943,6 +943,15 @@ int main(int argc, const char** argv) {
            tri_model->header.numberOfVertices / 3,
            tri_model->header.numberOfIndices / 3);
 
+    // Topology (indices) never changes frame to frame, so the 1-ring vertex
+    // adjacency used to smooth away low-poly limb "fluting" is built once,
+    // here, rather than every frame — see mhr_smooth_mesh_normals.
+    MHR_VertexAdjacency vert_adj;
+    mhr_build_vertex_adjacency(tri_model, vert_adj);
+    std::vector<float> normal_smooth_scratch;
+    int normal_smooth_iters = 2;
+    if (const char* e = getenv("FSB_NORMAL_SMOOTH_ITERS")) normal_smooth_iters = atoi(e);
+
     MeshGPU mesh_gpu = upload_mesh_once(tri_model);
 
     if (!export_mesh_prefix.empty())
@@ -1274,6 +1283,8 @@ int main(int argc, const char** argv) {
             }
             mhr_update_mesh_vertices(tri_model, lbs_out.data());
             mhr_update_mesh_normals(tri_model);
+            if (normal_smooth_iters > 0)
+                mhr_smooth_mesh_normals(tri_model, vert_adj, normal_smooth_scratch, normal_smooth_iters);
 
             // Export the deformed mesh (Blender-importable) for offline checking
             // of the BVH armature.  Same space/units the BVH writer uses, so the
@@ -1397,9 +1408,24 @@ int main(int argc, const char** argv) {
             glUniformMatrix4fv(mvp_loc, 1, GL_FALSE, mvp);
             glUniformMatrix4fv(view_loc, 1, GL_FALSE, view);
 
+            // Back-face culling matters here specifically because the mesh is
+            // drawn translucent (GL_BLEND, uAlpha<1) with no back-to-front
+            // sort: without it, both the near and far side of the same body
+            // part (or two self-occluding folds) are rasterized as separate
+            // fragments and blended one after another, so anywhere the
+            // viewing ray sees "through" one layer of the mesh to a second
+            // one, that pixel gets alpha-blended TWICE and reads visibly
+            // different from single-layer coverage next to it — a crease-
+            // shaped double-blend seam that tracks self-occlusion contours,
+            // not lighting.  Culling back faces leaves only the single
+            // nearest surface per pixel, removing the double-blend outright
+            // (and is cheaper, since half the fragments are never shaded).
+            glEnable(GL_CULL_FACE);
+            glCullFace(GL_BACK);
             glBindVertexArray(mesh_gpu.vao);
             glDrawElements(GL_TRIANGLES, mesh_gpu.n_indices,
                            GL_UNSIGNED_INT, nullptr);
+            glDisable(GL_CULL_FACE);
             GLenum err = glGetError();
             if (err != GL_NO_ERROR)
                 fprintf(stderr, "[GL] error 0x%04X after draw\n", err);
