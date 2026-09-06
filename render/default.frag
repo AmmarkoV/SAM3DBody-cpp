@@ -11,7 +11,21 @@ out vec4 fragColor;
 void main() {
     vec3  N = normalize(vNorm);
     vec3  L = normalize(vec3(0.3, 0.8, 0.5));
-    float d = clamp(dot(N, L), 0.0, 1.0) * 0.7 + 0.3;
+
+    // Half-Lambert / wrap lighting instead of a hard clamp(dot(N,L),0,1).
+    // The mesh only carries per-vertex normals, linearly interpolated per
+    // pixel, so the geometric facets between triangles are real (dihedral
+    // angles of 10-20+ degrees are common on a body-sized mesh).  A hard
+    // N·L=0 terminator plus that faceted normal field is exactly what makes
+    // individual triangles pop as visibly different shades ("Mach banding").
+    // Wrapping the light around the surface and smoothing the ramp removes
+    // the slope discontinuity at the terminator, which is what the eye
+    // actually keys on — same cost as the old formula, just different math.
+    float ndotl = dot(N, L);
+    float wrap  = 0.15;
+    float d = clamp((ndotl + wrap) / (1.0 + wrap), 0.0, 1.0);
+    d = d * d * (3.0 - 2.0 * d);   // smoothstep ease, kills the remaining clamp kinks
+    d = d * 0.65 + 0.35;           // same overall range as the old 0.3..1.0 ramp
     vec3  base = uColor * d;
 
     // ── Screen-space pseudo-reflection ("Silicon Dreams" chrome) ─────────────
@@ -33,5 +47,12 @@ void main() {
     // mirror) so --color stays visible at every --shiny level instead of
     // fading out to a neutral reflection as k -> 1.
     vec3 col = mix(base, refl * uColor, k);
+
+    // Cheap ordered dither (one hash, a couple ALU ops) to break up the
+    // 8-bit quantization bands that a smooth shading gradient otherwise
+    // shows on a fixed-function framebuffer with no MSAA/sRGB.
+    float dither = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
+    col += (dither - 0.5) / 255.0;
+
     fragColor = vec4(col, uAlpha);
 }
