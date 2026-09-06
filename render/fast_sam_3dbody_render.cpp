@@ -151,12 +151,14 @@ static MeshGPU upload_mesh_once(const struct TRI_Model* m)
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
 
-    // Normals — STATIC (T-pose normals are good enough for an overlay)
+    // Normals — DYNAMIC (recomputed from the posed vertices every frame by
+    // mhr_update_mesh_normals; stale T-pose normals made limbs shade wrong
+    // as soon as they rotated away from rest pose — see mhr_pose_driver.h)
     glGenBuffers(1, &g.vbo_norm);
     glBindBuffer(GL_ARRAY_BUFFER, g.vbo_norm);
     glBufferData(GL_ARRAY_BUFFER,
                  (GLsizeiptr)(m->header.numberOfNormals * sizeof(float)),
-                 m->normal, GL_STATIC_DRAW);
+                 m->normal, GL_DYNAMIC_DRAW);
     glEnableVertexAttribArray(1);
     glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
 
@@ -1271,6 +1273,7 @@ int main(int argc, const char** argv) {
                 }
             }
             mhr_update_mesh_vertices(tri_model, lbs_out.data());
+            mhr_update_mesh_normals(tri_model);
 
             // Export the deformed mesh (Blender-importable) for offline checking
             // of the BVH armature.  Same space/units the BVH writer uses, so the
@@ -1329,6 +1332,11 @@ int main(int argc, const char** argv) {
             glBufferSubData(GL_ARRAY_BUFFER, 0,
                             MHR_VERTEX_FLOATS * sizeof(float),
                             tri_model->vertices);
+
+            glBindBuffer(GL_ARRAY_BUFFER, mesh_gpu.vbo_norm);
+            glBufferSubData(GL_ARRAY_BUFFER, 0,
+                            MHR_VERTEX_FLOATS * sizeof(float),
+                            tri_model->normal);
 
             // Build MVP = projection * view
             float proj[16], view[16], mvp[16];
