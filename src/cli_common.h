@@ -84,6 +84,7 @@ struct CommonConfig
     int         cuda_device    = 0;       // -1 = CPU
     bool        use_trt        = false;
     bool        fp16           = true;    // can be disabled with --no-fp16
+    bool        ort_verbose    = false;   // --ort-verbose: print per-node EP assignment at session load
 
     // ── YOLO person detector tuning ──────────────────────────────────────────
     // The renderer doesn't use these (it inherits whatever the pipeline
@@ -181,6 +182,7 @@ inline bool parse_common_arg(int argc, const char* const* argv, int& i,
     CLI_INT ("--cuda",                 cuda_device)
     CLI_BOOL("--trt",                  use_trt, true)
     CLI_BOOL("--no-fp16",              fp16,    false)
+    CLI_BOOL("--ort-verbose",          ort_verbose, true)
 
     // Detector tuning.  --detector-threshold is the preferred, self-describing
     // spelling; --thresh is kept as a back-compat alias.  Both record that the
@@ -670,6 +672,7 @@ inline void apply_common_to_pipeline_cfg(const CommonConfig& c,
     pc.cuda_device    = c.cuda_device;
     pc.use_trt_ep     = c.use_trt;
     pc.use_fp16       = c.fp16;
+    pc.ort_verbose    = c.ort_verbose;
     pc.person_thresh  = c.person_thresh;
     pc.person_nms_iou = c.person_nms_iou;
     pc.max_persons    = c.max_persons;
@@ -705,6 +708,9 @@ inline void print_common_args_help(FILE* fp)
         "  --cuda     N                   CUDA device (-1 = CPU; default 0)\n"
         "  --trt                          Use ONNX Runtime TensorRT EP\n"
         "  --no-fp16                      Disable FP16\n"
+        "  --ort-verbose                  Print ORT's per-node execution-provider assignment table at\n"
+        "                                 session load (shows which ops got pinned to the CPU EP and are\n"
+        "                                 forcing Memcpy nodes at CUDA/TensorRT graph boundaries)\n"
         "  --detector-threshold F         Person confidence threshold (default 0.50; 0.25 for libreyolo,\n"
         "                                 whose tiny model scores people lower).  Alias: --thresh\n"
         "  --nms      F                   Detector NMS IoU (default 0.45)\n"

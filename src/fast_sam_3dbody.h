@@ -105,6 +105,12 @@ struct PipelineConfig {
     int  cuda_device    = 0;        // CUDA device (-1 = CPU only)
     bool use_trt_ep     = false;    // Enable ONNX Runtime TensorRT EP (requires TRT install)
     bool use_fp16       = true;     // FP16 for ONNX EP
+    // Raise the ORT Env's log severity to VERBOSE (--ort-verbose). Prints the
+    // per-node EP assignment table at session-load time ("Rerunning with
+    // verbose output on a non-minimal build will show node assignments" —
+    // exactly that rerun), so you can see which ops got pinned to the CPU EP
+    // and are forcing the Memcpy nodes at CUDA/TensorRT graph boundaries.
+    bool ort_verbose    = false;
 
     // Inference options
     bool skip_body_model = false;   // Skip body model – no vertices/keypoints (faster)

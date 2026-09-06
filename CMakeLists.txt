@@ -20,6 +20,24 @@ else()
     set(RT_LIB   rt)
 endif()
 
+# RobustCapture (src/v4l2_capture.cpp) uses raw V4L2 (linux/videodev2.h) to
+# re-grab webcam frames the kernel flags as incomplete/corrupt, instead of
+# handing back the torn image cv::VideoCapture's V4L2 backend would return.
+# That header only exists on Linux, so probe for it explicitly rather than
+# just relying on the outer NOT WIN32 guard (BSD/macOS are NOT WIN32 either
+# but have no V4L2). When it's missing, FSB_HAVE_V4L2 is left undefined and
+# src/v4l2_capture.cpp compiles to a thin pass-through to cv::VideoCapture —
+# same public API, old behavior.
+include(CheckIncludeFileCXX)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    check_include_file_cxx("linux/videodev2.h" SAM3D_HAVE_V4L2_HEADER)
+endif()
+if(SAM3D_HAVE_V4L2_HEADER)
+    message(STATUS "RobustCapture: raw V4L2 webcam capture enabled (FSB_HAVE_V4L2)")
+else()
+    message(STATUS "RobustCapture: linux/videodev2.h not found — falling back to plain cv::VideoCapture")
+endif()
+
 # ---------------------------------------------------------------------------
 # Model files check
 # ---------------------------------------------------------------------------
@@ -380,12 +398,16 @@ if(NOT WIN32)
 
     add_executable(fast_sam_3dbody_render
         render/fast_sam_3dbody_render.cpp
+        src/v4l2_capture.cpp
         ${GRAPHICS_ENGINE_DIR}/System/glx3.c
         ${GRAPHICS_ENGINE_DIR}/ModelLoader/model_loader_tri.c
         ${GRAPHICS_ENGINE_DIR}/ModelLoader/model_loader_transform_joints.c
     )
 
     target_compile_definitions(fast_sam_3dbody_render PRIVATE USE_GLEW)
+    if(SAM3D_HAVE_V4L2_HEADER)
+        target_compile_definitions(fast_sam_3dbody_render PRIVATE FSB_HAVE_V4L2)
+    endif()
 
     target_include_directories(fast_sam_3dbody_render PRIVATE
         src

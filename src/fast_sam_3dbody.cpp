@@ -205,6 +205,12 @@ static std::vector<float> cffn_run(const CFFN& ffn, const float* x, int B)
     return y;
 }
 
+// --ort-verbose: set once by Pipeline::Impl::load() before any OrtSession::load()
+// call below it. A per-session Ort::SessionOptions::SetLogSeverityLevel() is what
+// actually turns on ORT's per-node EP-assignment listing — Ort::Env's own default
+// severity (see UpdateEnvWithCustomLogLevel() above) is not enough on its own.
+static bool g_ort_verbose = false;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ONNX Runtime session wrapper
 // ─────────────────────────────────────────────────────────────────────────────
@@ -215,6 +221,9 @@ struct OrtSession
     Ort::MemoryInfo       mem_info{ nullptr };
     std::vector<std::string>       input_names_s,  output_names_s;
     std::vector<const char*>       input_names,    output_names;
+    // Set when g_ort_verbose enabled ORT's built-in profiler for this session
+    // (see load() below); free() then flushes it to disk and prints the path.
+    bool                  profiling_enabled = false;
 
     bool load(Ort::Env& e, const std::string& path, bool cuda, int device,
               bool fp16_io = false, bool trt_ep = false)
@@ -243,6 +252,22 @@ struct OrtSession
             Ort::SessionOptions opts;
             opts.SetIntraOpNumThreads(1);
             opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+            if (g_ort_verbose)
+            {
+                opts.SetLogSeverityLevel(ORT_LOGGING_LEVEL_VERBOSE);
+                // The prebuilt onnxruntime-gpu release strips the per-node EP
+                // assignment listing that ORT's own log message advertises
+                // ("Rerunning with verbose output ... will show node
+                // assignments") — SetLogSeverityLevel above has no visible
+                // effect on it. ORT's built-in chrome-trace profiler is NOT
+                // gated the same way, so use that instead: it dumps every op
+                // with its execution provider and per-call duration, which is
+                // strictly more actionable than a static assignment list.
+                std::string prefix = "/tmp/ort_profile_" +
+                    std::filesystem::path(path).stem().string() + "_";
+                opts.EnableProfiling(prefix.c_str());
+                profiling_enabled = true;
+            }
             try
             {
                 if (ep == EP_TRT)
@@ -354,6 +379,12 @@ struct OrtSession
 
     void free()
     {
+        if (profiling_enabled && session)
+        {
+            Ort::AllocatorWithDefaultOptions alloc;
+            auto prof_file = session->EndProfilingAllocated(alloc);
+            fprintf(stderr, "[ORT] profile written: %s\n", prof_file.get());
+        }
         delete session;
         session = nullptr;
     }
@@ -448,6 +479,18 @@ struct Pipeline::Impl
     bool load(const PipelineConfig& c)
     {
         cfg = c;
+
+        // --ort-verbose: raise both the Env's default log severity and the
+        // per-session severity (g_ort_verbose, read by OrtSession::load() below)
+        // so session creation prints ORT's per-node EP assignment table
+        // ("Rerunning with verbose output on a non-minimal build will show node
+        // assignments" — this is that rerun). Must happen before any
+        // OrtSession::load() call below.
+        if (cfg.ort_verbose)
+        {
+            ort_env.UpdateEnvWithCustomLogLevel(ORT_LOGGING_LEVEL_VERBOSE);
+            g_ort_verbose = true;
+        }
 
         bool cuda = cfg.cuda_device >= 0;
         int  dev  = cfg.cuda_device;

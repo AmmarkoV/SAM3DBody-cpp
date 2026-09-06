@@ -93,6 +93,8 @@ static void print_usage(const char* prog)
     printf("  --cuda DEVICE     CUDA device index (default 0; -1 = CPU)\n");
     printf("  --trt             Enable ONNX Runtime TensorRT EP\n");
     printf("  --no-fp16         Disable FP16 for ONNX EP\n");
+    printf("  --ort-verbose     Print ORT's per-node EP assignment + a chrome-trace profile per\n");
+    printf("                    session to /tmp/ort_profile_<model>_*.json (open in chrome://tracing)\n");
     printf("  --skip-body       Skip body model (no vertices / keypoints)\n");
     printf("  --dev-face        Enable face expression params (disabled by default)\n");
     printf("  --detector-threshold F  Person confidence (default 0.50; 0.25 for libreyolo). Alias: --thresh\n");

@@ -103,6 +103,8 @@ static void print_usage(const char* prog)
         "  --cuda     N               CUDA device index, -1 for CPU (default 0)\n"
         "  --trt                      Use ONNX Runtime TensorRT EP\n"
         "  --no-fp16                  Disable FP16\n"
+        "  --ort-verbose              Print ORT's per-node EP assignment + a chrome-trace profile per\n"
+        "                             session to /tmp/ort_profile_<model>_*.json (open in chrome://tracing)\n"
         "  --detector-threshold F     Person confidence (default 0.50; 0.25 for libreyolo). Alias: --thresh\n"
         "  --nms      F               Detector NMS IoU (default 0.45)\n"
         "  --max-persons N            Cap to top-N most-confident people (0 = unlimited)\n"

@@ -47,6 +47,7 @@ extern "C" {
 #include <opencv2/videoio.hpp>
 
 #include "../src/bvh_writer.h"
+#include "../src/v4l2_capture.h"
 
 #include <cstdio>
 #include <cstdlib>   // getenv (FSB_LBS_DUMP gate)
@@ -777,6 +778,7 @@ int main(int argc, const char** argv) {
         cfg.cuda_device     = cuda_device;
         cfg.use_trt_ep      = use_trt;
         cfg.use_fp16        = fp16;
+        cfg.ort_verbose     = cc.ort_verbose;      // --ort-verbose
         cfg.max_persons     = max_persons;
         cfg.detector        = detector;
         cfg.person_thresh   = cc.person_thresh;   // honour --detector-threshold / per-detector default
@@ -822,7 +824,11 @@ int main(int argc, const char** argv) {
     bool is_live  = false;       // webcam / live device → drop stale frames to stay in sync
     const int LIVE_BUFFER = 3;   // driver ring-buffer depth requested for live sources
     cv::Mat static_img;
-    cv::VideoCapture cap;
+    // RobustCapture only changes behavior for real /dev/video* devices or a
+    // numeric webcam index (raw V4L2, re-grabbing frames the kernel flagged
+    // V4L2_BUF_FLAG_ERROR instead of handing back torn/half-updated pixels);
+    // video files and images fall straight through to cv::VideoCapture.
+    RobustCapture cap;
     {
         bool numeric = !src.empty() &&
                        (src[0]=='-' || isdigit((unsigned char)src[0]));
