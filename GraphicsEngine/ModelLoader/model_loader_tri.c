@@ -604,7 +604,7 @@ int tri_loadModel(const char * filename , struct TRI_Model * triModel)
         unsigned int itemSize=0 , count=0;
 
         n = fread(&triModel->header , sizeof(struct TRI_Header), 1 , fd);
-        if (n!= sizeof(struct TRI_Header)) { fprintf(stderr,"Incomplete read of TRI Header\n"); }
+        if (n!=1) { fprintf(stderr,"Incomplete read of TRI Header\n"); }
 
         if (triModel->header.floatSize!=sizeof(float))
              {
