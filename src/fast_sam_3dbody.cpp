@@ -756,7 +756,7 @@ struct Pipeline::Impl
                 char fname[64];
                 snprintf(fname, sizeof(fname), "decoder_hand_layer%d.onnx", li);
                 if (!sess_decoder_hand_layers[li].load(ort_env, opath(fname),
-                                                        cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false))
+                                                        cuda, dev, /*fp16_io=*/false, /*trt_ep=*/cfg.use_trt_ep))
                     return false;
             }
             if (!sess_decoder_hand_normfinal.load(ort_env, opath("decoder_hand_normfinal.onnx"),
@@ -767,16 +767,36 @@ struct Pipeline::Impl
                 return false;
             printf("OK\n");
 
-            // These stay on the CUDA EP even under --trt, deliberately.  Measured
-            // on an RTX 4080 SUPER (videos/300.mkv, 2 persons/frame): pass 1 costs
-            // 33.7 ms/frame on the CUDA EP and 65.4 ms with the TensorRT EP.  The
-            // layer graphs are pure transformer blocks that TRT does run slightly
-            // faster, but pre/update contain GridSample, ScatterND and shape ops
-            // that TRT cannot take, so ORT partitions those sessions and the
-            // resulting EP boundaries copy the 5.2 MB image tensors back to the
-            // host — which is exactly what the IoBinding in the pass-1 loop below
-            // exists to avoid.  Revisit only if those graphs are re-exported
-            // without the unsupported ops.
+            // --trt is honoured for the transformer layer graphs and the fused
+            // head graphs ONLY.  pre/update/normfinal/handbox stay on the CUDA EP
+            // deliberately; the split is measured, not assumed.
+            //
+            // RTX 4080 SUPER, videos/300.mkv, medians over the 2-person frames of
+            // a 60-frame run (pass 1 / hand stage / whole frame, ms):
+            //   CUDA everywhere        16.7-18.4 / 127.7-133.8 / 221.8-231.9
+            //   TRT on layers+heads    15.2-15.7 / 126.4-128.4 / 217.2-223.0
+            //   TRT everywhere         49.5      / 183.7       / 344.2
+            //
+            // pre and update contain GridSample, ScatterND and shape ops TRT
+            // cannot take, so ORT partitions those sessions and the resulting EP
+            // boundaries copy the 5.2 MB image tensors back to the host — undoing
+            // exactly what the IoBinding in the loops below buys.  normfinal (2
+            // nodes) and handbox (13) are too small to pay for a TRT wrapper, and
+            // with the fused heads loaded normfinal is off the hot path anyway.
+            //
+            // Worth knowing: this was measured once before, BEFORE the IoBinding
+            // work, and TRT on the layers was worth nothing — the per-layer PCIe
+            // traffic dominated and hid the kernel difference.  It only became a
+            // real (if modest) win once the transfers were gone.  Cost is a
+            // one-off build of 21 engines on the first --trt run, cached in
+            // onnx/trt_engine_cache.
+            //
+            // Numerically the TRT layer/head kernels sit inside the CUDA EP's own
+            // run-to-run spread (BVH max |diff| 0.006 / 0.039 deg either way, with
+            // --trt held fixed on both sides).  Compare EPs only at equal --trt:
+            // --trt ALSO swaps in the fp16 backbone, which on its own moves the
+            // result by ~13 deg relative to a non-trt run — a property of that
+            // swap, not of the decoder EP.
             printf("[FSB] Loading decoder_prompted (iterative, 9 graphs) … ");
             fflush(stdout);
             if (!sess_decoder_prompted_pre.load(ort_env, opath("decoder_prompted_pre.onnx"),
@@ -787,7 +807,7 @@ struct Pipeline::Impl
                 char fname[64];
                 snprintf(fname, sizeof(fname), "decoder_prompted_layer%d.onnx", li);
                 if (!sess_decoder_prompted_layers[li].load(ort_env, opath(fname),
-                                                            cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false))
+                                                            cuda, dev, /*fp16_io=*/false, /*trt_ep=*/cfg.use_trt_ep))
                     return false;
             }
             if (!sess_decoder_prompted_normfinal.load(ort_env, opath("decoder_prompted_normfinal.onnx"),
@@ -808,7 +828,7 @@ struct Pipeline::Impl
                 char fname[64];
                 snprintf(fname, sizeof(fname), "decoder_pass1_layer%d.onnx", li);
                 if (!sess_decoder_pass1_layers[li].load(ort_env, opath(fname),
-                                                         cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false))
+                                                         cuda, dev, /*fp16_io=*/false, /*trt_ep=*/cfg.use_trt_ep))
                     return false;
             }
             if (!sess_decoder_pass1_normfinal.load(ort_env, opath("decoder_pass1_normfinal.onnx"),
@@ -836,7 +856,7 @@ struct Pipeline::Impl
                 {
                     std::string hp = opath(h.file);
                     if (!std::filesystem::exists(hp)) continue;
-                    if (h.sess->load(ort_env, hp, cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false))
+                    if (h.sess->load(ort_env, hp, cuda, dev, /*fp16_io=*/false, /*trt_ep=*/cfg.use_trt_ep))
                         ++n_head;
                     else
                         fprintf(stderr, "[FSB] %s failed to load – falling back to CPU heads\n", h.file);

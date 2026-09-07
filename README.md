@@ -1077,9 +1077,10 @@ steady state (so the one-time engine build is amortised):
 | Decoder | 14 ms | 7 ms |
 | **Total / frame** | **273 ms (3.7 fps)** | **170 ms (5.9 fps)** |
 
-End-to-end **~1.6× faster**, with keypoints within ~4 mm of the CUDA path (FP16 is
-numerically equivalent here). Run it through the wrapper, which puts the bundled
-TensorRT 10.4 libs on the loader path and adds `--trt`:
+End-to-end **~1.6× faster**, with keypoints within ~4 mm of the CUDA path. That is
+close, but not identical — see [What `--trt` does to the pose](#what---trt-does-to-the-pose)
+below before using `--trt` output as a reference. Run it through the wrapper, which
+puts the bundled TensorRT 10.4 libs on the loader path and adds `--trt`:
 
 ```bash
 tools/run_trt.sh --onnx-dir ./onnx --from your_video.mp4
@@ -1102,6 +1103,50 @@ Notes:
   `tools/export_backbone_fp16.py --input onnx/decoder.onnx --output onnx/decoder_fp16.onnx`.
 - Without the TensorRT libs the EP silently falls back to the CUDA EP, so `--trt`
   never errors — watch for the `[cli] TRT:` lines to confirm it engaged.
+
+#### What `--trt` does to the pose
+
+`--trt` is not only an execution-provider switch: it also **swaps the models** for
+their fp16 variants (the `[cli] TRT:` lines above say so). The stock `backbone.onnx`
+and `decoder.onnx` are bfloat16, which the TRT EP rejects, so `--trt` loads
+`backbone_fp16_trt.onnx` and `decoder_fp16.onnx` instead. That precision change —
+not TensorRT itself — moves the output.
+
+Measured on an RTX 4080 SUPER, `videos/300.mkv`, 10 frames, two people: per-channel
+BVH differences against the same build run **without** `--trt`, quoting the worse of
+the two people in each column.
+
+| path | rotations, median | rotations, p99 | rotations, worst | root translation, worst |
+|------|------------------:|---------------:|-----------------:|------------------------:|
+| plain | 0.000° | 1.3° | 7.1° | 19.0 (0.9 % of depth) |
+| `--refined-pose` | 0.000° | 1.1° | 5.7° | 13.0 (0.9 % of depth) |
+
+Most channels are untouched — the median difference is zero and the 99th percentile
+is around a degree. What does move is **global placement and distant subjects**: the
+worst channels are the root's depth and yaw, then the legs, and almost all of the
+deviation above belongs to the further of the two people in the clip. The nearer
+person stays under ~1.8° on every joint. Fingers are not especially affected.
+
+Two things this is *not*:
+
+- **Not the TensorRT EP.** Holding `--trt` fixed and moving only the refined-pose
+  decoder graphs between the CUDA and TensorRT EPs keeps every channel inside the
+  pipeline's own run-to-run spread (≤0.04°). The fp16 model swap is the whole effect.
+- **Not run-to-run noise.** The plain path is bit-reproducible across runs; the
+  `--refined-pose` path varies by ~0.04° (CUDA GEMM non-determinism). Both are two
+  orders of magnitude below the numbers in the table.
+
+For most uses this does not matter. It matters if you are validating against the
+reference implementation, diffing captures taken with and without `--trt`, or
+chasing a small residual error such as foot contact on a far subject. To keep the
+bf16 backbone while still passing `--trt`, pin it explicitly:
+
+```bash
+./build/fast_sam_3dbody_run --trt --backbone backbone.onnx ...
+```
+
+which drops the worst-case deviation on the distant subject from ~7° to ~1°, at the
+cost of the fp16 tensor-core path that the speedup in the table comes from.
 
 ### Why not INT8?
 
