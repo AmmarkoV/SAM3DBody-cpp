@@ -421,6 +421,7 @@ struct Pipeline::Impl
     std::array<OrtSession,6> sess_decoder_prompted_layers;
     OrtSession sess_decoder_prompted_normfinal;
     OrtSession sess_decoder_prompted_update;
+    OrtSession sess_decoder_prompted_head;   // optional: norm_final + mhr/cam heads fused
     static constexpr int P2_N_TOK = 148, P2_KPS_START = 6, P2_KPS3D_START = 76;
 
     // Iterative decoder_hand (same recipe, same rationale — see POSEREFINE.md).
@@ -429,6 +430,7 @@ struct Pipeline::Impl
     std::array<OrtSession,6> sess_decoder_hand_layers;
     OrtSession sess_decoder_hand_normfinal;
     OrtSession sess_decoder_hand_update;
+    OrtSession sess_decoder_hand_head;       // optional: norm_final + hand mhr/cam heads fused
     static constexpr int HAND_N_TOK = 145, HAND_KPS_START = 3, HAND_KPS3D_START = 73;
 
     // Iterative pass-1 (plain body decode — decoder.onnx never had the real
@@ -447,6 +449,7 @@ struct Pipeline::Impl
     OrtSession sess_decoder_pass1_normfinal;
     OrtSession sess_decoder_pass1_update;
     OrtSession sess_decoder_pass1_handbox;   // last raw layer token -> hand_box+hand_cls
+    OrtSession sess_decoder_pass1_head;      // optional: norm_final + mhr/cam heads fused
     static constexpr int PASS1_N_TOK = 145, PASS1_KPS_START = 3, PASS1_KPS3D_START = 73,
                           PASS1_HANDBOX_START = 143;
 
@@ -478,6 +481,58 @@ struct Pipeline::Impl
     struct MHR_LBS_Subset* lbs_kp_subset = nullptr;
     int                    kp_subset_n   = 0;
     std::vector<KpEntry>   kp_mapping_sub;
+
+    // Regress the pose token / MHR / camera heads from a decoder token.
+    //
+    // decoder_*_head.onnx (built by tools/build_decoder_heads.py) is
+    // decoder_*_normfinal.onnx with the two Linear/ReLU/Linear regression heads
+    // appended, so the token never leaves the GPU and only the 519+3 result
+    // floats come back.  The heads used to run on the CPU here — two
+    // 1024x1024->N GEMVs streaming ~10 MB of weights per call, ~9 ms per person
+    // per frame, more than the six transformer layers they sit between.
+    //
+    // Falls back to norm_final + the CPU FFNs when the fused graph is absent, so
+    // an older onnx/ directory still works.  Pass nullptr for outputs you do not
+    // need; only the requested graph outputs are computed.
+    bool decode_head(OrtSession& head, OrtSession& nf,
+                     const CFFN& mhr_head, const CFFN& cam_head,
+                     const Ort::Value& token,
+                     std::vector<float>* pose_out,
+                     std::vector<float>* mhr_out,
+                     std::vector<float>* cam_out)
+    {
+        if (head.session)
+        {
+            Ort::IoBinding b(*head.session);
+            b.BindInput(head.input_names[0], token);
+            if (pose_out) b.BindOutput(head.output_names[0], head.mem_info);   // pose_token
+            if (mhr_out)  b.BindOutput(head.output_names[1], head.mem_info);   // mhr
+            if (cam_out)  b.BindOutput(head.output_names[2], head.mem_info);   // cam
+            head.session->Run(Ort::RunOptions{nullptr}, b);
+            auto outs = b.GetOutputValues();
+            size_t k = 0;
+            auto take = [&](std::vector<float>* dst, size_t n)
+            {
+                const float* p = outs[k++].GetTensorData<float>();
+                dst->assign(p, p + n);
+            };
+            if (pose_out) take(pose_out, meta.decoder_dim);
+            if (mhr_out)  take(mhr_out,  (size_t)mhr_head.out_dim);
+            if (cam_out)  take(cam_out,  (size_t)cam_head.out_dim);
+            return true;
+        }
+
+        Ort::IoBinding b(*nf.session);
+        b.BindInput(nf.input_names[0], token);
+        b.BindOutput(nf.output_names[0], nf.mem_info);
+        nf.session->Run(Ort::RunOptions{nullptr}, b);
+        auto outs = b.GetOutputValues();
+        const float* pt = outs[0].GetTensorData<float>();
+        if (pose_out) pose_out->assign(pt, pt + meta.decoder_dim);
+        if (mhr_out)  *mhr_out = cffn_run(mhr_head, pt, 1);
+        if (cam_out)  *cam_out = cffn_run(cam_head, pt, 1);
+        return true;
+    }
 
     // Body model → the 70 MHR keypoints, via the subset when it is available.
     // Shared by the pass-1 / pass-2 / hand intermediate decodes.
@@ -766,6 +821,30 @@ struct Pipeline::Impl
                                                    cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false))
                 return false;
             printf("OK\n");
+
+            // Optional: the fused norm_final+heads graphs.  Absent in an older
+            // onnx/ directory, in which case decode_head() keeps using
+            // norm_final plus the CPU FFNs.
+            {
+                struct { OrtSession* sess; const char* file; } heads[] = {
+                    { &sess_decoder_pass1_head,    "decoder_pass1_head.onnx"    },
+                    { &sess_decoder_prompted_head, "decoder_prompted_head.onnx" },
+                    { &sess_decoder_hand_head,     "decoder_hand_head.onnx"     },
+                };
+                int n_head = 0;
+                for (auto& h : heads)
+                {
+                    std::string hp = opath(h.file);
+                    if (!std::filesystem::exists(hp)) continue;
+                    if (h.sess->load(ort_env, hp, cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false))
+                        ++n_head;
+                    else
+                        fprintf(stderr, "[FSB] %s failed to load – falling back to CPU heads\n", h.file);
+                }
+                printf("[FSB] fused decoder heads: %d/3 loaded%s\n", n_head,
+                       n_head == 3 ? "" : " (missing ones use norm_final + CPU FFN;"
+                                          " run tools/build_decoder_heads.py)");
+            }
 
             dec_mem = sess_decoder_pass1_pre.on_gpu
                 ? Ort::MemoryInfo("Cuda", OrtDeviceAllocator, dev, OrtMemTypeDefault)
@@ -1272,18 +1351,9 @@ struct Pipeline::Impl
 
                     if (layer_idx == 5) break;  // last layer: raw token feeds hand_box below + normfinal for body pose
 
-                    // The pose token is the one thing the CPU needs each iteration
-                    // (4 KB), so bind norm_final's output to host memory.
-                    auto& nf = sess_decoder_pass1_normfinal;
-                    Ort::IoBinding nb(*nf.session);
-                    nb.BindInput(nf.input_names[0], token);
-                    nb.BindOutput(nf.output_names[0], mi);
-                    nf.session->Run(Ort::RunOptions{nullptr}, nb);
-                    auto nfout = nb.GetOutputValues();
-                    const float* pose_token_l = nfout[0].GetTensorData<float>();
-
-                    std::vector<float> l_mhr = cffn_run(mhr_ffn, pose_token_l, 1);
-                    std::vector<float> l_cam = cffn_run(cam_ffn, pose_token_l, 1);
+                    std::vector<float> l_mhr, l_cam;
+                    decode_head(sess_decoder_pass1_head, sess_decoder_pass1_normfinal,
+                                mhr_ffn, cam_ffn, token, nullptr, &l_mhr, &l_cam);
                     std::vector<float> kp2d_c, kp2d_d, kp3d;
                     if (!decode_intermediate_p1(l_mhr.data(), l_cam.data(), kp2d_c, kp2d_d, kp3d))
                         break;
@@ -1323,13 +1393,10 @@ struct Pipeline::Impl
                     std::memcpy(hand_cls_out[i].data(), hc, 4*sizeof(float));
                 }
 
-                auto& nff = sess_decoder_pass1_normfinal;
-                Ort::IoBinding nfb(*nff.session);
-                nfb.BindInput(nff.input_names[0], token);
-                nfb.BindOutput(nff.output_names[0], mi);
-                nff.session->Run(Ort::RunOptions{nullptr}, nfb);
-                auto nfout_final = nfb.GetOutputValues();
-                std::memcpy(pose_tokens.data() + (size_t)i*DECODER_DIM, nfout_final[0].GetTensorData<float>(),
+                std::vector<float> pose_final;
+                decode_head(sess_decoder_pass1_head, sess_decoder_pass1_normfinal,
+                            mhr_ffn, cam_ffn, token, &pose_final, nullptr, nullptr);
+                std::memcpy(pose_tokens.data() + (size_t)i*DECODER_DIM, pose_final.data(),
                             (size_t)DECODER_DIM*sizeof(float));
             }
             double dt_dec = ms(t0);
@@ -1654,18 +1721,9 @@ struct Pipeline::Impl
                     // here rather than running norm_final twice on the same token.
                     if (layer_idx == 5) break;
 
-                    // The pose token is the one thing the CPU needs each iteration
-                    // (4 KB), so bind norm_final's output to host memory.
-                    auto& nf = sess_decoder_hand_normfinal;
-                    Ort::IoBinding nb(*nf.session);
-                    nb.BindInput(nf.input_names[0], htoken);
-                    nb.BindOutput(nf.output_names[0], mi);
-                    nf.session->Run(Ort::RunOptions{nullptr}, nb);
-                    auto nfout = nb.GetOutputValues();
-                    const float* pose_token = nfout[0].GetTensorData<float>();
-
-                    std::vector<float> l_mhr = cffn_run(mhr_ffn_hand, pose_token, 1);
-                    std::vector<float> l_cam = cffn_run(cam_ffn_hand, pose_token, 1);
+                    std::vector<float> l_mhr, l_cam;
+                    decode_head(sess_decoder_hand_head, sess_decoder_hand_normfinal,
+                                mhr_ffn_hand, cam_ffn_hand, htoken, nullptr, &l_mhr, &l_cam);
                     std::vector<float> kp2d_c, kp2d_d, kp3d;
                     if (!decode_intermediate_hand(l_mhr.data(), l_cam.data(), kp2d_c, kp2d_d, kp3d))
                         break;
@@ -1690,16 +1748,9 @@ struct Pipeline::Impl
                     htok_aug = std::move(uout[1]);
                 }
 
-                auto& hnff = sess_decoder_hand_normfinal;
-                Ort::IoBinding hnfb(*hnff.session);
-                hnfb.BindInput(hnff.input_names[0], htoken);
-                hnfb.BindOutput(hnff.output_names[0], mi);
-                hnff.session->Run(Ort::RunOptions{nullptr}, hnfb);
-                auto nfout_f = hnfb.GetOutputValues();
-                const float* h_pose_token = nfout_f[0].GetTensorData<float>();
-
-                std::vector<float> h_mhr = cffn_run(mhr_ffn_hand, h_pose_token, 1);
-                std::vector<float> h_cam = cffn_run(cam_ffn_hand, h_pose_token, 1);
+                std::vector<float> h_mhr, h_cam;
+                decode_head(sess_decoder_hand_head, sess_decoder_hand_normfinal,
+                            mhr_ffn_hand, cam_ffn_hand, htoken, nullptr, &h_mhr, &h_cam);
                 std::copy(h_mhr.begin(), h_mhr.end(), hand_mhr_raw.begin() + (size_t)h*mhr_ffn_hand.out_dim);
                 std::copy(h_cam.begin(), h_cam.end(), hand_cam_raw.begin() + (size_t)h*3);
             }
@@ -2622,18 +2673,9 @@ struct Pipeline::Impl
                     // below — so stop here instead of running norm_final twice.
                     if (layer_idx == 5) break;
 
-                    // The pose token is the one thing the CPU needs each iteration
-                    // (4 KB), so bind norm_final's output to host memory.
-                    auto& nf = sess_decoder_prompted_normfinal;
-                    Ort::IoBinding nb(*nf.session);
-                    nb.BindInput(nf.input_names[0], token);
-                    nb.BindOutput(nf.output_names[0], mi);
-                    nf.session->Run(Ort::RunOptions{nullptr}, nb);
-                    auto nfout = nb.GetOutputValues();
-                    const float* pose_token = nfout[0].GetTensorData<float>();
-
-                    std::vector<float> l_mhr = cffn_run(mhr_ffn, pose_token, 1);
-                    std::vector<float> l_cam = cffn_run(cam_ffn, pose_token, 1);
+                    std::vector<float> l_mhr, l_cam;
+                    decode_head(sess_decoder_prompted_head, sess_decoder_prompted_normfinal,
+                                mhr_ffn, cam_ffn, token, nullptr, &l_mhr, &l_cam);
                     std::vector<float> kp2d_c, kp2d_d, kp3d;
                     if (!decode_intermediate(l_mhr.data(), l_cam.data(), kp2d_c, kp2d_d, kp3d))
                         break;
@@ -2658,16 +2700,9 @@ struct Pipeline::Impl
                     tok_aug = std::move(uout[1]);
                 }
 
-                auto& p2nf = sess_decoder_prompted_normfinal;
-                Ort::IoBinding p2nfb(*p2nf.session);
-                p2nfb.BindInput(p2nf.input_names[0], token);
-                p2nfb.BindOutput(p2nf.output_names[0], mi);
-                p2nf.session->Run(Ort::RunOptions{nullptr}, p2nfb);
-                auto nfout_final = p2nfb.GetOutputValues();
-                const float* p2_token = nfout_final[0].GetTensorData<float>();
-
-                std::vector<float> p2_mhr = cffn_run(mhr_ffn, p2_token, 1);
-                std::vector<float> p2_cam = cffn_run(cam_ffn, p2_token, 1);
+                std::vector<float> p2_mhr, p2_cam;
+                decode_head(sess_decoder_prompted_head, sess_decoder_prompted_normfinal,
+                            mhr_ffn, cam_ffn, token, nullptr, &p2_mhr, &p2_cam);
                 const float* p2 = p2_mhr.data();
 
                 // Pass 2's decode REPLACES the pass-1 output wholesale (matches Python:

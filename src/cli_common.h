@@ -346,7 +346,13 @@ inline void ensure_models(CommonConfig& c, bool refined_pose = false)
             "decoder_pass1_layer1.onnx", "decoder_pass1_layer2.onnx",
             "decoder_pass1_layer3.onnx", "decoder_pass1_layer4.onnx",
             "decoder_pass1_layer5.onnx", "decoder_pass1_normfinal.onnx",
-            "decoder_pass1_update.onnx", "decoder_pass1_handbox.onnx" });
+            "decoder_pass1_update.onnx", "decoder_pass1_handbox.onnx",
+            // Fused norm_final+heads graphs (tools/build_decoder_heads.py).
+            // Optional at load — the pipeline falls back to norm_final plus the
+            // CPU regression heads — but listed here so a fresh checkout picks
+            // them up with everything else rather than silently running slower.
+            "decoder_pass1_head.onnx", "decoder_prompted_head.onnx",
+            "decoder_hand_head.onnx" });
     }
     // LibreYOLO is explicitly SELECTED (not "auto"): --detector libreyolo, or a
     // pinned --yolo pointing at a libreyolo* export.  Fetch the canonical model

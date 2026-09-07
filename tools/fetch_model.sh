@@ -14,7 +14,7 @@
 #   refined  extra files for --refined-pose (see PLAN.md,
 #            issue #15 "refined pose" plan) — opt-in, not part
 #            of 'all'; combine with a base profile, e.g.
-#            'tools/fetch_model.sh cuda refined'              ~607 MB
+#            'tools/fetch_model.sh cuda refined'              ~639 MB
 #   libreyolo  the LibreYOLO bbox detector (~8 MB) — fetched
 #            automatically at runtime only when explicitly
 #            selected (--detector libreyolo, or --yolo pinned
@@ -127,6 +127,17 @@ MANIFEST=(
   "refined|decoder_pass1_update.onnx|13700938|b0fa19f7455ac0b15630617ed608396d6c8995adb86c1da4e7efec8dedf53a7f"
   "refined|decoder_pass1_handbox.onnx|8432332|f481ef0fdbc1f0b2da44b197ebbdb746739a64cd998b97cca3a59786e0a60924"
   "refined|pipeline_refined.gguf|14764576|88ec6f7bdbf8519f5016c87cbb9c72b4db50e0ea2d71f298593f00a8999b9951"
+
+  # Fused norm_final + MHR/cam regression heads, one per decoder variant
+  # (tools/build_decoder_heads.py).  These replace a GPU norm_final call plus two
+  # 1024x1024->N CPU GEMVs with a single graph, worth ~9 ms per person per frame.
+  # OPTIONAL: when absent the C++ falls back to decoder_*_normfinal.onnx + the
+  # CPU heads and produces the same result, just slower — which is why they are
+  # listed last in this profile, so a fetch that cannot reach them has already
+  # placed every file the pipeline actually requires.
+  "refined|decoder_pass1_head.onnx|10546365|f4f85b609f960404228d8fb894deb767f78a5c53cbd234edea498c8fae05694c"
+  "refined|decoder_prompted_head.onnx|10546365|f6093423825544aa942d07fdf127d33637ea5a8434299c200e259d550a012c05"
+  "refined|decoder_hand_head.onnx|10546365|85a8ea53fc16bb389389eca9f09061c1ff8192cc45c1a4a989b8e2fb07d78889"
 
   # LibreYOLO bbox detector (optional — --detector libreyolo / pinned --yolo;
   # the default 'auto' detector prefers it only when it is already on disk).
