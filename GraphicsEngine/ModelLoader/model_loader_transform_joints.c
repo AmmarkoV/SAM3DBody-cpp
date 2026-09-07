@@ -1390,6 +1390,157 @@ static int mhr_apply_correctives(const struct MHR_LBS_Data *d,
 
 /* ── main per-frame compute ───────────────────────────────────────────────── */
 
+/* Steps 2-5 of the LBS pipeline: the joint-only half (127 joints, no per-vertex
+ * work).  Shared verbatim by mhr_lbs_compute() and mhr_lbs_compute_subset() so
+ * the two cannot drift apart numerically.  All outputs are caller-allocated:
+ *   joint_params [pt_rows]   g_t/skin_t [nj*3]   g_q/skin_q [nj*4]   g_s/skin_s [nj]
+ * The caller applies the pose correctives with the returned joint_params. */
+static int mhr_lbs_skeleton(const struct MHR_LBS_Data *d,
+                            const float *model_params,
+                            float *joint_params,
+                            float *g_t, float *g_q, float *g_s,
+                            float *skin_t, float *skin_q, float *skin_s)
+{
+    int nj  = d->n_joints;
+    int npc = d->pt_cols;
+    int npr = d->pt_rows;
+
+    /* Step 2 — joint_params = PT [npr×npc] @ concat(model_params[204], zeros) */
+    float *input_vec = (float*)calloc((size_t)npc, sizeof(float));
+    if (!input_vec) return 0;
+    memcpy(input_vec, model_params, (size_t)(npc < 204 ? npc : 204) * sizeof(float));
+
+    for (int j = 0; j < npr; j++) {
+        float acc = 0.f;
+        const float *row = d->PT + (size_t)j * npc;
+        for (int k = 0; k < npc; k++) acc += row[k] * input_vec[k];
+        joint_params[j] = acc;
+    }
+    free(input_vec);
+
+    /* Step 3 — local skeleton state per joint: (t_local, q_local, s_local)
+     *
+     * joint_params row j: [tx, ty, tz, rx, ry, rz, log2_scale]
+     *   tx,ty,tz  are ADDITIVE offsets relative to joint_offsets[j] (rest-pose position).
+     *   rx,ry,rz  are ZYX Euler angles (PyMomentum XYZ intrinsic: R = Rz(rz)*Ry(ry)*Rx(rx)).
+     *   log2_scale is decoded as exp2(val) = 2^val.
+     *
+     * q_local[j] = joint_prerotations[j] * euler_to_quat(rx,ry,rz)
+     *   joint_prerotations establishes each joint's rest-pose orientation.
+     *   The pose quaternion (from Euler) is applied ON TOP via right-multiplication.
+     *   R_local = R_pre @ R_euler  (pre-rotation first, then the driven pose).
+     */
+    float *t_local  = (float*)malloc((size_t)nj * 3 * sizeof(float));
+    float *q_local  = (float*)malloc((size_t)nj * 4 * sizeof(float));
+    float *s_local  = (float*)malloc((size_t)nj * sizeof(float));
+    if (!t_local || !q_local || !s_local) { free(t_local); free(q_local); free(s_local); return 0; }
+
+    for (int j = 0; j < nj; j++) {
+        const float *jp  = joint_params + j * 7;
+        const float *off = d->joint_offsets      + j * 3;
+        const float *pre = d->joint_prerotations + j * 4;  /* XYZW */
+
+        /* rest-pose offset + driven translation */
+        t_local[j*3+0] = off[0] + jp[0];
+        t_local[j*3+1] = off[1] + jp[1];
+        t_local[j*3+2] = off[2] + jp[2];
+
+        /* jp[3]=rx jp[4]=ry jp[5]=rz  →  q representing Rz(rz)*Ry(ry)*Rx(rx)
+         * Then compose: q_local = pre * q_euler  so R_local = R_pre @ R_euler. */
+        float q_euler[4];
+        mhr_euler_xyz_to_quat(jp[3], jp[4], jp[5], q_euler);
+        mhr_qmul(q_local + j*4, pre, q_euler);  /* R_local = R_pre @ R_euler */
+
+        s_local[j] = expf(jp[6] * MHR_LN2);  /* exp2(log2_scale) */
+    }
+
+    /* Step 4 — FK chain: accumulate global TRS from root to leaves.
+     *
+     * joint_parents is sorted so that parent index < child index, meaning a
+     * single forward pass is sufficient (no dependency ordering needed).
+     *
+     * For joint j with parent p:
+     *   g_q[j] = g_q[p] * q_local[j]     → R_global[j] = R_global[p] @ R_local[j]
+     *   g_t[j] = g_t[p] + g_s[p] * R_global[p] @ t_local[j]   (offset rotated by parent)
+     *   g_s[j] = g_s[p] * s_local[j]
+     *
+     * For the root joint (parent < 0), global = local directly.
+     */
+
+    //fprintf(stderr,"[LBS] root joint: t=(%.4f,%.4f,%.4f) s=%.6f\n",
+    //        t_local[0], t_local[1], t_local[2], s_local[0]);
+
+    /* Check for NaN/Inf in local transforms */
+    { int bad = 0;
+      for(int j=0;j<nj;j++) {
+          for(int c=0;c<4;c++) { if(!isfinite(q_local[j*4+c])) bad++; }
+          if(!isfinite(s_local[j])) bad++;
+      }
+      if(bad) fprintf(stderr,"[LBS] WARNING: %d NaN/Inf in local transforms\n", bad);
+    }
+
+    for (int j = 0; j < nj; j++) {
+        int p = d->joint_parents[j];
+        if (p < 0) {
+            /* root: global == local */
+            memcpy(g_t + j*3, t_local + j*3, 3*sizeof(float));
+            memcpy(g_q + j*4, q_local + j*4, 4*sizeof(float));
+            g_s[j] = s_local[j];
+        } else {
+            g_s[j] = g_s[p] * s_local[j];
+            /* g_q[j] = g_q[p] * q_local[j]  →  R_global[j] = R_parent @ R_local[j] */
+            mhr_qmul(g_q + j*4, g_q + p*4, q_local + j*4);
+            /* child offset rotated by parent global rotation, then scaled and added */
+            float rt[3];
+            mhr_qrot(rt, g_q + p*4, t_local + j*3);
+            g_t[j*3+0] = g_t[p*3+0] + g_s[p] * rt[0];
+            g_t[j*3+1] = g_t[p*3+1] + g_s[p] * rt[1];
+            g_t[j*3+2] = g_t[p*3+2] + g_s[p] * rt[2];
+        }
+    }
+
+    //fprintf(stderr,"[LBS] FK loop done\n");
+
+    /* Step 5 — skin TRS = global(j) ∘ inv_bind(j)
+     *
+     * inv_bind_pose[j] is the inverse of the joint's bind-pose transform.
+     * Composing global(j) with inv_bind(j) gives the net deformation applied
+     * to a vertex skinned to joint j when it moves from rest to the current pose.
+     *
+     * inv_bind layout per joint (8 floats): [tx, ty, tz, qx, qy, qz, qw, scale]
+     *
+     * Composition (TRS concatenation):
+     *   skin_q = g_q @ ib_q    → R_skin = R_global @ R_inv_bind
+     *   skin_t = g_t + g_s * rotate(g_q, ib_t)
+     *   skin_s = g_s * ib_scale
+     */
+
+    for (int j = 0; j < nj; j++) {
+        const float *ib  = d->inv_bind_pose + j * 8;  /* [tx,ty,tz, qx,qy,qz,qw, scale] */
+        float        ibs = ib[7];
+
+        skin_s[j] = g_s[j] * ibs;
+        mhr_qmul(skin_q + j*4, g_q + j*4, ib + 3);  /* R_skin = R_global @ R_inv_bind */
+        float rt[3];
+        mhr_qrot(rt, g_q + j*4, ib);   /* rotate inv_bind translation by global orientation */
+        skin_t[j*3+0] = g_t[j*3+0] + g_s[j] * rt[0];
+        skin_t[j*3+1] = g_t[j*3+1] + g_s[j] * rt[1];
+        skin_t[j*3+2] = g_t[j*3+2] + g_s[j] * rt[2];
+    }
+
+    //fprintf(stderr,"[LBS] Skin TRS done\n");
+    { int bad2 = 0;
+      for(int j=0;j<nj;j++) {
+          for(int c=0;c<4;c++) { if(!isfinite(skin_q[j*4+c])) bad2++; }
+          if(!isfinite(skin_s[j])) bad2++;
+      }
+      if(bad2) fprintf(stderr,"[LBS] WARNING: %d NaN/Inf in skin transforms\n", bad2);
+    }
+
+    free(t_local); free(q_local); free(s_local);
+    return 1;
+}
+
 /* mhr_lbs_compute — full LBS forward pass, replicating body_model.pt:
  *
  *  model_params [204] layout (see build_model_params in preprocess.hpp):
@@ -1507,153 +1658,25 @@ int mhr_lbs_compute(const struct MHR_LBS_Data *d,
     }
 #endif
 
-    /* Step 2 — joint_params = PT [npr×npc] @ concat(model_params[204], zeros) */
+    /* Steps 2-5 — joint pipeline (shared with mhr_lbs_compute_subset) */
     float *joint_params = (float*)malloc((size_t)npr * sizeof(float));
-    float *input_vec    = (float*)calloc((size_t)npc,  sizeof(float));
-    if (!joint_params || !input_vec) {
-        free(joint_params); free(input_vec); free(unposed); return 0;
-    }
-    memcpy(input_vec, model_params, (size_t)(npc < 204 ? npc : 204) * sizeof(float));
-
-    for (int j = 0; j < npr; j++) {
-        float acc = 0.f;
-        const float *row = d->PT + (size_t)j * npc;
-        for (int k = 0; k < npc; k++) acc += row[k] * input_vec[k];
-        joint_params[j] = acc;
-    }
-    free(input_vec);
-
-    /* Step 2b — pose correctives: add corrective offsets to unposed (before LBS).
-     * Requires joint_params (computed above) which is freed in Step 3. */
-    mhr_apply_correctives(d, joint_params, unposed);
-
-    /* Step 3 — local skeleton state per joint: (t_local, q_local, s_local)
-     *
-     * joint_params row j: [tx, ty, tz, rx, ry, rz, log2_scale]
-     *   tx,ty,tz  are ADDITIVE offsets relative to joint_offsets[j] (rest-pose position).
-     *   rx,ry,rz  are ZYX Euler angles (PyMomentum XYZ intrinsic: R = Rz(rz)*Ry(ry)*Rx(rx)).
-     *   log2_scale is decoded as exp2(val) = 2^val.
-     *
-     * q_local[j] = joint_prerotations[j] * euler_to_quat(rx,ry,rz)
-     *   joint_prerotations establishes each joint's rest-pose orientation.
-     *   The pose quaternion (from Euler) is applied ON TOP via right-multiplication.
-     *   R_local = R_pre @ R_euler  (pre-rotation first, then the driven pose).
-     */
-    float *t_local  = (float*)malloc((size_t)nj * 3 * sizeof(float));
-    float *q_local  = (float*)malloc((size_t)nj * 4 * sizeof(float));
-    float *s_local  = (float*)malloc((size_t)nj * sizeof(float));
-    if (!t_local || !q_local || !s_local) { free(t_local); free(q_local); free(s_local); return 0; }
-
-    for (int j = 0; j < nj; j++) {
-        const float *jp  = joint_params + j * 7;
-        const float *off = d->joint_offsets      + j * 3;
-        const float *pre = d->joint_prerotations + j * 4;  /* XYZW */
-
-        /* rest-pose offset + driven translation */
-        t_local[j*3+0] = off[0] + jp[0];
-        t_local[j*3+1] = off[1] + jp[1];
-        t_local[j*3+2] = off[2] + jp[2];
-
-        /* jp[3]=rx jp[4]=ry jp[5]=rz  →  q representing Rz(rz)*Ry(ry)*Rx(rx)
-         * Then compose: q_local = pre * q_euler  so R_local = R_pre @ R_euler. */
-        float q_euler[4];
-        mhr_euler_xyz_to_quat(jp[3], jp[4], jp[5], q_euler);
-        mhr_qmul(q_local + j*4, pre, q_euler);  /* R_local = R_pre @ R_euler */
-
-        s_local[j] = expf(jp[6] * MHR_LN2);  /* exp2(log2_scale) */
-    }
-    free(joint_params);
-
-    /* Step 4 — FK chain: accumulate global TRS from root to leaves.
-     *
-     * joint_parents is sorted so that parent index < child index, meaning a
-     * single forward pass is sufficient (no dependency ordering needed).
-     *
-     * For joint j with parent p:
-     *   g_q[j] = g_q[p] * q_local[j]     → R_global[j] = R_global[p] @ R_local[j]
-     *   g_t[j] = g_t[p] + g_s[p] * R_global[p] @ t_local[j]   (offset rotated by parent)
-     *   g_s[j] = g_s[p] * s_local[j]
-     *
-     * For the root joint (parent < 0), global = local directly.
-     */
-   float *g_t = (float*)malloc((size_t)nj * 3 * sizeof(float));
-    float *g_q = (float*)malloc((size_t)nj * 4 * sizeof(float));
-    float *g_s = (float*)malloc((size_t)nj * sizeof(float));
-    if (!g_t || !g_q || !g_s) { free(g_t); free(g_q); free(g_s); free(t_local); free(q_local); free(s_local); return 0; }
-
-    //fprintf(stderr,"[LBS] root joint: t=(%.4f,%.4f,%.4f) s=%.6f\n",
-    //        t_local[0], t_local[1], t_local[2], s_local[0]);
-
-    /* Check for NaN/Inf in local transforms */
-    { int bad = 0;
-      for(int j=0;j<nj;j++) {
-          for(int c=0;c<4;c++) { if(!isfinite(q_local[j*4+c])) bad++; }
-          if(!isfinite(s_local[j])) bad++;
-      }
-      if(bad) fprintf(stderr,"[LBS] WARNING: %d NaN/Inf in local transforms\n", bad);
-    }
-
-    for (int j = 0; j < nj; j++) {
-        int p = d->joint_parents[j];
-        if (p < 0) {
-            /* root: global == local */
-            memcpy(g_t + j*3, t_local + j*3, 3*sizeof(float));
-            memcpy(g_q + j*4, q_local + j*4, 4*sizeof(float));
-            g_s[j] = s_local[j];
-        } else {
-            g_s[j] = g_s[p] * s_local[j];
-            /* g_q[j] = g_q[p] * q_local[j]  →  R_global[j] = R_parent @ R_local[j] */
-            mhr_qmul(g_q + j*4, g_q + p*4, q_local + j*4);
-            /* child offset rotated by parent global rotation, then scaled and added */
-            float rt[3];
-            mhr_qrot(rt, g_q + p*4, t_local + j*3);
-            g_t[j*3+0] = g_t[p*3+0] + g_s[p] * rt[0];
-            g_t[j*3+1] = g_t[p*3+1] + g_s[p] * rt[1];
-            g_t[j*3+2] = g_t[p*3+2] + g_s[p] * rt[2];
-        }
-    }
-
-    //fprintf(stderr,"[LBS] FK loop done\n");
-
-    /* Step 5 — skin TRS = global(j) ∘ inv_bind(j)
-     *
-     * inv_bind_pose[j] is the inverse of the joint's bind-pose transform.
-     * Composing global(j) with inv_bind(j) gives the net deformation applied
-     * to a vertex skinned to joint j when it moves from rest to the current pose.
-     *
-     * inv_bind layout per joint (8 floats): [tx, ty, tz, qx, qy, qz, qw, scale]
-     *
-     * Composition (TRS concatenation):
-     *   skin_q = g_q @ ib_q    → R_skin = R_global @ R_inv_bind
-     *   skin_t = g_t + g_s * rotate(g_q, ib_t)
-     *   skin_s = g_s * ib_scale
-     */
+    float *g_t    = (float*)malloc((size_t)nj * 3 * sizeof(float));
+    float *g_q    = (float*)malloc((size_t)nj * 4 * sizeof(float));
+    float *g_s    = (float*)malloc((size_t)nj * sizeof(float));
     float *skin_t = (float*)malloc((size_t)nj * 3 * sizeof(float));
     float *skin_q = (float*)malloc((size_t)nj * 4 * sizeof(float));
     float *skin_s = (float*)malloc((size_t)nj * sizeof(float));
-    if (!skin_t || !skin_q || !skin_s) { free(skin_t); free(skin_q); free(skin_s); free(g_t); free(g_q); free(g_s); free(t_local); free(q_local); free(s_local); return 0; }
-
-    for (int j = 0; j < nj; j++) {
-        const float *ib  = d->inv_bind_pose + j * 8;  /* [tx,ty,tz, qx,qy,qz,qw, scale] */
-        float        ibs = ib[7];
-
-        skin_s[j] = g_s[j] * ibs;
-        mhr_qmul(skin_q + j*4, g_q + j*4, ib + 3);  /* R_skin = R_global @ R_inv_bind */
-        float rt[3];
-        mhr_qrot(rt, g_q + j*4, ib);   /* rotate inv_bind translation by global orientation */
-        skin_t[j*3+0] = g_t[j*3+0] + g_s[j] * rt[0];
-        skin_t[j*3+1] = g_t[j*3+1] + g_s[j] * rt[1];
-        skin_t[j*3+2] = g_t[j*3+2] + g_s[j] * rt[2];
+    if (!joint_params || !g_t || !g_q || !g_s || !skin_t || !skin_q || !skin_s ||
+        !mhr_lbs_skeleton(d, model_params, joint_params, g_t, g_q, g_s, skin_t, skin_q, skin_s))
+    {
+        free(joint_params); free(g_t); free(g_q); free(g_s);
+        free(skin_t); free(skin_q); free(skin_s); free(unposed);
+        return 0;
     }
 
-    //fprintf(stderr,"[LBS] Skin TRS done\n");
-    { int bad2 = 0;
-      for(int j=0;j<nj;j++) {
-          for(int c=0;c<4;c++) { if(!isfinite(skin_q[j*4+c])) bad2++; }
-          if(!isfinite(skin_s[j])) bad2++;
-      }
-      if(bad2) fprintf(stderr,"[LBS] WARNING: %d NaN/Inf in skin transforms\n", bad2);
-    }
+    /* Step 2b — pose correctives: add corrective offsets to unposed (before LBS). */
+    mhr_apply_correctives(d, joint_params, unposed);
+    free(joint_params);
 
     /* Step 6 — LBS: sparse weighted accumulation */
     memset(out_verts, 0, (size_t)nv * 3 * sizeof(float));
@@ -1712,7 +1735,241 @@ int mhr_lbs_compute(const struct MHR_LBS_Data *d,
 
     //fprintf(stderr,"[LBS] output joints done, returning\n");
 
-    free(t_local); free(q_local); free(s_local);
+    free(g_t); free(g_q); free(g_s);
+    free(skin_t); free(skin_q); free(skin_s);
+    return 1;
+}
+
+/* ── Keypoint-subset LBS ───────────────────────────────────────────────────── */
+/* The refined-pose loop evaluates the body model five times per person purely to
+ * read 70 keypoints back out of it.  Those keypoints touch 468 of the 18439
+ * vertices, but mhr_lbs_compute() blends and skins the whole mesh: 9.9 MB of
+ * shape_vectors plus 33.6 MB of pose correctives streamed per call.  The subset
+ * built here packs the basis rows for just the requested vertices, so the same
+ * math runs over ~2.5% of the data. */
+
+struct MHR_LBS_Subset {
+    int    n_vert;
+    int   *vert_idx;        /* [n_vert]               original vertex ids       */
+    float *base_shape;      /* [n_vert*3]             packed                    */
+    float *shape_vectors;   /* [n_shape_pc][n_vert*3] packed                    */
+    float *face_vectors;    /* [n_face_pc ][n_vert*3] packed, NULL if none      */
+    int    n_skin;
+    int   *skin_joint_idx;  /* [n_skin]                                         */
+    int   *skin_vert_idx;   /* [n_skin]               subset-local              */
+    float *skin_weights;    /* [n_skin]                                         */
+    int    corr_nnz2;       /* 0 when correctives are not loaded                */
+    int   *corr_row;        /* [corr_nnz2]            subset-local component id */
+    int   *corr_col;
+    float *corr_val;
+};
+
+void mhr_lbs_subset_free(struct MHR_LBS_Subset *s)
+{
+    if (!s) return;
+    free(s->vert_idx); free(s->base_shape); free(s->shape_vectors); free(s->face_vectors);
+    free(s->skin_joint_idx); free(s->skin_vert_idx); free(s->skin_weights);
+    free(s->corr_row); free(s->corr_col); free(s->corr_val);
+    free(s);
+}
+
+struct MHR_LBS_Subset *mhr_lbs_subset_build(const struct MHR_LBS_Data *d,
+                                            const int *vert_idx, int n_vert)
+{
+    if (!d || !vert_idx || n_vert <= 0) return NULL;
+
+    struct MHR_LBS_Subset *s = (struct MHR_LBS_Subset*)calloc(1, sizeof(*s));
+    int *slot = (int*)malloc((size_t)d->n_verts * sizeof(int));
+    if (!s || !slot) { free(slot); mhr_lbs_subset_free(s); return NULL; }
+    for (int v = 0; v < d->n_verts; v++) slot[v] = -1;
+
+    size_t nk = (size_t)n_vert * 3;
+    s->n_vert   = n_vert;
+    s->vert_idx = (int*)malloc((size_t)n_vert * sizeof(int));
+    if (!s->vert_idx) goto fail;
+    for (int k = 0; k < n_vert; k++) {
+        int v = vert_idx[k];
+        if (v < 0 || v >= d->n_verts) goto fail;
+        s->vert_idx[k] = v;
+        slot[v] = k;
+    }
+
+    /* Packed shape basis: base + shape PCs + face PCs, each [n_vert*3] */
+    s->base_shape = (float*)malloc(nk * sizeof(float));
+    if (!s->base_shape) goto fail;
+    for (int k = 0; k < n_vert; k++)
+        memcpy(s->base_shape + (size_t)k*3,
+               d->base_shape + (size_t)s->vert_idx[k]*3, 3*sizeof(float));
+
+    if (d->n_shape_pc > 0) {
+        s->shape_vectors = (float*)malloc((size_t)d->n_shape_pc * nk * sizeof(float));
+        if (!s->shape_vectors) goto fail;
+        for (int p = 0; p < d->n_shape_pc; p++)
+            for (int k = 0; k < n_vert; k++)
+                memcpy(s->shape_vectors + (size_t)p*nk + (size_t)k*3,
+                       d->shape_vectors + ((size_t)p*d->n_verts + s->vert_idx[k])*3,
+                       3*sizeof(float));
+    }
+    if (d->n_face_pc > 0) {
+        s->face_vectors = (float*)malloc((size_t)d->n_face_pc * nk * sizeof(float));
+        if (!s->face_vectors) goto fail;
+        for (int p = 0; p < d->n_face_pc; p++)
+            for (int k = 0; k < n_vert; k++)
+                memcpy(s->face_vectors + (size_t)p*nk + (size_t)k*3,
+                       d->face_vectors + ((size_t)p*d->n_verts + s->vert_idx[k])*3,
+                       3*sizeof(float));
+    }
+
+    /* Skin entries landing on a subset vertex, with the vertex index remapped */
+    for (int k = 0; k < d->n_skin; k++)
+        if (slot[d->skin_vert_idx[k]] >= 0) s->n_skin++;
+    if (s->n_skin > 0) {
+        s->skin_joint_idx = (int*)malloc((size_t)s->n_skin * sizeof(int));
+        s->skin_vert_idx  = (int*)malloc((size_t)s->n_skin * sizeof(int));
+        s->skin_weights   = (float*)malloc((size_t)s->n_skin * sizeof(float));
+        if (!s->skin_joint_idx || !s->skin_vert_idx || !s->skin_weights) goto fail;
+        int n = 0;
+        for (int k = 0; k < d->n_skin; k++) {
+            int sv = slot[d->skin_vert_idx[k]];
+            if (sv < 0) continue;
+            s->skin_joint_idx[n] = d->skin_joint_idx[k];
+            s->skin_vert_idx[n]  = sv;
+            s->skin_weights[n]   = d->skin_weights[k];
+            n++;
+        }
+    }
+
+    /* Corrective layer-2 entries whose output row belongs to the subset.
+     * Rows are vertex-component ids (vertex*3 + component). */
+    if (d->corr_sp2_row) {
+        for (int k = 0; k < d->corr_nnz2; k++)
+            if (slot[d->corr_sp2_row[k] / 3] >= 0) s->corr_nnz2++;
+        if (s->corr_nnz2 > 0) {
+            s->corr_row = (int*)malloc((size_t)s->corr_nnz2 * sizeof(int));
+            s->corr_col = (int*)malloc((size_t)s->corr_nnz2 * sizeof(int));
+            s->corr_val = (float*)malloc((size_t)s->corr_nnz2 * sizeof(float));
+            if (!s->corr_row || !s->corr_col || !s->corr_val) goto fail;
+            int n = 0;
+            for (int k = 0; k < d->corr_nnz2; k++) {
+                int row = d->corr_sp2_row[k];
+                int sv  = slot[row / 3];
+                if (sv < 0) continue;
+                s->corr_row[n] = sv*3 + (row % 3);
+                s->corr_col[n] = d->corr_sp2_col[k];
+                s->corr_val[n] = d->corr_sp2_val[k];
+                n++;
+            }
+        }
+    }
+
+    free(slot);
+    return s;
+
+fail:
+    free(slot);
+    mhr_lbs_subset_free(s);
+    return NULL;
+}
+
+int mhr_lbs_compute_subset(const struct MHR_LBS_Data *d,
+                           const struct MHR_LBS_Subset *s,
+                           const float *model_params,
+                           const float *shape_coeffs,
+                           const float *face_coeffs,
+                           float       *out_verts,
+                           float       *out_joints)
+{
+    if (!d || !s || !model_params || !shape_coeffs || !face_coeffs || !out_verts)
+        return 0;
+
+    int    nj = d->n_joints;
+    size_t nk = (size_t)s->n_vert * 3;
+
+    /* Step 1 — unposed subset vertices (same blend, packed basis) */
+    float *unposed = (float*)malloc(nk * sizeof(float));
+    if (!unposed) return 0;
+    memcpy(unposed, s->base_shape, nk * sizeof(float));
+    for (int i = 0; i < d->n_shape_pc; i++) {
+        float c = shape_coeffs[i];
+        if (c == 0.f) continue;
+        const float *sv = s->shape_vectors + (size_t)i * nk;
+        for (size_t k = 0; k < nk; k++) unposed[k] += c * sv[k];
+    }
+    for (int i = 0; i < d->n_face_pc; i++) {
+        float c = face_coeffs[i];
+        if (c == 0.f) continue;
+        const float *fv = s->face_vectors + (size_t)i * nk;
+        for (size_t k = 0; k < nk; k++) unposed[k] += c * fv[k];
+    }
+
+    /* Steps 2-5 — joint pipeline (identical code path as mhr_lbs_compute) */
+    float *joint_params = (float*)malloc((size_t)d->pt_rows * sizeof(float));
+    float *g_t    = (float*)malloc((size_t)nj * 3 * sizeof(float));
+    float *g_q    = (float*)malloc((size_t)nj * 4 * sizeof(float));
+    float *g_s    = (float*)malloc((size_t)nj * sizeof(float));
+    float *skin_t = (float*)malloc((size_t)nj * 3 * sizeof(float));
+    float *skin_q = (float*)malloc((size_t)nj * 4 * sizeof(float));
+    float *skin_s = (float*)malloc((size_t)nj * sizeof(float));
+    if (!joint_params || !g_t || !g_q || !g_s || !skin_t || !skin_q || !skin_s ||
+        !mhr_lbs_skeleton(d, model_params, joint_params, g_t, g_q, g_s, skin_t, skin_q, skin_s))
+    {
+        free(joint_params); free(g_t); free(g_q); free(g_s);
+        free(skin_t); free(skin_q); free(skin_s); free(unposed);
+        return 0;
+    }
+
+    /* Step 2b — pose correctives restricted to the subset rows.  Layer 1 runs in
+     * full (53k nnz, joint-driven); only layer 2 (2.8 M nnz) is filtered. */
+    if (s->corr_nnz2 > 0 && d->corr_sp1_row) {
+        float *feat   = (float*)calloc((size_t)d->corr_n_feat,   sizeof(float));
+        float *hidden = (float*)calloc((size_t)d->corr_n_hidden, sizeof(float));
+        float *out    = (float*)calloc(nk, sizeof(float));
+        if (feat && hidden && out) {
+            mhr_compute_pose_features(joint_params, nj, feat);
+            mhr_spmv_relu(d->corr_sp1_row, d->corr_sp1_col, d->corr_sp1_val,
+                          d->corr_nnz1, feat, hidden);
+            for (int i = 0; i < d->corr_n_hidden; i++) if (hidden[i] < 0.f) hidden[i] = 0.f;
+            for (int k = 0; k < s->corr_nnz2; k++)
+                out[s->corr_row[k]] += s->corr_val[k] * hidden[s->corr_col[k]];
+            for (size_t k = 0; k < nk; k++) unposed[k] += out[k];
+        }
+        free(feat); free(hidden); free(out);
+    }
+    free(joint_params);
+
+    /* Step 6 — LBS scatter over the subset's skin entries */
+    memset(out_verts, 0, nk * sizeof(float));
+    for (int k = 0; k < s->n_skin; k++) {
+        int   ji = s->skin_joint_idx[k];
+        int   vi = s->skin_vert_idx[k];
+        float w  = s->skin_weights[k];
+        float sx = skin_s[ji];
+
+        const float *vr = unposed + vi * 3;
+        float pv[3];
+        mhr_qrot(pv, skin_q + ji*4, vr);
+        out_verts[vi*3+0] += w * (skin_t[ji*3+0] + sx * pv[0]);
+        out_verts[vi*3+1] += w * (skin_t[ji*3+1] + sx * pv[1]);
+        out_verts[vi*3+2] += w * (skin_t[ji*3+2] + sx * pv[2]);
+    }
+    free(unposed);
+
+    /* Step 7 — coordinate flip + cm→m */
+    for (int v = 0; v < s->n_vert; v++) {
+        out_verts[v*3+0] *=  0.01f;
+        out_verts[v*3+1] *= -0.01f;
+        out_verts[v*3+2] *= -0.01f;
+    }
+
+    /* Step 8 — joint world positions (full skeleton, same flip) */
+    if (out_joints) {
+        for (int j = 0; j < nj; j++) {
+            out_joints[j*3+0] =  g_t[j*3+0] * 0.01f;
+            out_joints[j*3+1] = -g_t[j*3+1] * 0.01f;
+            out_joints[j*3+2] = -g_t[j*3+2] * 0.01f;
+        }
+    }
+
     free(g_t); free(g_q); free(g_s);
     free(skin_t); free(skin_q); free(skin_s);
     return 1;

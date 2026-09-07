@@ -103,6 +103,31 @@ int mhr_lbs_compute(const struct MHR_LBS_Data *d,
                     float       *out_joints,
                     float       *out_joint_quats);
 
+/* ── Keypoint-subset LBS ────────────────────────────────────────────────────
+ * mhr_lbs_compute() blends and skins all 18439 vertices.  Callers that only
+ * need a handful of them (the refined-pose loop reads 70 keypoints, which touch
+ * 468 vertices) can build a subset once and then run the same pipeline over the
+ * packed basis rows instead — same joint math, ~2.5% of the per-vertex work. */
+struct MHR_LBS_Subset;
+
+/* vert_idx[n_vert] are original vertex ids; the subset keeps its own copy.
+ * Returns NULL on failure.  Free with mhr_lbs_subset_free(). */
+struct MHR_LBS_Subset *mhr_lbs_subset_build(const struct MHR_LBS_Data *d,
+                                            const int *vert_idx, int n_vert);
+void mhr_lbs_subset_free(struct MHR_LBS_Subset *s);
+
+/* Same arguments as mhr_lbs_compute(), except:
+ *   out_verts  [n_vert*3]   in subset order (slot k = vert_idx[k])
+ *   out_joints [n_joints*3] full skeleton as usual, may be NULL
+ * Returns 1 on success, 0 on failure. */
+int mhr_lbs_compute_subset(const struct MHR_LBS_Data *d,
+                           const struct MHR_LBS_Subset *s,
+                           const float *model_params,
+                           const float *shape_coeffs,
+                           const float *face_coeffs,
+                           float       *out_verts,
+                           float       *out_joints);
+
 /* ── TRI bone transforms ────────────────────────────────────────────────────── */
 
 /**
