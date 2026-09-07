@@ -464,6 +464,12 @@ struct Pipeline::Impl
     struct MHR_LBS_Data* lbs_data = nullptr;
     MHR_LBS_CUDACtx*    lbs_cuda = nullptr;   // GPU-accelerated path; null on CPU builds
 
+    // Where the refined-pose loops keep their intermediate tensors.  On a GPU EP
+    // that is device memory, so the tokens and the image features never cross the
+    // bus between graphs; on the CPU fallback it is host memory and the bindings
+    // are a no-op wrapper around the same buffers.  Set in load().
+    Ort::MemoryInfo dec_mem{ nullptr };
+
     // Keypoint-only LBS subset: the refined-pose loops evaluate the body model
     // several times per person purely to read the 70 MHR keypoints back out, and
     // those touch only 468 of the 18439 vertices.  Built once from kp_mapping;
@@ -760,6 +766,10 @@ struct Pipeline::Impl
                                                    cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false))
                 return false;
             printf("OK\n");
+
+            dec_mem = sess_decoder_pass1_pre.on_gpu
+                ? Ort::MemoryInfo("Cuda", OrtDeviceAllocator, dev, OrtMemTypeDefault)
+                : Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
         }
 
         // YOLO – optional (might not exist for image-only usage)
@@ -1166,13 +1176,6 @@ struct Pipeline::Impl
             // `_get_hand_box`'s real source (`pose_output["mhr"]["hand_box"]` =
             // `self.bbox_embed(tokens_output)`, not the norm_final'd pose token).
             static const float zero_face72_p1[72] = {};
-            // Where the loop's intermediate tensors live.  On a GPU EP that is
-            // device memory, so the token and the image features never cross the
-            // bus between graphs; on the CPU fallback it is just host memory and
-            // the binding is a no-op wrapper around the same buffers.
-            Ort::MemoryInfo dec_mem = sess_decoder_pass1_pre.on_gpu
-                ? Ort::MemoryInfo("Cuda", OrtDeviceAllocator, cfg.cuda_device, OrtMemTypeDefault)
-                : Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
             for (int i = 0; i < B; ++i)
             {
                 std::vector<int64_t> f_sh{1, BACKBONE_DIM, FEAT_HW, FEAT_HW};
@@ -1188,11 +1191,10 @@ struct Pipeline::Impl
                                       mi, batch_ray.data() + (size_t)i*2*ray_plane, 2*ray_plane, r_sh.data(), 4);
 
                 // pre's outputs are handed straight to the layer/update graphs and
-                // are never read by the CPU, so they are left wherever the EP put
-                // them (device memory under CUDA/TRT).  features_flat, img_aug_flat
-                // and features_chw are 5.2 MB each and constant for the whole
-                // 6-layer loop — copying them back and re-uploading them per layer
-                // cost more than the transformer kernels themselves.
+                // are never read by the CPU, so they stay wherever the EP put them.
+                // features_flat, img_aug_flat and features_chw are 5.2 MB each and
+                // constant for the whole 6-layer loop — copying them back and
+                // re-uploading them per layer cost more than the kernels themselves.
                 auto& p1pre = sess_decoder_pass1_pre;
                 Ort::IoBinding pb(*p1pre.session);
                 pb.BindInput(p1pre.input_names[0], pf_t);
@@ -1548,22 +1550,23 @@ struct Pipeline::Impl
                                       mi, hbatch_cond.data() + (size_t)h*3, 3, c1_sh.data(), 2);
                 Ort::Value hr_t = Ort::Value::CreateTensor<float>(
                                       mi, hbatch_ray.data() + (size_t)h*2*ray_plane, 2*ray_plane, r1_sh.data(), 4);
-                std::vector<Ort::Value> hpre_in;
-                hpre_in.push_back(std::move(hf_t)); hpre_in.push_back(std::move(hc_t)); hpre_in.push_back(std::move(hr_t));
+                // Same marshalling story as pass 1: pre's outputs feed the layer and
+                // update graphs and are never read by the CPU, so they stay in
+                // device memory instead of being copied out and re-uploaded per layer.
+                auto& hpre = sess_decoder_hand_pre;
+                Ort::IoBinding hpb(*hpre.session);
+                hpb.BindInput(hpre.input_names[0], hf_t);
+                hpb.BindInput(hpre.input_names[1], hc_t);
+                hpb.BindInput(hpre.input_names[2], hr_t);
+                for (int o = 0; o < 5; ++o) hpb.BindOutput(hpre.output_names[o], dec_mem);
+                hpre.session->Run(Ort::RunOptions{nullptr}, hpb);
+                std::vector<Ort::Value> hpre_out = hpb.GetOutputValues();
 
-                auto hpre_out = sess_decoder_hand_pre.session->Run(
-                                    Ort::RunOptions{nullptr}, sess_decoder_hand_pre.input_names.data(),
-                                    hpre_in.data(), hpre_in.size(), sess_decoder_hand_pre.output_names.data(), 5);
-                std::vector<float> htoken(hpre_out[0].GetTensorData<float>(),
-                                           hpre_out[0].GetTensorData<float>() + (size_t)HAND_N_TOK*1024);
-                std::vector<float> htok_aug(hpre_out[1].GetTensorData<float>(),
-                                             hpre_out[1].GetTensorData<float>() + (size_t)HAND_N_TOK*1024);
-                std::vector<float> hfeat_chw(hpre_out[2].GetTensorData<float>(),
-                                              hpre_out[2].GetTensorData<float>() + (size_t)BACKBONE_DIM*FEAT_HW*FEAT_HW);
-                std::vector<float> hfeat_flat(hpre_out[3].GetTensorData<float>(),
-                                               hpre_out[3].GetTensorData<float>() + (size_t)FEAT_HW*FEAT_HW*BACKBONE_DIM);
-                std::vector<float> himg_aug_flat(hpre_out[4].GetTensorData<float>(),
-                                                  hpre_out[4].GetTensorData<float>() + (size_t)FEAT_HW*FEAT_HW*BACKBONE_DIM);
+                Ort::Value htoken        = std::move(hpre_out[0]);
+                Ort::Value htok_aug      = std::move(hpre_out[1]);
+                Ort::Value hfeat_chw     = std::move(hpre_out[2]);
+                Ort::Value hfeat_flat    = std::move(hpre_out[3]);
+                Ort::Value himg_aug_flat = std::move(hpre_out[4]);
 
                 // Decodes a raw 519-dim hand regression output into 70 3D
                 // keypoints + crop-normalised 2D/depth, INCLUDING the
@@ -1636,28 +1639,30 @@ struct Pipeline::Impl
 
                 for (int layer_idx = 0; layer_idx < 6; ++layer_idx)
                 {
-                    std::vector<int64_t> tok_sh{1, HAND_N_TOK, 1024}, img_sh{1, FEAT_HW*FEAT_HW, BACKBONE_DIM};
-                    Ort::Value t_tok = Ort::Value::CreateTensor<float>(mi, htoken.data(), htoken.size(), tok_sh.data(), 3);
-                    Ort::Value t_img = Ort::Value::CreateTensor<float>(mi, hfeat_flat.data(), hfeat_flat.size(), img_sh.data(), 3);
-                    Ort::Value t_aug = Ort::Value::CreateTensor<float>(mi, htok_aug.data(), htok_aug.size(), tok_sh.data(), 3);
-                    Ort::Value t_iag = Ort::Value::CreateTensor<float>(mi, himg_aug_flat.data(), himg_aug_flat.size(), img_sh.data(), 3);
-                    std::vector<Ort::Value> lin;
-                    lin.push_back(std::move(t_tok)); lin.push_back(std::move(t_img));
-                    lin.push_back(std::move(t_aug)); lin.push_back(std::move(t_iag));
                     auto& ls = sess_decoder_hand_layers[layer_idx];
-                    auto lout = ls.session->Run(Ort::RunOptions{nullptr}, ls.input_names.data(), lin.data(), lin.size(),
-                                                 ls.output_names.data(), 1);   // only token_out; image_out is a Cast passthrough of image_flat
-                    htoken.assign(lout[0].GetTensorData<float>(), lout[0].GetTensorData<float>() + htoken.size());
+                    Ort::IoBinding lb(*ls.session);
+                    lb.BindInput(ls.input_names[0], htoken);
+                    lb.BindInput(ls.input_names[1], hfeat_flat);
+                    lb.BindInput(ls.input_names[2], htok_aug);
+                    lb.BindInput(ls.input_names[3], himg_aug_flat);
+                    // only token_out; image_out is a Cast passthrough of image_flat
+                    lb.BindOutput(ls.output_names[0], dec_mem);
+                    ls.session->Run(Ort::RunOptions{nullptr}, lb);
+                    htoken = std::move(lb.GetOutputValues()[0]);
 
-                    std::vector<int64_t> pt_sh{1, HAND_N_TOK, 1024};
-                    Ort::Value nf_in = Ort::Value::CreateTensor<float>(mi, htoken.data(), htoken.size(), pt_sh.data(), 3);
-                    std::vector<Ort::Value> nfin; nfin.push_back(std::move(nf_in));
-                    auto nfout = sess_decoder_hand_normfinal.session->Run(
-                                     Ort::RunOptions{nullptr}, sess_decoder_hand_normfinal.input_names.data(),
-                                     nfin.data(), nfin.size(), sess_decoder_hand_normfinal.output_names.data(), 1);
-                    const float* pose_token = nfout[0].GetTensorData<float>();
-
+                    // Last layer: its pose token is regressed once below, so stop
+                    // here rather than running norm_final twice on the same token.
                     if (layer_idx == 5) break;
+
+                    // The pose token is the one thing the CPU needs each iteration
+                    // (4 KB), so bind norm_final's output to host memory.
+                    auto& nf = sess_decoder_hand_normfinal;
+                    Ort::IoBinding nb(*nf.session);
+                    nb.BindInput(nf.input_names[0], htoken);
+                    nb.BindOutput(nf.output_names[0], mi);
+                    nf.session->Run(Ort::RunOptions{nullptr}, nb);
+                    auto nfout = nb.GetOutputValues();
+                    const float* pose_token = nfout[0].GetTensorData<float>();
 
                     std::vector<float> l_mhr = cffn_run(mhr_ffn_hand, pose_token, 1);
                     std::vector<float> l_cam = cffn_run(cam_ffn_hand, pose_token, 1);
@@ -1665,30 +1670,32 @@ struct Pipeline::Impl
                     if (!decode_intermediate_hand(l_mhr.data(), l_cam.data(), kp2d_c, kp2d_d, kp3d))
                         break;
 
-                    std::vector<int64_t> chw_sh{1, BACKBONE_DIM, FEAT_HW, FEAT_HW};
                     std::vector<int64_t> k2_sh{1, 70, 2}, kd_sh{1, 70}, k3_sh{1, 70, 3};
-                    Ort::Value u_tok = Ort::Value::CreateTensor<float>(mi, htoken.data(), htoken.size(), tok_sh.data(), 3);
-                    Ort::Value u_aug = Ort::Value::CreateTensor<float>(mi, htok_aug.data(), htok_aug.size(), tok_sh.data(), 3);
-                    Ort::Value u_chw = Ort::Value::CreateTensor<float>(mi, hfeat_chw.data(), hfeat_chw.size(), chw_sh.data(), 4);
-                    Ort::Value u_k2  = Ort::Value::CreateTensor<float>(mi, kp2d_c.data(), kp2d_c.size(), k2_sh.data(), 3);
-                    Ort::Value u_kd  = Ort::Value::CreateTensor<float>(mi, kp2d_d.data(), kp2d_d.size(), kd_sh.data(), 2);
-                    Ort::Value u_k3  = Ort::Value::CreateTensor<float>(mi, kp3d.data(), kp3d.size(), k3_sh.data(), 3);
-                    std::vector<Ort::Value> uin;
-                    uin.push_back(std::move(u_tok)); uin.push_back(std::move(u_aug)); uin.push_back(std::move(u_chw));
-                    uin.push_back(std::move(u_k2));  uin.push_back(std::move(u_kd));  uin.push_back(std::move(u_k3));
-                    auto uout = sess_decoder_hand_update.session->Run(
-                                    Ort::RunOptions{nullptr}, sess_decoder_hand_update.input_names.data(),
-                                    uin.data(), uin.size(), sess_decoder_hand_update.output_names.data(), 2);
-                    htoken.assign(uout[0].GetTensorData<float>(), uout[0].GetTensorData<float>() + htoken.size());
-                    htok_aug.assign(uout[1].GetTensorData<float>(), uout[1].GetTensorData<float>() + htok_aug.size());
+                    Ort::Value u_k2 = Ort::Value::CreateTensor<float>(mi, kp2d_c.data(), kp2d_c.size(), k2_sh.data(), 3);
+                    Ort::Value u_kd = Ort::Value::CreateTensor<float>(mi, kp2d_d.data(), kp2d_d.size(), kd_sh.data(), 2);
+                    Ort::Value u_k3 = Ort::Value::CreateTensor<float>(mi, kp3d.data(), kp3d.size(), k3_sh.data(), 3);
+                    auto& up = sess_decoder_hand_update;
+                    Ort::IoBinding ub(*up.session);
+                    ub.BindInput(up.input_names[0], htoken);
+                    ub.BindInput(up.input_names[1], htok_aug);
+                    ub.BindInput(up.input_names[2], hfeat_chw);
+                    ub.BindInput(up.input_names[3], u_k2);
+                    ub.BindInput(up.input_names[4], u_kd);
+                    ub.BindInput(up.input_names[5], u_k3);
+                    ub.BindOutput(up.output_names[0], dec_mem);
+                    ub.BindOutput(up.output_names[1], dec_mem);
+                    up.session->Run(Ort::RunOptions{nullptr}, ub);
+                    auto uout = ub.GetOutputValues();
+                    htoken   = std::move(uout[0]);
+                    htok_aug = std::move(uout[1]);
                 }
 
-                std::vector<int64_t> pt_sh_f{1, HAND_N_TOK, 1024};
-                Ort::Value nf_in_f = Ort::Value::CreateTensor<float>(mi, htoken.data(), htoken.size(), pt_sh_f.data(), 3);
-                std::vector<Ort::Value> nfin_f; nfin_f.push_back(std::move(nf_in_f));
-                auto nfout_f = sess_decoder_hand_normfinal.session->Run(
-                                   Ort::RunOptions{nullptr}, sess_decoder_hand_normfinal.input_names.data(),
-                                   nfin_f.data(), nfin_f.size(), sess_decoder_hand_normfinal.output_names.data(), 1);
+                auto& hnff = sess_decoder_hand_normfinal;
+                Ort::IoBinding hnfb(*hnff.session);
+                hnfb.BindInput(hnff.input_names[0], htoken);
+                hnfb.BindOutput(hnff.output_names[0], mi);
+                hnff.session->Run(Ort::RunOptions{nullptr}, hnfb);
+                auto nfout_f = hnfb.GetOutputValues();
                 const float* h_pose_token = nfout_f[0].GetTensorData<float>();
 
                 std::vector<float> h_mhr = cffn_run(mhr_ffn_hand, h_pose_token, 1);
@@ -2524,32 +2531,30 @@ struct Pipeline::Impl
                 Ort::Value pk_t = Ort::Value::CreateTensor<float>(mi, &kp_prompt[0][0], 12, k_sh.data(), 3);
                 Ort::Value pp_t = Ort::Value::CreateTensor<float>(mi, prev_est, 522, p_sh.data(), 3);
 
-                std::vector<Ort::Value> p2_inputs;
-                p2_inputs.push_back(std::move(pf_t));
-                p2_inputs.push_back(std::move(pc_t));
-                p2_inputs.push_back(std::move(pr_t));
-                p2_inputs.push_back(std::move(pk_t));
-                p2_inputs.push_back(std::move(pp_t));
-
                 // ── iterative pass-2: preamble → 6 layers, with the real do_interm_preds
                 // + keypoint_token_update loop interposed between layers, using the
                 // EXISTING native LBS + mhr_ffn/cam_ffn regression heads for the
                 // between-layer step (the piece that can't be exported to ONNX
                 // directly — see POSEREFINE.md). ────────────────────────────────────
-                auto pre_out = sess_decoder_prompted_pre.session->Run(
-                                   Ort::RunOptions{nullptr},
-                                   sess_decoder_prompted_pre.input_names.data(), p2_inputs.data(), p2_inputs.size(),
-                                   sess_decoder_prompted_pre.output_names.data(), 5);
-                std::vector<float> token(pre_out[0].GetTensorData<float>(),
-                                          pre_out[0].GetTensorData<float>() + (size_t)P2_N_TOK*1024);
-                std::vector<float> tok_aug(pre_out[1].GetTensorData<float>(),
-                                            pre_out[1].GetTensorData<float>() + (size_t)P2_N_TOK*1024);
-                std::vector<float> feat_chw(pre_out[2].GetTensorData<float>(),
-                                             pre_out[2].GetTensorData<float>() + (size_t)BACKBONE_DIM*FEAT_HW*FEAT_HW);
-                std::vector<float> feat_flat(pre_out[3].GetTensorData<float>(),
-                                              pre_out[3].GetTensorData<float>() + (size_t)FEAT_HW*FEAT_HW*BACKBONE_DIM);
-                std::vector<float> img_aug_flat(pre_out[4].GetTensorData<float>(),
-                                                 pre_out[4].GetTensorData<float>() + (size_t)FEAT_HW*FEAT_HW*BACKBONE_DIM);
+                // As in pass 1, pre's outputs stay in device memory: the CPU never
+                // reads them, and features_flat/img_aug_flat/features_chw are 5.2 MB
+                // each and constant across the whole 6-layer loop.
+                auto& p2pre = sess_decoder_prompted_pre;
+                Ort::IoBinding p2b(*p2pre.session);
+                p2b.BindInput(p2pre.input_names[0], pf_t);
+                p2b.BindInput(p2pre.input_names[1], pc_t);
+                p2b.BindInput(p2pre.input_names[2], pr_t);
+                p2b.BindInput(p2pre.input_names[3], pk_t);
+                p2b.BindInput(p2pre.input_names[4], pp_t);
+                for (int o = 0; o < 5; ++o) p2b.BindOutput(p2pre.output_names[o], dec_mem);
+                p2pre.session->Run(Ort::RunOptions{nullptr}, p2b);
+                std::vector<Ort::Value> pre_out = p2b.GetOutputValues();
+
+                Ort::Value token        = std::move(pre_out[0]);
+                Ort::Value tok_aug      = std::move(pre_out[1]);
+                Ort::Value feat_chw     = std::move(pre_out[2]);
+                Ort::Value feat_flat    = std::move(pre_out[3]);
+                Ort::Value img_aug_flat = std::move(pre_out[4]);
 
                 // Decodes a raw 519-dim regression output (p2/p2_cam) into 70 3D
                 // keypoints + their crop-normalised 2D/depth projections, for the
@@ -2602,27 +2607,30 @@ struct Pipeline::Impl
 
                 for (int layer_idx = 0; layer_idx < 6; ++layer_idx)
                 {
-                    std::vector<int64_t> tok_sh{1, P2_N_TOK, 1024}, img_sh{1, FEAT_HW*FEAT_HW, BACKBONE_DIM};
-                    Ort::Value t_tok = Ort::Value::CreateTensor<float>(mi, token.data(), token.size(), tok_sh.data(), 3);
-                    Ort::Value t_img = Ort::Value::CreateTensor<float>(mi, feat_flat.data(), feat_flat.size(), img_sh.data(), 3);
-                    Ort::Value t_aug = Ort::Value::CreateTensor<float>(mi, tok_aug.data(), tok_aug.size(), tok_sh.data(), 3);
-                    Ort::Value t_iag = Ort::Value::CreateTensor<float>(mi, img_aug_flat.data(), img_aug_flat.size(), img_sh.data(), 3);
-                    std::vector<Ort::Value> lin; lin.push_back(std::move(t_tok)); lin.push_back(std::move(t_img));
-                    lin.push_back(std::move(t_aug)); lin.push_back(std::move(t_iag));
                     auto& ls = sess_decoder_prompted_layers[layer_idx];
-                    auto lout = ls.session->Run(Ort::RunOptions{nullptr}, ls.input_names.data(), lin.data(), lin.size(),
-                                                 ls.output_names.data(), 1);   // only token_out; image_out is a Cast passthrough of image_flat
-                    token.assign(lout[0].GetTensorData<float>(), lout[0].GetTensorData<float>() + token.size());
+                    Ort::IoBinding lb(*ls.session);
+                    lb.BindInput(ls.input_names[0], token);
+                    lb.BindInput(ls.input_names[1], feat_flat);
+                    lb.BindInput(ls.input_names[2], tok_aug);
+                    lb.BindInput(ls.input_names[3], img_aug_flat);
+                    // only token_out; image_out is a Cast passthrough of image_flat
+                    lb.BindOutput(ls.output_names[0], dec_mem);
+                    ls.session->Run(Ort::RunOptions{nullptr}, lb);
+                    token = std::move(lb.GetOutputValues()[0]);
 
-                    std::vector<int64_t> pt_sh{1, P2_N_TOK, 1024};
-                    Ort::Value nf_in = Ort::Value::CreateTensor<float>(mi, token.data(), token.size(), pt_sh.data(), 3);
-                    std::vector<Ort::Value> nfin; nfin.push_back(std::move(nf_in));
-                    auto nfout = sess_decoder_prompted_normfinal.session->Run(
-                                     Ort::RunOptions{nullptr}, sess_decoder_prompted_normfinal.input_names.data(),
-                                     nfin.data(), nfin.size(), sess_decoder_prompted_normfinal.output_names.data(), 1);
+                    // Last layer: no update, and its pose token is regressed once
+                    // below — so stop here instead of running norm_final twice.
+                    if (layer_idx == 5) break;
+
+                    // The pose token is the one thing the CPU needs each iteration
+                    // (4 KB), so bind norm_final's output to host memory.
+                    auto& nf = sess_decoder_prompted_normfinal;
+                    Ort::IoBinding nb(*nf.session);
+                    nb.BindInput(nf.input_names[0], token);
+                    nb.BindOutput(nf.output_names[0], mi);
+                    nf.session->Run(Ort::RunOptions{nullptr}, nb);
+                    auto nfout = nb.GetOutputValues();
                     const float* pose_token = nfout[0].GetTensorData<float>();
-
-                    if (layer_idx == 5) break;  // last layer: no update, drop straight to final regress below
 
                     std::vector<float> l_mhr = cffn_run(mhr_ffn, pose_token, 1);
                     std::vector<float> l_cam = cffn_run(cam_ffn, pose_token, 1);
@@ -2630,30 +2638,32 @@ struct Pipeline::Impl
                     if (!decode_intermediate(l_mhr.data(), l_cam.data(), kp2d_c, kp2d_d, kp3d))
                         break;
 
-                    std::vector<int64_t> chw_sh{1, BACKBONE_DIM, FEAT_HW, FEAT_HW};
                     std::vector<int64_t> k2_sh{1, 70, 2}, kd_sh{1, 70}, k3_sh{1, 70, 3};
-                    Ort::Value u_tok = Ort::Value::CreateTensor<float>(mi, token.data(), token.size(), tok_sh.data(), 3);
-                    Ort::Value u_aug = Ort::Value::CreateTensor<float>(mi, tok_aug.data(), tok_aug.size(), tok_sh.data(), 3);
-                    Ort::Value u_chw = Ort::Value::CreateTensor<float>(mi, feat_chw.data(), feat_chw.size(), chw_sh.data(), 4);
-                    Ort::Value u_k2  = Ort::Value::CreateTensor<float>(mi, kp2d_c.data(), kp2d_c.size(), k2_sh.data(), 3);
-                    Ort::Value u_kd  = Ort::Value::CreateTensor<float>(mi, kp2d_d.data(), kp2d_d.size(), kd_sh.data(), 2);
-                    Ort::Value u_k3  = Ort::Value::CreateTensor<float>(mi, kp3d.data(), kp3d.size(), k3_sh.data(), 3);
-                    std::vector<Ort::Value> uin;
-                    uin.push_back(std::move(u_tok)); uin.push_back(std::move(u_aug)); uin.push_back(std::move(u_chw));
-                    uin.push_back(std::move(u_k2));  uin.push_back(std::move(u_kd));  uin.push_back(std::move(u_k3));
-                    auto uout = sess_decoder_prompted_update.session->Run(
-                                    Ort::RunOptions{nullptr}, sess_decoder_prompted_update.input_names.data(),
-                                    uin.data(), uin.size(), sess_decoder_prompted_update.output_names.data(), 2);
-                    token.assign(uout[0].GetTensorData<float>(), uout[0].GetTensorData<float>() + token.size());
-                    tok_aug.assign(uout[1].GetTensorData<float>(), uout[1].GetTensorData<float>() + tok_aug.size());
+                    Ort::Value u_k2 = Ort::Value::CreateTensor<float>(mi, kp2d_c.data(), kp2d_c.size(), k2_sh.data(), 3);
+                    Ort::Value u_kd = Ort::Value::CreateTensor<float>(mi, kp2d_d.data(), kp2d_d.size(), kd_sh.data(), 2);
+                    Ort::Value u_k3 = Ort::Value::CreateTensor<float>(mi, kp3d.data(), kp3d.size(), k3_sh.data(), 3);
+                    auto& up = sess_decoder_prompted_update;
+                    Ort::IoBinding ub(*up.session);
+                    ub.BindInput(up.input_names[0], token);
+                    ub.BindInput(up.input_names[1], tok_aug);
+                    ub.BindInput(up.input_names[2], feat_chw);
+                    ub.BindInput(up.input_names[3], u_k2);
+                    ub.BindInput(up.input_names[4], u_kd);
+                    ub.BindInput(up.input_names[5], u_k3);
+                    ub.BindOutput(up.output_names[0], dec_mem);
+                    ub.BindOutput(up.output_names[1], dec_mem);
+                    up.session->Run(Ort::RunOptions{nullptr}, ub);
+                    auto uout = ub.GetOutputValues();
+                    token   = std::move(uout[0]);
+                    tok_aug = std::move(uout[1]);
                 }
 
-                std::vector<int64_t> pt_sh_final{1, P2_N_TOK, 1024};
-                Ort::Value nf_in_final = Ort::Value::CreateTensor<float>(mi, token.data(), token.size(), pt_sh_final.data(), 3);
-                std::vector<Ort::Value> nfin_final; nfin_final.push_back(std::move(nf_in_final));
-                auto nfout_final = sess_decoder_prompted_normfinal.session->Run(
-                                       Ort::RunOptions{nullptr}, sess_decoder_prompted_normfinal.input_names.data(),
-                                       nfin_final.data(), nfin_final.size(), sess_decoder_prompted_normfinal.output_names.data(), 1);
+                auto& p2nf = sess_decoder_prompted_normfinal;
+                Ort::IoBinding p2nfb(*p2nf.session);
+                p2nfb.BindInput(p2nf.input_names[0], token);
+                p2nfb.BindOutput(p2nf.output_names[0], mi);
+                p2nf.session->Run(Ort::RunOptions{nullptr}, p2nfb);
+                auto nfout_final = p2nfb.GetOutputValues();
                 const float* p2_token = nfout_final[0].GetTensorData<float>();
 
                 std::vector<float> p2_mhr = cffn_run(mhr_ffn, p2_token, 1);
