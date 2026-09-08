@@ -582,6 +582,188 @@ struct Pipeline::Impl
     // Falls back to norm_final + the CPU FFNs when the fused graph is absent, so
     // an older onnx/ directory still works.  Pass nullptr for outputs you do not
     // need; only the requested graph outputs are computed.
+    // Context a body-pass intermediate decode needs besides the regression
+    // output itself: the person's box, that person's crop geometry, and the
+    // camera it was cropped under.
+    struct BodyDecodeCtx
+    {
+        float bx1, by1, bx2, by2;            // person box, original-image pixels
+        float crop_cx, crop_cy, crop_sz;     // that person's body crop
+        float fx, fy, cx, cy;                // camera intrinsics
+    };
+
+    // Decode one intermediate regression output into what the
+    // keypoint_token_update graph consumes: 70 3D keypoints plus their
+    // crop-normalised 2D projections and depths.  Returns false to abandon the
+    // refinement (the body model failed).
+    //
+    // Pass 1 and pass 2 held byte-identical copies of this.  The only thing that
+    // differed was where the person's box came from — dets[i] in pass 1, which
+    // runs before results[] is assembled, and r.bbox in pass 2, which is that
+    // same box copied — so it is a parameter now.
+    bool decode_intermediate_body(const float* praw, const float* pcam,
+                                  const BodyDecodeCtx& ctx,
+                                  std::vector<float>& kp2d_cropped_out,
+                                  std::vector<float>& kp2d_depth_out,
+                                  std::vector<float>& kp3d_out) const
+    {
+        static const float zero_face72[72] = {};
+
+        float g_rot[3]; rot6d_to_euler(praw, g_rot);
+        std::array<float,133> b_euler{};
+        compact_cont_to_body_params(praw + MhrOut::BODY, b_euler.data());
+        ModelParams204 mpi = build_model_params(g_rot, b_euler.data(), nullptr, true);
+        apply_hand_pose(mpi.data, praw + MhrOut::HAND,
+                        lbs_data->hand_pose_mean, lbs_data->hand_pose_comps,
+                        lbs_data->hand_joint_idxs_left, lbs_data->hand_joint_idxs_right);
+        if (lbs_data->scale_mean && lbs_data->scale_comps)
+        {
+            int ns = lbs_data->n_scale_out, npc = lbs_data->n_scale_pc;
+            for (int j = 0; j < ns; ++j) mpi.data[136+j] = lbs_data->scale_mean[j];
+            for (int k = 0; k < npc; ++k)
+                for (int j = 0; j < ns; ++j)
+                    mpi.data[136+j] += praw[MhrOut::SCALE + k] * lbs_data->scale_comps[k*ns+j];
+        }
+        if (!kp3d_from_model(mpi.data, praw + MhrOut::SHAPE, zero_face72, kp3d_out))
+            return false;
+
+        float s_val = -pcam[0], t_x = pcam[1], t_y = -pcam[2];
+        float bw = ctx.bx2 - ctx.bx1, bh = ctx.by2 - ctx.by1;
+        float bbox_cx = (ctx.bx1 + ctx.bx2) * 0.5f, bbox_cy = (ctx.by1 + ctx.by2) * 0.5f;
+        float bs = fixed_aspect_bbox_size(bw, bh) * s_val + 1e-8f;
+        float cam_t[3] = { t_x + 2.f*(bbox_cx - ctx.cx)/bs,
+                           t_y + 2.f*(bbox_cy - ctx.cy)/bs,
+                           2.f*ctx.fx/bs };
+        kp2d_cropped_out.assign(70*2, 0.f);
+        kp2d_depth_out.assign(70, 0.f);
+        for (int k = 0; k < 70; ++k)
+        {
+            float dz = kp3d_out[k*3+2] + cam_t[2];
+            float dx = kp3d_out[k*3+0] + cam_t[0];
+            float dy = kp3d_out[k*3+1] + cam_t[1];
+            if (dz < 1e-4f) dz = 1e-4f;
+            float full_x = dx/dz*ctx.fx + ctx.cx, full_y = dy/dz*ctx.fy + ctx.cy;
+            kp2d_cropped_out[k*2+0] = (full_x - ctx.crop_cx) / ctx.crop_sz;
+            kp2d_cropped_out[k*2+1] = (full_y - ctx.crop_cy) / ctx.crop_sz;
+            kp2d_depth_out[k] = dz;
+        }
+        return true;
+    }
+
+    // ─── one iterative decoder variant ───────────────────────────────────────
+    // Pass 1, pass 2 and the hand crops each own a full set of these graphs.
+    // The graphs differ; the code driving them did not — the 6-layer loop below
+    // was copy-pasted three times, byte for byte, and every optimisation to it
+    // had to be applied three times over.
+    struct DecoderPass
+    {
+        OrtSession&               pre;
+        std::array<OrtSession,6>& layers;
+        OrtSession&               update;
+        OrtSession&               normfinal;
+        OrtSession&               head;      // fused norm_final+heads, optional
+        const CFFN&               mhr_head;  // CPU fallback when `head` is absent
+        const CFFN&               cam_head;
+    };
+
+    // pre's five outputs.  They feed the layer and update graphs and are never
+    // read by the CPU, so they stay wherever the execution provider put them:
+    // feat_flat, img_aug_flat and feat_chw are 5.2 MB each and constant for the
+    // whole loop, and copying them back and re-uploading them per layer cost
+    // more than the kernels themselves.
+    struct DecoderState
+    {
+        Ort::Value token{nullptr}, tok_aug{nullptr}, feat_chw{nullptr},
+                   feat_flat{nullptr}, img_aug_flat{nullptr};
+    };
+
+    // `inputs` are bound in order to pre's declared inputs.  Pass 1 and the hand
+    // crops supply (features, cond_info, ray_cond); pass 2's prompted variant
+    // takes two more — the keypoint prompt and the previous estimate — which is
+    // the only place the three variants' preambles differ.
+    DecoderState run_decoder_pre(const DecoderPass& pass,
+                                 std::initializer_list<const Ort::Value*> inputs)
+    {
+        Ort::IoBinding b(*pass.pre.session);
+        int in_idx = 0;
+        for (const Ort::Value* v : inputs)
+            b.BindInput(pass.pre.input_names[in_idx++], *v);
+        for (int o = 0; o < 5; ++o) b.BindOutput(pass.pre.output_names[o], dec_mem);
+        pass.pre.session->Run(Ort::RunOptions{nullptr}, b);
+        std::vector<Ort::Value> out = b.GetOutputValues();
+
+        DecoderState st;
+        st.token        = std::move(out[0]);
+        st.tok_aug      = std::move(out[1]);
+        st.feat_chw     = std::move(out[2]);
+        st.feat_flat    = std::move(out[3]);
+        st.img_aug_flat = std::move(out[4]);
+        return st;
+    }
+
+    // The 6 transformer layers with Python's real do_interm_preds +
+    // keypoint_token_update between them (see POSEREFINE.md): after each layer
+    // but the last, the token is regressed to a pose, that pose is pushed
+    // through the MHR body model on the CPU to get keypoints, and the keypoints
+    // are fed back in.  `decode` is what differs between the three variants —
+    // it maps (raw pose, raw camera) to crop-normalised 2D keypoints, depths
+    // and 3D keypoints, and returns false to abandon the refinement.
+    //
+    // It is a template parameter rather than a std::function so the call still
+    // inlines exactly as it did when this loop was written out three times;
+    // this extraction is meant to cost nothing.
+    //
+    // On return st.token holds the last layer's RAW (pre-norm_final) token,
+    // which is what each caller's epilogue regresses.
+    template <typename DecodeIntermediate>
+    void run_decoder_layers(const DecoderPass& pass, const Ort::MemoryInfo& cpu_mem,
+                            DecoderState& st, DecodeIntermediate&& decode)
+    {
+        for (int layer_idx = 0; layer_idx < 6; ++layer_idx)
+        {
+            OrtSession& ls = pass.layers[layer_idx];
+            Ort::IoBinding lb(*ls.session);
+            lb.BindInput(ls.input_names[0], st.token);
+            lb.BindInput(ls.input_names[1], st.feat_flat);
+            lb.BindInput(ls.input_names[2], st.tok_aug);
+            lb.BindInput(ls.input_names[3], st.img_aug_flat);
+            // only token_out; image_out is a Cast passthrough of image_flat
+            lb.BindOutput(ls.output_names[0], dec_mem);
+            ls.session->Run(Ort::RunOptions{nullptr}, lb);
+            st.token = std::move(lb.GetOutputValues()[0]);
+
+            // Last layer: no update, and its token is regressed once by the
+            // caller — so stop here rather than running norm_final twice.
+            if (layer_idx == 5) break;
+
+            std::vector<float> l_mhr, l_cam;
+            decode_head(pass.head, pass.normfinal, pass.mhr_head, pass.cam_head,
+                        st.token, nullptr, &l_mhr, &l_cam);
+            std::vector<float> kp2d_c, kp2d_d, kp3d;
+            if (!decode(l_mhr.data(), l_cam.data(), kp2d_c, kp2d_d, kp3d))
+                break;
+
+            std::vector<int64_t> k2_sh{1, 70, 2}, kd_sh{1, 70}, k3_sh{1, 70, 3};
+            Ort::Value u_k2 = Ort::Value::CreateTensor<float>(cpu_mem, kp2d_c.data(), kp2d_c.size(), k2_sh.data(), 3);
+            Ort::Value u_kd = Ort::Value::CreateTensor<float>(cpu_mem, kp2d_d.data(), kp2d_d.size(), kd_sh.data(), 2);
+            Ort::Value u_k3 = Ort::Value::CreateTensor<float>(cpu_mem, kp3d.data(), kp3d.size(), k3_sh.data(), 3);
+            OrtSession& up = pass.update;
+            Ort::IoBinding ub(*up.session);
+            ub.BindInput(up.input_names[0], st.token);
+            ub.BindInput(up.input_names[1], st.tok_aug);
+            ub.BindInput(up.input_names[2], st.feat_chw);
+            ub.BindInput(up.input_names[3], u_k2);
+            ub.BindInput(up.input_names[4], u_kd);
+            ub.BindInput(up.input_names[5], u_k3);
+            ub.BindOutput(up.output_names[0], dec_mem);
+            ub.BindOutput(up.output_names[1], dec_mem);
+            up.session->Run(Ort::RunOptions{nullptr}, ub);
+            auto uout = ub.GetOutputValues();
+            st.token   = std::move(uout[0]);
+            st.tok_aug = std::move(uout[1]);
+        }
+    }
+
     bool decode_head(OrtSession& head, OrtSession& nf,
                      const CFFN& mhr_head, const CFFN& cam_head,
                      const Ort::Value& token,
@@ -1367,7 +1549,6 @@ struct Pipeline::Impl
             // LAST layer's raw (pre-norm_final) token, exactly mirroring
             // `_get_hand_box`'s real source (`pose_output["mhr"]["hand_box"]` =
             // `self.bbox_embed(tokens_output)`, not the norm_final'd pose token).
-            static const float zero_face72_p1[72] = {};
             for (int i = 0; i < B; ++i)
             {
                 std::vector<int64_t> f_sh{1, BACKBONE_DIM, FEAT_HW, FEAT_HW};
@@ -1382,120 +1563,27 @@ struct Pipeline::Impl
                 Ort::Value pr_t = Ort::Value::CreateTensor<float>(
                                       mi, batch_ray.data() + (size_t)i*2*ray_plane, 2*ray_plane, r_sh.data(), 4);
 
-                // pre's outputs are handed straight to the layer/update graphs and
-                // are never read by the CPU, so they stay wherever the EP put them.
-                // features_flat, img_aug_flat and features_chw are 5.2 MB each and
-                // constant for the whole 6-layer loop — copying them back and
-                // re-uploading them per layer cost more than the kernels themselves.
-                auto& p1pre = sess_decoder_pass1_pre;
-                Ort::IoBinding pb(*p1pre.session);
-                pb.BindInput(p1pre.input_names[0], pf_t);
-                pb.BindInput(p1pre.input_names[1], pc_t);
-                pb.BindInput(p1pre.input_names[2], pr_t);
-                for (int o = 0; o < 5; ++o) pb.BindOutput(p1pre.output_names[o], dec_mem);
-                p1pre.session->Run(Ort::RunOptions{nullptr}, pb);
-                std::vector<Ort::Value> pre_out = pb.GetOutputValues();
+                const DecoderPass p1_pass{ sess_decoder_pass1_pre,
+                                           sess_decoder_pass1_layers,
+                                           sess_decoder_pass1_update,
+                                           sess_decoder_pass1_normfinal,
+                                           sess_decoder_pass1_head,
+                                           mhr_ffn, cam_ffn };
+                DecoderState st = run_decoder_pre(p1_pass, { &pf_t, &pc_t, &pr_t });
 
-                Ort::Value token        = std::move(pre_out[0]);
-                Ort::Value tok_aug      = std::move(pre_out[1]);
-                Ort::Value feat_chw     = std::move(pre_out[2]);
-                Ort::Value feat_flat    = std::move(pre_out[3]);
-                Ort::Value img_aug_flat = std::move(pre_out[4]);
-
-                // Mirrors pass-2's decode_intermediate lambda exactly
-                // (build_model_params/apply_hand_pose/scale PCA/mhr_lbs_compute/
-                // kp_mapping/camera formula) — just uses dets[i] instead of
-                // r.bbox, since pass 1 runs before results[] is assembled.
-                auto decode_intermediate_p1 = [&](const float* praw, const float* pcam,
-                                                    std::vector<float>& kp2d_cropped_out,
-                                                    std::vector<float>& kp2d_depth_out,
-                                                    std::vector<float>& kp3d_out)
-                {
-                    float g_rot[3]; rot6d_to_euler(praw, g_rot);
-                    std::array<float,133> b_euler{};
-                    compact_cont_to_body_params(praw + MhrOut::BODY, b_euler.data());
-                    ModelParams204 mpi = build_model_params(g_rot, b_euler.data(), nullptr, true);
-                    apply_hand_pose(mpi.data, praw + MhrOut::HAND,
-                                     lbs_data->hand_pose_mean, lbs_data->hand_pose_comps,
-                                     lbs_data->hand_joint_idxs_left, lbs_data->hand_joint_idxs_right);
-                    if (lbs_data->scale_mean && lbs_data->scale_comps)
-                    {
-                        int ns = lbs_data->n_scale_out, npc = lbs_data->n_scale_pc;
-                        for (int j = 0; j < ns; ++j) mpi.data[136+j] = lbs_data->scale_mean[j];
-                        for (int k = 0; k < npc; ++k)
-                            for (int j = 0; j < ns; ++j)
-                                mpi.data[136+j] += praw[MhrOut::SCALE + k] * lbs_data->scale_comps[k*ns+j];
-                    }
-                    if (!kp3d_from_model(mpi.data, praw + MhrOut::SHAPE, zero_face72_p1, kp3d_out))
-                        return false;
-                    float s_val = -pcam[0], t_x = pcam[1], t_y = -pcam[2];
-                    float bw = dets[i].x2-dets[i].x1, bh = dets[i].y2-dets[i].y1;
-                    float bbox_cx = (dets[i].x1+dets[i].x2)*0.5f, bbox_cy = (dets[i].y1+dets[i].y2)*0.5f;
-                    float bs = fixed_aspect_bbox_size(bw,bh)*s_val + 1e-8f;
-                    float cam_t[3] = { t_x + 2.f*(bbox_cx-cx)/bs, t_y + 2.f*(bbox_cy-cy)/bs, 2.f*fx/bs };
-                    kp2d_cropped_out.assign(70*2, 0.f);
-                    kp2d_depth_out.assign(70, 0.f);
-                    for (int k = 0; k < 70; ++k)
-                    {
-                        float dz = kp3d_out[k*3+2] + cam_t[2];
-                        float dx = kp3d_out[k*3+0] + cam_t[0];
-                        float dy = kp3d_out[k*3+1] + cam_t[1];
-                        if (dz < 1e-4f) dz = 1e-4f;
-                        float full_x = dx/dz*fx + cx, full_y = dy/dz*fy + cy;
-                        kp2d_cropped_out[k*2+0] = (full_x - crop_cx_v[i]) / crop_sz_v[i];
-                        kp2d_cropped_out[k*2+1] = (full_y - crop_cy_v[i]) / crop_sz_v[i];
-                        kp2d_depth_out[k] = dz;
-                    }
-                    return true;
-                };
-
-                for (int layer_idx = 0; layer_idx < 6; ++layer_idx)
-                {
-                    auto& ls = sess_decoder_pass1_layers[layer_idx];
-                    Ort::IoBinding lb(*ls.session);
-                    lb.BindInput(ls.input_names[0], token);
-                    lb.BindInput(ls.input_names[1], feat_flat);
-                    lb.BindInput(ls.input_names[2], tok_aug);
-                    lb.BindInput(ls.input_names[3], img_aug_flat);
-                    // only token_out; image_out is a Cast passthrough of image_flat
-                    lb.BindOutput(ls.output_names[0], dec_mem);
-                    ls.session->Run(Ort::RunOptions{nullptr}, lb);
-                    token = std::move(lb.GetOutputValues()[0]);
-
-                    if (layer_idx == 5) break;  // last layer: raw token feeds hand_box below + normfinal for body pose
-
-                    std::vector<float> l_mhr, l_cam;
-                    decode_head(sess_decoder_pass1_head, sess_decoder_pass1_normfinal,
-                                mhr_ffn, cam_ffn, token, nullptr, &l_mhr, &l_cam);
-                    std::vector<float> kp2d_c, kp2d_d, kp3d;
-                    if (!decode_intermediate_p1(l_mhr.data(), l_cam.data(), kp2d_c, kp2d_d, kp3d))
-                        break;
-
-                    std::vector<int64_t> k2_sh{1, 70, 2}, kd_sh{1, 70}, k3_sh{1, 70, 3};
-                    Ort::Value u_k2 = Ort::Value::CreateTensor<float>(mi, kp2d_c.data(), kp2d_c.size(), k2_sh.data(), 3);
-                    Ort::Value u_kd = Ort::Value::CreateTensor<float>(mi, kp2d_d.data(), kp2d_d.size(), kd_sh.data(), 2);
-                    Ort::Value u_k3 = Ort::Value::CreateTensor<float>(mi, kp3d.data(), kp3d.size(), k3_sh.data(), 3);
-                    auto& up = sess_decoder_pass1_update;
-                    Ort::IoBinding ub(*up.session);
-                    ub.BindInput(up.input_names[0], token);
-                    ub.BindInput(up.input_names[1], tok_aug);
-                    ub.BindInput(up.input_names[2], feat_chw);
-                    ub.BindInput(up.input_names[3], u_k2);
-                    ub.BindInput(up.input_names[4], u_kd);
-                    ub.BindInput(up.input_names[5], u_k3);
-                    ub.BindOutput(up.output_names[0], dec_mem);
-                    ub.BindOutput(up.output_names[1], dec_mem);
-                    up.session->Run(Ort::RunOptions{nullptr}, ub);
-                    auto uout = ub.GetOutputValues();
-                    token   = std::move(uout[0]);
-                    tok_aug = std::move(uout[1]);
-                }
+                const BodyDecodeCtx p1_ctx{ dets[i].x1, dets[i].y1, dets[i].x2, dets[i].y2,
+                                            crop_cx_v[i], crop_cy_v[i], crop_sz_v[i],
+                                            fx, fy, cx, cy };
+                run_decoder_layers(p1_pass, mi, st,
+                    [&](const float* praw, const float* pcam, std::vector<float>& k2,
+                        std::vector<float>& kd, std::vector<float>& k3)
+                    { return decode_intermediate_body(praw, pcam, p1_ctx, k2, kd, k3); });
 
                 // Last layer's RAW token (pre-norm_final) — hand_box/hand_cls source.
                 {
                     auto& hbx = sess_decoder_pass1_handbox;
                     Ort::IoBinding hb_b(*hbx.session);
-                    hb_b.BindInput(hbx.input_names[0], token);
+                    hb_b.BindInput(hbx.input_names[0], st.token);
                     hb_b.BindOutput(hbx.output_names[0], mi);
                     hb_b.BindOutput(hbx.output_names[1], mi);
                     hbx.session->Run(Ort::RunOptions{nullptr}, hb_b);
@@ -1512,7 +1600,7 @@ struct Pipeline::Impl
                 // more than the transformer layer that produced the token.
                 std::vector<float> pose_final, mhr_final, cam_final;
                 decode_head(sess_decoder_pass1_head, sess_decoder_pass1_normfinal,
-                            mhr_ffn, cam_ffn, token, &pose_final, &mhr_final, &cam_final);
+                            mhr_ffn, cam_ffn, st.token, &pose_final, &mhr_final, &cam_final);
                 std::memcpy(pose_tokens.data() + (size_t)i*DECODER_DIM, pose_final.data(),
                             (size_t)DECODER_DIM*sizeof(float));
                 if (mhr_raw.empty())
@@ -1792,23 +1880,13 @@ struct Pipeline::Impl
                                       mi, hbatch_cond.data() + hs*3, 3, c1_sh.data(), 2);
                 Ort::Value hr_t = Ort::Value::CreateTensor<float>(
                                       mi, hbatch_ray.data() + hs*2*ray_plane, 2*ray_plane, r1_sh.data(), 4);
-                // Same marshalling story as pass 1: pre's outputs feed the layer and
-                // update graphs and are never read by the CPU, so they stay in
-                // device memory instead of being copied out and re-uploaded per layer.
-                auto& hpre = sess_decoder_hand_pre;
-                Ort::IoBinding hpb(*hpre.session);
-                hpb.BindInput(hpre.input_names[0], hf_t);
-                hpb.BindInput(hpre.input_names[1], hc_t);
-                hpb.BindInput(hpre.input_names[2], hr_t);
-                for (int o = 0; o < 5; ++o) hpb.BindOutput(hpre.output_names[o], dec_mem);
-                hpre.session->Run(Ort::RunOptions{nullptr}, hpb);
-                std::vector<Ort::Value> hpre_out = hpb.GetOutputValues();
-
-                Ort::Value htoken        = std::move(hpre_out[0]);
-                Ort::Value htok_aug      = std::move(hpre_out[1]);
-                Ort::Value hfeat_chw     = std::move(hpre_out[2]);
-                Ort::Value hfeat_flat    = std::move(hpre_out[3]);
-                Ort::Value himg_aug_flat = std::move(hpre_out[4]);
+                const DecoderPass hand_pass{ sess_decoder_hand_pre,
+                                             sess_decoder_hand_layers,
+                                             sess_decoder_hand_update,
+                                             sess_decoder_hand_normfinal,
+                                             sess_decoder_hand_head,
+                                             mhr_ffn_hand, cam_ffn_hand };
+                DecoderState hst = run_decoder_pre(hand_pass, { &hf_t, &hc_t, &hr_t });
 
                 // Decodes a raw 519-dim hand regression output into 70 3D
                 // keypoints + crop-normalised 2D/depth, INCLUDING the
@@ -1879,53 +1957,11 @@ struct Pipeline::Impl
                     return true;
                 };
 
-                for (int layer_idx = 0; layer_idx < 6; ++layer_idx)
-                {
-                    auto& ls = sess_decoder_hand_layers[layer_idx];
-                    Ort::IoBinding lb(*ls.session);
-                    lb.BindInput(ls.input_names[0], htoken);
-                    lb.BindInput(ls.input_names[1], hfeat_flat);
-                    lb.BindInput(ls.input_names[2], htok_aug);
-                    lb.BindInput(ls.input_names[3], himg_aug_flat);
-                    // only token_out; image_out is a Cast passthrough of image_flat
-                    lb.BindOutput(ls.output_names[0], dec_mem);
-                    ls.session->Run(Ort::RunOptions{nullptr}, lb);
-                    htoken = std::move(lb.GetOutputValues()[0]);
-
-                    // Last layer: its pose token is regressed once below, so stop
-                    // here rather than running norm_final twice on the same token.
-                    if (layer_idx == 5) break;
-
-                    std::vector<float> l_mhr, l_cam;
-                    decode_head(sess_decoder_hand_head, sess_decoder_hand_normfinal,
-                                mhr_ffn_hand, cam_ffn_hand, htoken, nullptr, &l_mhr, &l_cam);
-                    std::vector<float> kp2d_c, kp2d_d, kp3d;
-                    if (!decode_intermediate_hand(l_mhr.data(), l_cam.data(), kp2d_c, kp2d_d, kp3d))
-                        break;
-
-                    std::vector<int64_t> k2_sh{1, 70, 2}, kd_sh{1, 70}, k3_sh{1, 70, 3};
-                    Ort::Value u_k2 = Ort::Value::CreateTensor<float>(mi, kp2d_c.data(), kp2d_c.size(), k2_sh.data(), 3);
-                    Ort::Value u_kd = Ort::Value::CreateTensor<float>(mi, kp2d_d.data(), kp2d_d.size(), kd_sh.data(), 2);
-                    Ort::Value u_k3 = Ort::Value::CreateTensor<float>(mi, kp3d.data(), kp3d.size(), k3_sh.data(), 3);
-                    auto& up = sess_decoder_hand_update;
-                    Ort::IoBinding ub(*up.session);
-                    ub.BindInput(up.input_names[0], htoken);
-                    ub.BindInput(up.input_names[1], htok_aug);
-                    ub.BindInput(up.input_names[2], hfeat_chw);
-                    ub.BindInput(up.input_names[3], u_k2);
-                    ub.BindInput(up.input_names[4], u_kd);
-                    ub.BindInput(up.input_names[5], u_k3);
-                    ub.BindOutput(up.output_names[0], dec_mem);
-                    ub.BindOutput(up.output_names[1], dec_mem);
-                    up.session->Run(Ort::RunOptions{nullptr}, ub);
-                    auto uout = ub.GetOutputValues();
-                    htoken   = std::move(uout[0]);
-                    htok_aug = std::move(uout[1]);
-                }
+                run_decoder_layers(hand_pass, mi, hst, decode_intermediate_hand);
 
                 std::vector<float> h_mhr, h_cam;
                 decode_head(sess_decoder_hand_head, sess_decoder_hand_normfinal,
-                            mhr_ffn_hand, cam_ffn_hand, htoken, nullptr, &h_mhr, &h_cam);
+                            mhr_ffn_hand, cam_ffn_hand, hst.token, nullptr, &h_mhr, &h_cam);
                 std::copy(h_mhr.begin(), h_mhr.end(), hand_mhr_raw.begin() + (size_t)h*mhr_ffn_hand.out_dim);
                 std::copy(h_cam.begin(), h_cam.end(), hand_cam_raw.begin() + (size_t)h*3);
             }
@@ -2339,7 +2375,6 @@ struct Pipeline::Impl
             std::vector<HandFK> hfk(HB);
 
             std::vector<float> hq_scratch((size_t)lbs_data->n_joints * 4);
-            static const float zero_face72[72] = {};
 
             // ── Criterion 1 (rotation agreement) prerequisite: pass-1's own "zero
             // rotation" FK reference per person, for both hands — matches Python's
@@ -2776,122 +2811,26 @@ struct Pipeline::Impl
                 // EXISTING native LBS + mhr_ffn/cam_ffn regression heads for the
                 // between-layer step (the piece that can't be exported to ONNX
                 // directly — see POSEREFINE.md). ────────────────────────────────────
-                // As in pass 1, pre's outputs stay in device memory: the CPU never
-                // reads them, and features_flat/img_aug_flat/features_chw are 5.2 MB
-                // each and constant across the whole 6-layer loop.
-                auto& p2pre = sess_decoder_prompted_pre;
-                Ort::IoBinding p2b(*p2pre.session);
-                p2b.BindInput(p2pre.input_names[0], pf_t);
-                p2b.BindInput(p2pre.input_names[1], pc_t);
-                p2b.BindInput(p2pre.input_names[2], pr_t);
-                p2b.BindInput(p2pre.input_names[3], pk_t);
-                p2b.BindInput(p2pre.input_names[4], pp_t);
-                for (int o = 0; o < 5; ++o) p2b.BindOutput(p2pre.output_names[o], dec_mem);
-                p2pre.session->Run(Ort::RunOptions{nullptr}, p2b);
-                std::vector<Ort::Value> pre_out = p2b.GetOutputValues();
+                const DecoderPass p2_pass{ sess_decoder_prompted_pre,
+                                           sess_decoder_prompted_layers,
+                                           sess_decoder_prompted_update,
+                                           sess_decoder_prompted_normfinal,
+                                           sess_decoder_prompted_head,
+                                           mhr_ffn, cam_ffn };
+                DecoderState st = run_decoder_pre(p2_pass,
+                                                  { &pf_t, &pc_t, &pr_t, &pk_t, &pp_t });
 
-                Ort::Value token        = std::move(pre_out[0]);
-                Ort::Value tok_aug      = std::move(pre_out[1]);
-                Ort::Value feat_chw     = std::move(pre_out[2]);
-                Ort::Value feat_flat    = std::move(pre_out[3]);
-                Ort::Value img_aug_flat = std::move(pre_out[4]);
-
-                // Decodes a raw 519-dim regression output (p2/p2_cam) into 70 3D
-                // keypoints + their crop-normalised 2D/depth projections, for the
-                // keypoint_token_update step — mirrors the FINAL pass-2 decode+LBS+
-                // projection block below exactly (build_model_params/apply_hand_pose/
-                // scale PCA/mhr_lbs_compute/kp_mapping/camera formula), just run
-                // mid-loop instead of once at the end.
-                auto decode_intermediate = [&](const float* praw, const float* pcam,
-                                                std::vector<float>& kp2d_cropped_out,
-                                                std::vector<float>& kp2d_depth_out,
-                                                std::vector<float>& kp3d_out)
-                {
-                    float g_rot[3]; rot6d_to_euler(praw, g_rot);
-                    std::array<float,133> b_euler{};
-                    compact_cont_to_body_params(praw + MhrOut::BODY, b_euler.data());
-                    ModelParams204 mpi = build_model_params(g_rot, b_euler.data(), nullptr, true);
-                    apply_hand_pose(mpi.data, praw + MhrOut::HAND,
-                                     lbs_data->hand_pose_mean, lbs_data->hand_pose_comps,
-                                     lbs_data->hand_joint_idxs_left, lbs_data->hand_joint_idxs_right);
-                    if (lbs_data->scale_mean && lbs_data->scale_comps)
-                    {
-                        int ns = lbs_data->n_scale_out, npc = lbs_data->n_scale_pc;
-                        for (int j = 0; j < ns; ++j) mpi.data[136+j] = lbs_data->scale_mean[j];
-                        for (int k = 0; k < npc; ++k)
-                            for (int j = 0; j < ns; ++j)
-                                mpi.data[136+j] += praw[MhrOut::SCALE + k] * lbs_data->scale_comps[k*ns+j];
-                    }
-                    if (!kp3d_from_model(mpi.data, praw + MhrOut::SHAPE, zero_face72, kp3d_out))
-                        return false;
-                    float s_val = -pcam[0], t_x = pcam[1], t_y = -pcam[2];
-                    float bw = r.bbox[2]-r.bbox[0], bh = r.bbox[3]-r.bbox[1];
-                    float bbox_cx = (r.bbox[0]+r.bbox[2])*0.5f, bbox_cy = (r.bbox[1]+r.bbox[3])*0.5f;
-                    float bs = fixed_aspect_bbox_size(bw,bh)*s_val + 1e-8f;
-                    float cam_t[3] = { t_x + 2.f*(bbox_cx-cx)/bs, t_y + 2.f*(bbox_cy-cy)/bs, 2.f*fx/bs };
-                    kp2d_cropped_out.assign(70*2, 0.f);
-                    kp2d_depth_out.assign(70, 0.f);
-                    for (int k = 0; k < 70; ++k)
-                    {
-                        float dz = kp3d_out[k*3+2] + cam_t[2];
-                        float dx = kp3d_out[k*3+0] + cam_t[0];
-                        float dy = kp3d_out[k*3+1] + cam_t[1];
-                        if (dz < 1e-4f) dz = 1e-4f;
-                        float full_x = dx/dz*fx + cx, full_y = dy/dz*fy + cy;
-                        kp2d_cropped_out[k*2+0] = (full_x - crop_cx_v[i]) / crop_sz_v[i];
-                        kp2d_cropped_out[k*2+1] = (full_y - crop_cy_v[i]) / crop_sz_v[i];
-                        kp2d_depth_out[k] = dz;
-                    }
-                    return true;
-                };
-
-                for (int layer_idx = 0; layer_idx < 6; ++layer_idx)
-                {
-                    auto& ls = sess_decoder_prompted_layers[layer_idx];
-                    Ort::IoBinding lb(*ls.session);
-                    lb.BindInput(ls.input_names[0], token);
-                    lb.BindInput(ls.input_names[1], feat_flat);
-                    lb.BindInput(ls.input_names[2], tok_aug);
-                    lb.BindInput(ls.input_names[3], img_aug_flat);
-                    // only token_out; image_out is a Cast passthrough of image_flat
-                    lb.BindOutput(ls.output_names[0], dec_mem);
-                    ls.session->Run(Ort::RunOptions{nullptr}, lb);
-                    token = std::move(lb.GetOutputValues()[0]);
-
-                    // Last layer: no update, and its pose token is regressed once
-                    // below — so stop here instead of running norm_final twice.
-                    if (layer_idx == 5) break;
-
-                    std::vector<float> l_mhr, l_cam;
-                    decode_head(sess_decoder_prompted_head, sess_decoder_prompted_normfinal,
-                                mhr_ffn, cam_ffn, token, nullptr, &l_mhr, &l_cam);
-                    std::vector<float> kp2d_c, kp2d_d, kp3d;
-                    if (!decode_intermediate(l_mhr.data(), l_cam.data(), kp2d_c, kp2d_d, kp3d))
-                        break;
-
-                    std::vector<int64_t> k2_sh{1, 70, 2}, kd_sh{1, 70}, k3_sh{1, 70, 3};
-                    Ort::Value u_k2 = Ort::Value::CreateTensor<float>(mi, kp2d_c.data(), kp2d_c.size(), k2_sh.data(), 3);
-                    Ort::Value u_kd = Ort::Value::CreateTensor<float>(mi, kp2d_d.data(), kp2d_d.size(), kd_sh.data(), 2);
-                    Ort::Value u_k3 = Ort::Value::CreateTensor<float>(mi, kp3d.data(), kp3d.size(), k3_sh.data(), 3);
-                    auto& up = sess_decoder_prompted_update;
-                    Ort::IoBinding ub(*up.session);
-                    ub.BindInput(up.input_names[0], token);
-                    ub.BindInput(up.input_names[1], tok_aug);
-                    ub.BindInput(up.input_names[2], feat_chw);
-                    ub.BindInput(up.input_names[3], u_k2);
-                    ub.BindInput(up.input_names[4], u_kd);
-                    ub.BindInput(up.input_names[5], u_k3);
-                    ub.BindOutput(up.output_names[0], dec_mem);
-                    ub.BindOutput(up.output_names[1], dec_mem);
-                    up.session->Run(Ort::RunOptions{nullptr}, ub);
-                    auto uout = ub.GetOutputValues();
-                    token   = std::move(uout[0]);
-                    tok_aug = std::move(uout[1]);
-                }
+                const BodyDecodeCtx p2_ctx{ r.bbox[0], r.bbox[1], r.bbox[2], r.bbox[3],
+                                            crop_cx_v[i], crop_cy_v[i], crop_sz_v[i],
+                                            fx, fy, cx, cy };
+                run_decoder_layers(p2_pass, mi, st,
+                    [&](const float* praw, const float* pcam, std::vector<float>& k2,
+                        std::vector<float>& kd, std::vector<float>& k3)
+                    { return decode_intermediate_body(praw, pcam, p2_ctx, k2, kd, k3); });
 
                 std::vector<float> p2_mhr, p2_cam;
                 decode_head(sess_decoder_prompted_head, sess_decoder_prompted_normfinal,
-                            mhr_ffn, cam_ffn, token, nullptr, &p2_mhr, &p2_cam);
+                            mhr_ffn, cam_ffn, st.token, nullptr, &p2_mhr, &p2_cam);
                 const float* p2 = p2_mhr.data();
 
                 // Pass 2's decode REPLACES the pass-1 output wholesale (matches Python:
