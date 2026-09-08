@@ -1425,9 +1425,16 @@ struct Pipeline::Impl
     // GPU work, rather than from trying to widen any one stage.
     //
     // The pool is a fork/join barrier: all N workers are released together and
-    // waited on together, so frames are processed in batches of N.  Results
-    // therefore lag submission by up to N frames, and the first N-1 calls to
-    // process_bgr() return empty while the batch fills.
+    // waited on together, so frames are processed in batches of N.  To keep the
+    // caller's loop running at a steady rate rather than stalling for a whole
+    // batch every N frames, the kick and the wait are split (the pool supports
+    // Prepare -> Kick -> other work -> WaitForKicked) and the slots are double
+    // buffered: while the pool chews on one bank the main thread fills the
+    // other and hands back one already-finished result per call.  The wait only
+    // happens when a bank fills, and by then the batch has had N calls' worth of
+    // wall time to finish, so on a live source paced by the camera it is usually
+    // already done and costs nothing.  The price is latency: results lag
+    // submission by N to 2N frames instead of up to N.
     struct PipelineSlot
     {
         cv::Mat                frame;      // owned copy: the caller's buffer is
@@ -1439,8 +1446,11 @@ struct Pipeline::Impl
 
     struct workerPool         pipe_pool{};
     bool                      pipe_started = false;
-    std::vector<PipelineSlot> pipe_slots;    // the batch currently being filled
-    int                       pipe_fill = 0;
+    std::vector<PipelineSlot> pipe_bank[2];  // one filled by us, one owned by the pool
+    int                       pipe_fill_bank = 0;   // which bank we are filling
+    int                       pipe_fill = 0;        // slots used in that bank
+    bool                      pipe_inflight = false;// a kick is outstanding
+    std::vector<PipelineSlot>* pipe_active = nullptr; // bank the workers read
     std::deque<PipelineSlot>  pipe_done;     // finished, awaiting collection
     PipelineSlot              pipe_last;     // most recently handed back
     long long                 pipe_submitted = 0;
@@ -1468,27 +1478,31 @@ struct Pipeline::Impl
                 "      this build.  Continuing single-threaded.\n", n);
             return false;
         }
-        pipe_slots.resize(n);
+        pipe_bank[0].resize(n);
+        pipe_bank[1].resize(n);
         if (!threadpoolCreate(&pipe_pool, (unsigned int)n,
                               (void*)&Impl::pipeline_worker, this))
         {
             fprintf(stderr, "[FSB] --pipeline %d: could not create the worker pool, "
                             "falling back to single-threaded.\n", n);
-            pipe_slots.clear();
+            pipe_bank[0].clear();
+            pipe_bank[1].clear();
             return false;
         }
         pipe_started = true;
-        printf("[FSB] frame pipeline: %d frames in flight "
-               "(results lag submission by up to %d frames)\n", n, n);
+        printf("[FSB] frame pipeline: %d frames in flight, double buffered "
+               "(results lag submission by %d-%d frames)\n", n, n, 2 * n);
         return true;
     }
 
     void pipeline_stop()
     {
         if (!pipe_started) return;
+        pipeline_harvest();          // never tear the pool down under a live kick
         threadpoolDestroy(&pipe_pool);
         pipe_started = false;
-        pipe_slots.clear();
+        pipe_bank[0].clear();
+        pipe_bank[1].clear();
         pipe_done.clear();
         pipe_fill = 0;
     }
@@ -1515,20 +1529,33 @@ struct Pipeline::Impl
     // how a partial final batch is drained.
     void pipeline_worker_run(int id)
     {
-        if (id < 0 || id >= (int)pipe_slots.size()) return;
-        PipelineSlot& s = pipe_slots[id];
+        if (pipe_active == nullptr) return;
+        if (id < 0 || id >= (int)pipe_active->size()) return;
+        PipelineSlot& s = (*pipe_active)[id];
         if (!s.filled) return;
         s.results = process_mat(s.frame, s.frame.cols, s.frame.rows);
     }
 
-    void pipeline_run_batch()
+    // Hand the bank we just filled to the pool and return immediately; the other
+    // bank becomes the one we fill next.
+    void pipeline_kick()
     {
+        pipe_active = &pipe_bank[pipe_fill_bank];
         threadpoolMainThreadPrepareWorkForWorkers(&pipe_pool);
         threadpoolMainThreadKickWorkers(&pipe_pool);
+        pipe_inflight  = true;
+        pipe_fill_bank = 1 - pipe_fill_bank;
+        pipe_fill      = 0;
+    }
+
+    // Wait for the outstanding kick (if any) and queue its results in order.
+    void pipeline_harvest()
+    {
+        if (!pipe_inflight) return;
         threadpoolMainThreadWaitForKickedWorkersToFinishTimeoutSeconds(&pipe_pool, 0);
-        for (auto& s : pipe_slots)
+        for (auto& s : *pipe_active)
             if (s.filled) { pipe_done.push_back(std::move(s)); s = PipelineSlot{}; }
-        pipe_fill = 0;
+        pipe_inflight = false;
     }
 
     std::vector<MHRResult> pipeline_collect()
@@ -1541,14 +1568,18 @@ struct Pipeline::Impl
 
     std::vector<MHRResult> pipeline_submit(const uint8_t* bgr, int W, int H)
     {
-        PipelineSlot& s = pipe_slots[pipe_fill];
+        std::vector<PipelineSlot>& bank = pipe_bank[pipe_fill_bank];
+        PipelineSlot&              s    = bank[pipe_fill];
         cv::Mat(H, W, CV_8UC3, const_cast<uint8_t*>(bgr)).copyTo(s.frame);
         s.index  = pipe_submitted++;
         s.filled = true;
         ++pipe_fill;
 
-        if (pipe_fill == (int)pipe_slots.size())
-            pipeline_run_batch();
+        if (pipe_fill == (int)bank.size())
+        {
+            pipeline_harvest();   // collect the previous batch — normally already done
+            pipeline_kick();      // release this one and carry on without waiting
+        }
 
         return pipeline_collect();
     }
@@ -1557,8 +1588,15 @@ struct Pipeline::Impl
     // pending result per call.  Empty return means the pipeline is empty.
     std::vector<MHRResult> pipeline_drain()
     {
-        if (pipe_done.empty() && pipe_fill > 0)
-            pipeline_run_batch();
+        if (pipe_done.empty())
+        {
+            pipeline_harvest();                      // the batch still in the pool
+            if (pipe_done.empty() && pipe_fill > 0)  // then the partial tail bank
+            {
+                pipeline_kick();
+                pipeline_harvest();
+            }
+        }
         return pipeline_collect();
     }
 

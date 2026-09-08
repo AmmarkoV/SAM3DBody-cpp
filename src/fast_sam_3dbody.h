@@ -166,11 +166,13 @@ struct PipelineConfig {
 
     // --pipeline N: process N frames concurrently on a worker pool.  1 (the
     // default) keeps the pipeline exactly single-threaded and synchronous.  With
-    // N>1 process_bgr() buffers frames until it holds N, runs them in parallel,
-    // and then returns results for EARLIER frames — output lags submission by up
-    // to N frames, and the first N-1 calls return empty while the pool fills.
-    // Use Pipeline::drain() at end of stream to get the tail, and
-    // Pipeline::last_result_bgr() to find which frame a result belongs to.
+    // N>1 process_bgr() buffers frames until it holds N, hands the batch to the
+    // pool WITHOUT waiting, and returns results for EARLIER frames — one per
+    // call, so the caller's loop keeps a steady rate instead of stalling for a
+    // whole batch every N frames.  Output lags submission by N to 2N frames, and
+    // the first calls return empty while the pool fills.  Use Pipeline::drain()
+    // at end of stream to get the tail, and Pipeline::last_result_bgr() to find
+    // which frame a result belongs to.
     int pipeline_depth = 1;
     std::string decoder_hand_name    = "decoder_hand.onnx";
     std::string decoder_prompted_name= "decoder_prompted.onnx";

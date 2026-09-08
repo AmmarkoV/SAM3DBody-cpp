@@ -54,6 +54,7 @@ extern "C" {
 #include <cstring>
 #include <string>
 #include <vector>
+#include <deque>
 #include <time.h>
 
 // ── Inline GLSL shaders ──────────────────────────────────────────────────────
@@ -653,6 +654,7 @@ int main(int argc, const char** argv) {
     float       rot_clamp_deg     = 1.0f;   // rejection threshold in degrees/frame
     int         max_frames        = -1;     // --frames N: stop after N frames
     int         pipeline_depth    = 1;      // --pipeline N: frames processed concurrently
+    int         frame_skip        = 0;      // --frameskip K: source frames discarded per processed one
     int         start_frame       = 0;      // --start N: seek to frame N first
     int         max_persons       = 0;      // --max-persons N: 0 = unlimited
     int         detector          = fsb::PipelineConfig::DET_YOLO_POSE; // --detector
@@ -770,6 +772,7 @@ int main(int argc, const char** argv) {
     start_frame                    = cc.start_frame;
     max_persons                    = cc.max_persons;
     pipeline_depth                 = cc.pipeline_depth;
+    frame_skip                     = cc.frame_skip;
     detector                       = detector_kind_from_string(cc.detector);
 
     // ── Pipeline ─────────────────────────────────────────────────────────────
@@ -1077,6 +1080,21 @@ int main(int argc, const char** argv) {
     // ends we keep looping to flush the frames still inside the pool.
     const bool pipelining = pipeline_depth > 1;
     bool       draining   = false;
+    // --pipeline N hands results back in bursts: the pool finishes N frames at
+    // once, so N iterations return instantly and the next one blocks for a whole
+    // batch.  Drawn as it arrives that looks like a stutter every N frames, so
+    // instead we hold each result until its slot in an even schedule.  It costs
+    // no throughput: the next batch was kicked the moment the previous one was
+    // harvested, so the pool keeps working right through the sleeps.  Headless
+    // runs skip it — nobody is watching, and the point there is raw throughput.
+    const bool pacing        = pipelining && !headless;
+    long long  t_next_emit   = 0;   // when the current result is due on screen
+    // Recent emission times, used to measure the rate we are sustaining.  A
+    // couple of bursts is the right window: shorter and the estimate is just the
+    // burst's own shape, longer and a one-off stall (a TensorRT engine build for
+    // a person count we have not seen yet) skews the schedule for ages.
+    const size_t          pace_window = (size_t)(2 * pipeline_depth);
+    std::deque<long long> pace_hist;
     while (glx3_checkEvents()) 
     {
         if (draining)
@@ -1094,18 +1112,34 @@ int main(int argc, const char** argv) {
             // driver has already overwritten anything older, so grabbing beyond
             // that would block waiting on a not-yet-captured frame).  Video files
             // fall through untouched and are read frame-by-frame.
+            bool ended = false;
             if (frame_dropping)
             {
                 double elapsed_s = (NS_NOW() - t_last_grab) / 1e9;
                 int    behind    = (int)(elapsed_s * video_fps) - 1;
                 if (behind > LIVE_BUFFER - 1) behind = LIVE_BUFFER - 1;
-                bool   ended     = false;
                 for (int s = 0; s < behind; ++s)
                     if (!cap.grab()) { ended = true; break; }   // discard stale
                     else             ++dropped_frames;
-                if (ended) break;                               // stream closed
             }
-            cap >> frame;                 // newest available frame
+            // --frameskip K: deterministically discard K frames after every
+            // processed one, so we sample every (K+1)-th frame.  This is
+            // independent of the adaptive dropper above: that one reacts to how
+            // long inference took, this one fixes the *spacing* of the samples.
+            // With --pipeline N the pool grabs N frames back to back and then
+            // stalls for a whole batch, so a camera's samples arrive in bursts
+            // and the recovered motion is unevenly timed; skipping widens the
+            // in-burst gaps until they match the batch gap.  Offline it simply
+            // processes less of the video.
+            for (int s = 0; s < frame_skip && !ended; ++s)
+                if (!cap.grab()) ended = true;
+                else             ++dropped_frames;
+            if (ended)                    // source ran out mid-skip
+            {
+                if (!pipelining) break;
+                draining = true;          // flush what is still in the pool
+            }
+            if (!draining) cap >> frame;  // newest available frame
             t_last_grab = NS_NOW();
             if (frame.empty())
             {
@@ -1129,6 +1163,33 @@ int main(int argc, const char** argv) {
         else if (draining)
             break;
         double latency_ms = (NS_NOW() - t_infer) / 1e6;
+
+        // Spread the burst.  The target period is the rate we are actually
+        // sustaining, taken a few percent fast so the estimate can come back
+        // down — pacing to exactly the achieved rate would make any overshoot
+        // permanent, since the achieved rate is then whatever we chose.
+        if (pacing && !results.empty())
+        {
+            long long now = NS_NOW();
+            if (pace_hist.size() >= 2)
+            {
+                long long period = (long long)(0.97 * (double)(pace_hist.back() - pace_hist.front())
+                                                    / (double)(pace_hist.size() - 1));
+                if (t_next_emit == 0 || now - t_next_emit > 2 * period)
+                    t_next_emit = now;                       // first frame, or lost the beat
+                if (t_next_emit > now)
+                {
+                    struct timespec ts;
+                    ts.tv_sec  = (time_t)((t_next_emit - now) / 1000000000LL);
+                    ts.tv_nsec = (long)  ((t_next_emit - now) % 1000000000LL);
+                    nanosleep(&ts, nullptr);
+                    now = NS_NOW();
+                }
+                t_next_emit += period;
+            }
+            pace_hist.push_back(now);
+            if (pace_hist.size() > pace_window) pace_hist.pop_front();
+        }
 
         // Patch arm/collar/head angles in mhr_model_params.
         // The pipeline runs with skip_body_model=true so its internal lbs_data is null,

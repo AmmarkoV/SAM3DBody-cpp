@@ -86,6 +86,7 @@ struct CommonConfig
     bool        fp16           = true;    // can be disabled with --no-fp16
     bool        ort_verbose    = false;   // --ort-verbose: print per-node EP assignment at session load
     int         pipeline_depth = 1;       // --pipeline N: run N frames concurrently
+    int         frame_skip     = 0;       // --frameskip K: discard K source frames per processed one
 
     // ── YOLO person detector tuning ──────────────────────────────────────────
     // The renderer doesn't use these (it inherits whatever the pipeline
@@ -185,6 +186,7 @@ inline bool parse_common_arg(int argc, const char* const* argv, int& i,
     CLI_BOOL("--no-fp16",              fp16,    false)
     CLI_BOOL("--ort-verbose",          ort_verbose, true)
     CLI_INT ("--pipeline",             pipeline_depth)
+    CLI_INT ("--frameskip",            frame_skip)
 
     // Detector tuning.  --detector-threshold is the preferred, self-describing
     // spelling; --thresh is kept as a back-compat alias.  Both record that the
@@ -721,6 +723,13 @@ inline void print_common_args_help(FILE* fp)
         "                                 N=1 is the ordinary synchronous path.  N>1 trades latency for\n"
         "                                 throughput: results lag submission by up to N frames and the\n"
         "                                 per-frame [FSB] stage lines from the N workers interleave.\n"
+        "  --frameskip K                  Discard K source frames after every processed one, i.e. sample\n"
+        "                                 every (K+1)-th frame (default 0 = every frame).  Offline this\n"
+        "                                 just raises throughput.  Live, it is the fix for the bursty\n"
+        "                                 sampling --pipeline N introduces: the pool grabs N frames back\n"
+        "                                 to back and then stalls for the whole batch, so motion comes\n"
+        "                                 out unevenly timed.  Pick K+1 near (batch time)/(N x camera\n"
+        "                                 frame interval) to space the grabs evenly.\n"
         "  --ort-verbose                  Print ORT's per-node execution-provider assignment table at\n"
         "                                 session load (shows which ops got pinned to the CPU EP and are\n"
         "                                 forcing Memcpy nodes at CUDA/TensorRT graph boundaries)\n"
