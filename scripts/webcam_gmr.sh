@@ -30,6 +30,12 @@
 #  (the binary's own live view), plus the retargeted robot (the sink's viewer).
 #  HEADLESS=1 suppresses the input overlay (e.g. on a server / under xvfb).
 #
+#  If a crowded scene leaves the robot stuck in a bent pose, press R in the robot
+#  window to re-home the IK to its neutral pose.  gmr_stream.py also does this by
+#  itself when the IK residual says it is stuck (--no-reset-on-stuck disables it),
+#  and eases the robot home when the tracked person is lost for a couple of
+#  seconds and no frames arrive at all (--reset-idle-s 0 disables that).
+#
 #  Prerequisites:
 #    - the C++ binary is built (build/fast_sam_3dbody_run)
 #    - tools/setup_gmr.sh has been run (GMR/venv + lafan_mhr.bvh)
@@ -139,6 +145,7 @@ else
     echo "[webcam_gmr] transport: stdout pipe  [$_shm_reason]  (Ctrl-C to stop)"
 fi
 [ "$HEADLESS" = "0" ] && echo "[webcam_gmr] input overlay window on (press q in it to stop; HEADLESS=1 to disable)"
+[ "$SINK" = "viewer" ] && echo "[webcam_gmr] press R in the robot window to reset a stuck pose to neutral"
 
 # --max-persons 1: one actor drives the robot. --butterworth (+ root rotation):
 # the live binary's causal smoothing, so the robot isn't fed raw per-frame jitter.

@@ -9,6 +9,13 @@
 # reused verbatim (no reimplementation).  Each frame is then retargeted, causally
 # despiked (robot safety), and pushed to a pluggable Sink.
 #
+# GMR's IK is warm-started (retarget() integrates into rt.configuration in place),
+# which a crowd can walk into a bent local minimum it never climbs out of, so two
+# escapes re-home it to the robot's neutral qpos0: pressing R in the robot window,
+# and an automatic residual check.  A third case is losing the person entirely --
+# the C++ side then streams nothing at all -- so an idle watchdog eases the robot
+# home rather than leaving it frozen.  See "Stuck-pose recovery" in GMR.md.
+#
 # Unlike gmr_retarget.py this is CAUSAL: single pass, no look-ahead.  The offline
 # despike_qpos interpolates a glitch frame from its FUTURE clean neighbour, which
 # we cannot do live; instead we CLAMP each frame's step away from the last
@@ -18,7 +25,7 @@
 # Usage (normally via scripts/webcam_gmr.sh):
 #   fast_sam_3dbody_run ... --bvh-template lafan_mhr.bvh --bvh-stream - \
 #     | gmr_stream.py --robot unitree_g1 --config <pos_config.json> --flip-depth
-import argparse, copy, sys
+import argparse, copy, os, select, sys, time
 import numpy as np
 from pathlib import Path
 
@@ -59,6 +66,29 @@ ap.add_argument("--despike-pos-m", type=float, default=0.30,
                 help="max root position velocity (m/frame) before the step is clamped")
 ap.add_argument("--despike-dof-deg", type=float, default=45.0,
                 help="max per-dof angular velocity (deg/frame) before the step is clamped")
+# Stuck-pose recovery.  GMR's IK is a warm-started differential solver: retarget()
+# integrates velocities into rt.configuration IN PLACE, so every frame starts from
+# wherever the last one ended.  With a crowd, --max-persons 1 can hand it a
+# different person frame to frame; the contradictory targets can walk it into a
+# bent local minimum it cannot climb out of, and it then stays bent even after the
+# source pose is clean again.  Both escapes below re-home the solver to the robot
+# model's neutral qpos0 and re-solve the SAME targets from there.
+ap.add_argument("--no-reset-on-stuck", action="store_true",
+                help="disable the automatic escape (on by default). When on, a persistently high "
+                     "IK residual triggers a re-solve from the neutral pose, kept only if it is "
+                     "actually better than the warm-started one (so a false trigger costs one "
+                     "extra IK solve and changes nothing).")
+ap.add_argument("--reset-stuck-err", type=float, default=4.0,
+                help="IK residual (sum of the two match tables' task-error norms) above which a "
+                     "frame counts as stuck. Measured with the shipped g1 config: healthy tracking "
+                     "sits at 1.6-2.0 and peaks at 3.0, while real stuck episodes read 8-19.")
+ap.add_argument("--reset-stuck-frames", type=int, default=2,
+                help="consecutive over-threshold frames before the escape is attempted")
+ap.add_argument("--reset-idle-s", type=float, default=2.0,
+                help="seconds without a frame after which the robot is eased back to the neutral "
+                     "pose (0 disables). The C++ side streams nothing while nobody is detected, so "
+                     "a crowd that loses the tracked person would otherwise leave the robot frozen "
+                     "in whatever pose the last frame happened to be.")
 a = ap.parse_args()
 
 # Point the bvh_lafan1 -> <robot> config at our custom file (in-memory patch;
@@ -123,11 +153,49 @@ def causal_clamp(prev, q, root_deg, pos_m, dof_deg):
     return out, True
 
 
+# ── stuck-pose recovery ──────────────────────────────────────────────────────
+# Set from the MuJoCo viewer's UI thread, consumed by the streaming loop (a plain
+# bool is enough: both sides are Python bytecode under the GIL).
+_reset_requested = False
+
+RESET_KEY = "R"
+def _on_key(keycode):
+    """RobotMotionViewer -> mujoco.viewer key_callback. GLFW reports letter keys
+    as their uppercase ASCII code; accept both spellings anyway."""
+    global _reset_requested
+    if keycode in (ord(RESET_KEY), ord(RESET_KEY.lower())):
+        _reset_requested = True
+
+
+# How often the frame sources wake up to report "still nothing" (seconds).  Small
+# enough that the idle ease looks smooth, large enough not to spin.
+_POLL_S = 0.02
+
+
+def ease_step(prev, target):
+    """One velocity-bounded step from prev toward target, reusing the causal
+    despike caps -- so easing home is as safe to actuate as tracked motion, and
+    repeated calls land exactly on target."""
+    if a.no_despike:
+        return target.copy()
+    return causal_clamp(prev, target, a.despike_root_deg, a.despike_pos_m, a.despike_dof_deg)[0]
+
+
+def ik_residual(rt):
+    """Total IK task error of the pose currently in rt.configuration. Same
+    quantity GMR reports internally, summed over whichever match tables are on."""
+    e = 0.0
+    if rt.use_ik_match_table1: e += float(rt.error1())
+    if rt.use_ik_match_table2: e += float(rt.error2())
+    return e
+
+
 # ── pluggable sinks ──────────────────────────────────────────────────────────
 class ViewerSink:
     """Live MuJoCo visualisation of the retargeted robot (GMR's own viewer)."""
-    def __init__(self, robot, fps):
-        self.v = RobotMotionViewer(robot_type=robot, motion_fps=fps)
+    def __init__(self, robot, fps, key_callback=None):
+        self.v = RobotMotionViewer(robot_type=robot, motion_fps=fps,
+                                   keyboard_callback=key_callback)
     def step(self, q, overlay):
         self.v.step(root_pos=q[:3], root_rot=q[3:7], dof_pos=q[7:],
                     human_motion_data=overlay, rate_limit=True, follow_camera=True)
@@ -172,13 +240,33 @@ def channels_from_line(motion_line):
 
 # ── main streaming loop ──────────────────────────────────────────────────────
 def make_sink():
-    return DDSSink(a.robot, a.fps) if a.sink == "dds" else ViewerSink(a.robot, a.fps)
+    if a.sink == "dds":
+        return DDSSink(a.robot, a.fps)          # no viewer, hence no reset key
+    return ViewerSink(a.robot, a.fps, _on_key)
 
 # ── frame sources: shared memory (fast path) or @F lines on stdin (fallback) ──
 def _stdin_channels():
-    """Yield channel arrays from '@F' lines on stdin; forward diagnostics."""
-    for raw in sys.stdin:
-        raw = raw.rstrip("\n")
+    """Yield channel arrays from '@F' lines on stdin, or None when _POLL_S passes
+    with nothing to read (which is what drives the idle watchdog).
+
+    We read the fd ourselves and split lines by hand rather than iterating
+    sys.stdin: select() reports the OS-level fd, so a TextIOWrapper sitting on a
+    chunk of already-buffered lines would look idle when it is not.
+    """
+    fd  = sys.stdin.fileno()
+    buf = b""
+    while True:
+        if b"\n" not in buf:
+            if not select.select([fd], [], [], _POLL_S)[0]:
+                yield None
+                continue
+            chunk = os.read(fd, 65536)
+            if not chunk:                     # EOF -- the producer is gone
+                return
+            buf += chunk
+            continue
+        line, buf = buf.split(b"\n", 1)
+        raw = line.decode(errors="replace").rstrip("\r")
         if not raw.startswith("@F "):
             if raw:                           # forward the binary's diagnostics
                 print(raw, file=sys.stderr)
@@ -187,12 +275,19 @@ def _stdin_channels():
 
 
 def main():
+    global _reset_requested
     rt = None
     sink = None
     prev_q = None
     y0 = 0.0
     nclamp = 0
     reader = None
+    q_home = None                 # the robot's neutral qpos0 -- what we reset to
+    stuck_n = 0                   # consecutive over-threshold frames
+    nrehome = 0
+    t_last_frame = time.monotonic()
+    easing = False                # currently walking the robot back to neutral
+    nidle = 0
 
     if a.bvh_shm:
         from shm_bvh_reader import ShmBvhReader
@@ -200,16 +295,36 @@ def main():
         reader = ShmBvhReader(lib, a.bvh_shm, a.shm_stream)
         print(f"[gmr_stream] reading frames from shm '{a.bvh_shm}:{a.shm_stream}'", file=sys.stderr)
         def source():
-            while True:
-                arr = reader.read()
-                if arr is not None:
-                    yield arr
+            while True:                       # None on timeout = an idle tick
+                yield reader.read(timeout=_POLL_S)
         channels = source()
     else:
         channels = _stdin_channels()
 
     try:
         for arr in channels:
+            if arr is None:                   # no frame this tick -- idle watchdog
+                if rt is None:                # nothing has ever arrived; no viewer yet
+                    continue
+                idle_s = time.monotonic() - t_last_frame
+                if not (_reset_requested or
+                        (a.reset_idle_s > 0 and idle_s > a.reset_idle_s)):
+                    continue
+                if not easing:
+                    easing = True
+                    why = "reset key" if _reset_requested else f"no frames for {idle_s:.1f}s"
+                    _reset_requested = False
+                    # Re-home the solver too, so tracking resumes from neutral
+                    # rather than snapping back to the pose we just walked away from.
+                    rt.configuration.update(q_home)
+                    nidle += 1
+                    print(f"[gmr_stream] {why} -> easing to the neutral pose", file=sys.stderr)
+                prev_q = q_home.copy() if prev_q is None else ease_step(prev_q, q_home)
+                sink.step(prev_q, {})         # {} (not None) clears the stale human overlay
+                continue
+
+            t_last_frame = time.monotonic()
+            easing = False
             fr = fk.frame_from_channels(arr)
 
             if rt is None:                    # lazy init on the first real frame
@@ -221,14 +336,51 @@ def main():
                     print(f"[gmr_stream] bone-path={H:.3f} m -> actual_human_height={hh:.3f} m",
                           file=sys.stderr)
                 rt = GMR(src_human="bvh_lafan1", tgt_robot=a.robot, actual_human_height=hh)
+                # mink.Configuration is built from the model's default qpos0, and
+                # nothing has integrated into it yet, so this IS the neutral pose.
+                q_home = rt.configuration.q.copy()
                 sink = make_sink()
+                if a.sink != "dds":
+                    print(f"[gmr_stream] press {RESET_KEY} in the robot window to reset the pose",
+                          file=sys.stderr)
                 if a.flip_depth:
                     y0 = float(np.asarray(fr["Hips"][0])[DEPTH])
 
             if a.flip_depth:
                 fr = _flip_depth(fr, y0)
 
+            # Manual reset: re-home the solver, then solve this frame from neutral.
+            # prev_q is dropped too, so the causal clamp does not drag the recovered
+            # pose back toward the bent one it was just asked to abandon.
+            if _reset_requested:
+                _reset_requested = False
+                rt.configuration.update(q_home)
+                prev_q = None
+                stuck_n = 0
+                print("[gmr_stream] reset: IK re-homed to the neutral pose", file=sys.stderr)
+
             q = rt.retarget(fr, offset_to_ground=not a.no_ground)
+
+            # Automatic escape from a bent local minimum.  The warm start is what
+            # gets stuck, so re-solve the same targets from neutral -- but keep that
+            # result only if it genuinely scores better, because from a cold start
+            # the IK can also land far worse than a healthy warm solve.
+            if not a.no_reset_on_stuck:
+                err = ik_residual(rt)
+                stuck_n = stuck_n + 1 if err > a.reset_stuck_err else 0
+                if stuck_n >= a.reset_stuck_frames:
+                    stuck_n = 0
+                    q_warm = rt.configuration.q.copy()
+                    rt.configuration.update(q_home)
+                    q_alt = rt.retarget(fr, offset_to_ground=not a.no_ground)
+                    err_alt = ik_residual(rt)
+                    if err_alt < err:
+                        q = q_alt
+                        nrehome += 1
+                        print(f"[gmr_stream] stuck (residual {err:.2f}) -> re-homed, "
+                              f"residual {err_alt:.2f}", file=sys.stderr)
+                    else:
+                        rt.configuration.update(q_warm)   # escape was worse; keep the warm solve
 
             if not a.no_despike and prev_q is not None:
                 q, clamped = causal_clamp(prev_q, q, a.despike_root_deg,
@@ -246,6 +398,10 @@ def main():
             sink.close()
         if nclamp:
             print(f"[gmr_stream] causal despike clamped {nclamp} frame(s)", file=sys.stderr)
+        if nrehome:
+            print(f"[gmr_stream] re-homed out of a stuck pose {nrehome} time(s)", file=sys.stderr)
+        if nidle:
+            print(f"[gmr_stream] eased to the neutral pose {nidle} time(s)", file=sys.stderr)
 
 if __name__ == "__main__":
     main()
