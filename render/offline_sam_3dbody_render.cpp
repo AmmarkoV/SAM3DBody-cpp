@@ -103,6 +103,11 @@ static void print_usage(const char* prog)
         "  --cuda     N               CUDA device index, -1 for CPU (default 0)\n"
         "  --trt                      Use ONNX Runtime TensorRT EP\n"
         "  --no-fp16                  Disable FP16\n"
+        "  --no-refined-pose          Disable the iterative refined pose, which is ON by default in\n"
+        "                             offline mode (the live binaries have it off by default and opt\n"
+        "                             in with --refined-pose, accepted here too).  It roughly doubles\n"
+        "                             the per-frame cost and fetches the 'refined' model profile on\n"
+        "                             first run, and it is what fixes image alignment.\n"
         "  --ort-verbose              Print ORT's per-node EP assignment + a chrome-trace profile per\n"
         "                             session to /tmp/ort_profile_<model>_*.json (open in chrome://tracing)\n"
         "  --detector-threshold F     Person confidence (default 0.50; 0.25 for libreyolo). Alias: --thresh\n"
@@ -194,6 +199,8 @@ static bool parse_args(int argc, char** argv, Config& c)
             else { fprintf(stderr, "unknown --smoothing %s\n", v.c_str()); return false; }
             continue;
         }
+        if (!strcmp(argv[i], "--refined-pose"))            { c.refined_pose = true;  continue; }
+        if (!strcmp(argv[i], "--no-refined-pose"))         { c.refined_pose = false; continue; }
         if (!strcmp(argv[i], "--interpolate-jitter"))     { c.interpolate_jitter = true; continue; }
         if (!strcmp(argv[i], "--no-gap-interpolation"))   { c.gap_interpolation = false; continue; }
         if (!strcmp(argv[i], "--no-scene-detection"))     { c.scene_detection = false; continue; }
@@ -258,11 +265,14 @@ int main(int argc, char** argv)
     fsb::Pipeline pipeline;
     {
         fsb::PipelineConfig pcfg;
-        ensure_models(cfg);                     // fetch the models if onnx/ is empty
+        ensure_models(cfg, cfg.refined_pose);   // fetch the models if onnx/ is empty
+                                                // (incl. the 'refined' profile, which
+                                                // offline mode uses by default)
         resolve_detector_defaults(cfg);         // "auto" → libreyolo when available
         resolve_backbone_defaults(cfg);         // CUDA: prefer backbone_fp16.onnx if present
         apply_common_to_pipeline_cfg(cfg, pcfg);
         pcfg.skip_body_model = false;  // we need keypoints_3d for jitter detection
+        pcfg.refined_pose    = cfg.refined_pose;
         if (!pipeline.load(pcfg)) {
             fprintf(stderr, "Failed to load pipeline\n");
             return 1;

@@ -76,6 +76,14 @@ struct Config : public CommonConfig
 
     std::string lbs_path;          // auto: <onnx_dir>/body_model.lbs
 
+    // Iterative refined pose (the live binaries' --refined-pose).  ON by
+    // default here: it roughly doubles the per-frame cost, which is exactly the
+    // trade this binary exists to make — it already pays for five passes over
+    // the clip to buy accuracy that a causal live run cannot have.  Turn it off
+    // with --no-refined-pose.  Note it also pulls the 'refined' model profile
+    // (the iterative decoder_* graphs + pipeline_refined.gguf) on first run.
+    bool      refined_pose         = true;
+
     // Process only a frame window: seek to start_frame, then stop after
     // max_frames decoded (0 = whole video).  Used by the multi-view front-end
     // to align per-stream inference to a common wall-clock window.
