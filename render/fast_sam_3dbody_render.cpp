@@ -660,6 +660,7 @@ int main(int argc, const char** argv) {
     bool fp16         = true;
     bool zero_face    = true;
     bool refined_pose = false;  // --refined-pose: see PLAN.md
+    bool no_pass2     = false;  // --no-pass2: run only pass 1 of --refined-pose
     std::string boxes_path;  // --boxes: external person boxes, one "x1 y1 x2 y2" per line
     float  focal_x    = 0.f; // --fx: camera focal x in pixels (0 = pipeline default)
     float  focal_y    = 0.f; // --fy: camera focal y in pixels (0 = pipeline default)
@@ -727,6 +728,7 @@ int main(int argc, const char** argv) {
         if (!strcmp(argv[i], "--mjpg")) { use_mjpg = true; continue; }
         if (!strcmp(argv[i], "--dev-face"))    { zero_face      = false; continue; }
         if (!strcmp(argv[i], "--refined-pose")){ refined_pose   = true;  continue; }
+        if (!strcmp(argv[i], "--no-pass2"))    { no_pass2       = true;  continue; }
         if (!strcmp(argv[i], "--butterworth"))              { use_butterworth  = true; continue; }
         if (!strcmp(argv[i], "--butterworth-root-rotation")){ filter_root_rot  = true; continue; }
         if (!strcmp(argv[i], "--headless"))                 { headless = true; continue; }
@@ -816,6 +818,7 @@ int main(int argc, const char** argv) {
         // Pipeline self-contained rather than threading render's copy in.
         cfg.skip_body_model = !refined_pose;
         cfg.refined_pose    = refined_pose;
+        cfg.skip_pass2      = no_pass2;
         if (!pipeline.load(cfg)) {
             fprintf(stderr, "Failed to load pipeline\n"); return 1;
         }

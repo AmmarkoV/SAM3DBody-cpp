@@ -367,6 +367,8 @@ Full option list:
 --rot-clamp DEG    Geodesic SLERP-step clamp on global_rot in degrees/frame (default 1; 0 = no clamp)
 --refined-pose     Extra iterative pose-refinement passes (see "Refined pose" below).
                    fast_sam_3dbody_render only; off by default
+--no-pass2         With --refined-pose, run pass 1 only: keeps pass 1's image
+                   alignment and skips the pass-2 re-decode + hand splice
 --info             Print pipeline info and exit
 --help             Show this message
 ```
@@ -421,6 +423,34 @@ That is roughly 1.1–1.4 fps for live webcam input — the flag is currently be
 suited to recorded video, BVH export, and quality testing rather than fluid
 live use. The extra cost scales with the number of visible hands per person
 (up to two hand-crop decode loops per person per frame).
+
+**`--no-pass2`** runs only pass 1 of the refinement. Pass 1 is what fixes the
+image alignment (the foot-slippage symptom); pass 2 re-decodes the body from a
+keypoint prompt and splices the hand crops in, for a smaller additional gain at
+roughly the same cost again. If you want the alignment without the second pass:
+
+```bash
+./build/fast_sam_3dbody_render --from video.mp4 --refined-pose --no-pass2
+```
+
+Hand crops are also skipped up front when the regressed hand box is at or below
+64 px in the source image, since the validity gate rejects those regardless of
+what the decoder returns. On multi-person footage with a distant subject that is
+commonly half the hand crops in the frame, and it changes no output — those
+hands were already being discarded, just after paying for a backbone pass and a
+six-layer decode each.
+
+Measured on `videos/300.mkv`, RTX 4080 SUPER, `--trt`, on frames with 2 people and
+2 surviving hand crops:
+
+| mode | frame |
+|------|------:|
+| `--refined-pose`, before the pre-gate | 213 ms |
+| `--refined-pose` | 135 ms |
+| `--refined-pose --no-pass2` | 112 ms |
+
+The saving scales with how many hands fail the size test, so it is largest exactly
+where the pipeline was slowest: crowded frames with distant people.
 
 ### Python lightweight frontend
 

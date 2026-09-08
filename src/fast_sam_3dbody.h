@@ -158,6 +158,11 @@ struct PipelineConfig {
     // faithful per-layer ONNX + native-LBS port of that iterative loop) is
     // built out on this branch.
     bool refined_pose = false;
+    // --no-pass2 (or FSB_SKIP_PASS2): run only pass 1 of --refined-pose.  Pass 1
+    // is what fixes the image alignment; pass 2 re-decodes the body from the
+    // keypoint prompt and splices the hand crops in, which costs roughly as much
+    // again.  Skipping it keeps pass 1's alignment at a fraction of the price.
+    bool skip_pass2 = false;
     std::string decoder_hand_name    = "decoder_hand.onnx";
     std::string decoder_prompted_name= "decoder_prompted.onnx";
 };

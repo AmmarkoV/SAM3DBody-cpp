@@ -228,8 +228,14 @@ struct OrtSession
     // not on the CPU fallback — i.e. whether binding I/O to device memory works.
     bool                  on_gpu = false;
 
+    // fixed_batch > 0 pins the model's symbolic "B" dimension to that value.  ORT
+    // can then constant-fold the shape arithmetic that a dynamic batch forces it
+    // to keep as live graph nodes — worth ~40% on the update graphs, which are
+    // mostly Shape/Expand/Range/Concat plumbing.  Only pass it for a session that
+    // really is always called at that batch size: ORT rejects other shapes after
+    // the override.
     bool load(Ort::Env& e, const std::string& path, bool cuda, int device,
-              bool fp16_io = false, bool trt_ep = false)
+              bool fp16_io = false, bool trt_ep = false, int fixed_batch = 0)
     {
         // Execution-provider preference ladder, most→least preferred.  We try
         // each in turn and fall back on failure, so a missing TensorRT runtime
@@ -254,6 +260,9 @@ struct OrtSession
             const bool last = (a + 1 == ladder.size());
             Ort::SessionOptions opts;
             opts.SetIntraOpNumThreads(1);
+            if (fixed_batch > 0)
+                Ort::ThrowOnError(Ort::GetApi().AddFreeDimensionOverrideByName(
+                                      opts, "B", (int64_t)fixed_batch));
             opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
             if (g_ort_verbose)
             {
@@ -432,6 +441,10 @@ struct Pipeline::Impl
     OrtSession sess_decoder_hand_update;
     OrtSession sess_decoder_hand_head;       // optional: norm_final + hand mhr/cam heads fused
     static constexpr int HAND_N_TOK = 145, HAND_KPS_START = 3, HAND_KPS3D_START = 73;
+    // Minimum hand-crop side (px, original image) for the validity gate below.
+    // Also applied up front, when the crops are built, so hands that cannot
+    // possibly pass never reach the backbone — see "pre-gate" there.
+    static constexpr float HAND_BOX_SIZE_THRESH = 64.f;
 
     // Iterative pass-1 (plain body decode — decoder.onnx never had the real
     // do_interm_preds + keypoint_token_update loop either; discovered while
@@ -763,7 +776,7 @@ struct Pipeline::Impl
                                                     cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false))
                 return false;
             if (!sess_decoder_hand_update.load(ort_env, opath("decoder_hand_update.onnx"),
-                                                 cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false))
+                                                 cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false, /*fixed_batch=*/1))
                 return false;
             printf("OK\n");
 
@@ -814,7 +827,7 @@ struct Pipeline::Impl
                                                         cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false))
                 return false;
             if (!sess_decoder_prompted_update.load(ort_env, opath("decoder_prompted_update.onnx"),
-                                                     cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false))
+                                                     cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false, /*fixed_batch=*/1))
                 return false;
             printf("OK\n");
 
@@ -835,7 +848,7 @@ struct Pipeline::Impl
                                                      cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false))
                 return false;
             if (!sess_decoder_pass1_update.load(ort_env, opath("decoder_pass1_update.onnx"),
-                                                  cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false))
+                                                  cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false, /*fixed_batch=*/1))
                 return false;
             if (!sess_decoder_pass1_handbox.load(ort_env, opath("decoder_pass1_handbox.onnx"),
                                                    cuda, dev, /*fp16_io=*/false, /*trt_ep=*/false))
@@ -1237,8 +1250,10 @@ struct Pipeline::Impl
                                 Ort::RunOptions{nullptr},
                                 sess_backbone.input_names.data(),  &img_t,  1,
                                 sess_backbone.output_names.data(), 1);
-        const float* feat_ptr = backbone_out[0].GetTensorData<float>();
-        std::vector<float> features(feat_ptr, feat_ptr + feat_elems);
+        // backbone_out owns this buffer and stays in scope for the whole frame
+        // (pass 1 at the decoder below, pass 2 further down), so point at it
+        // directly rather than memcpy'ing 5.2 MB per person into a vector.
+        float* features = backbone_out[0].GetTensorMutableData<float>();
         double dt_bb = ms(t0);
         timers.backbone += dt_bb;
         printf("[FSB] backbone:   %.1f ms\n", dt_bb);
@@ -1282,7 +1297,7 @@ struct Pipeline::Impl
                 std::vector<int64_t> r_sh{1, 2, FEAT_HW, FEAT_HW};
 
                 Ort::Value pf_t = Ort::Value::CreateTensor<float>(
-                                      mi, features.data() + (size_t)i*BACKBONE_DIM*FEAT_HW*FEAT_HW,
+                                      mi, features + (size_t)i*BACKBONE_DIM*FEAT_HW*FEAT_HW,
                                       (size_t)BACKBONE_DIM*FEAT_HW*FEAT_HW, f_sh.data(), 4);
                 Ort::Value pc_t = Ort::Value::CreateTensor<float>(
                                       mi, batch_cond.data() + (size_t)i*3, 3, c_sh.data(), 2);
@@ -1426,7 +1441,7 @@ struct Pipeline::Impl
         else
         {
             Ort::Value feat_t = Ort::Value::CreateTensor<float>(
-                                    mi, features.data(), features.size(), feat_shape.data(), 4);
+                                    mi, features, feat_elems, feat_shape.data(), 4);
             Ort::Value cond_t = Ort::Value::CreateTensor<float>(
                                     mi, batch_cond.data(), batch_cond.size(), cond_shape.data(), 2);
             Ort::Value ray_t  = Ort::Value::CreateTensor<float>(
@@ -1472,6 +1487,12 @@ struct Pipeline::Impl
         struct HandCropRef {
             int person; bool is_left;
             float orig_cx, orig_cy, orig_sz;   // hand crop geometry, original-image space
+            // Row of this hand in the hand-crop batch, or -1 when the crop was
+            // pre-gated away (too small to ever pass the validity gate) and no
+            // backbone/decoder work was done for it.  The ref itself is still
+            // kept so the per-person left_h/right_h lookups downstream are
+            // unaffected by the skip.
+            int slot;
         };
         std::vector<HandCropRef> hand_refs;
         std::vector<float> hand_mhr_raw, hand_cam_raw;
@@ -1493,6 +1514,10 @@ struct Pipeline::Impl
             hbatch_cond.reserve((size_t)2 * B * 3);
             hbatch_ray.reserve((size_t)2 * B * 2 * ray_plane);
 
+            // FSB_FORCE_HAND_VALID deliberately resurrects box-invalid hands for
+            // debugging, so it has to suppress the pre-gate too.
+            const bool force_hand_valid = getenv("FSB_FORCE_HAND_VALID") != nullptr;
+            int n_hand_crops = 0;   // rows actually placed in the hand-crop batch
             for (int i = 0; i < B; ++i)
             {
                 const float scale_i = float(CROP_SIZE) / crop_sz_v[i];
@@ -1512,6 +1537,29 @@ struct Pipeline::Impl
 
                     float hx1 = orig_cx - orig_sz * 0.5f, hx2 = orig_cx + orig_sz * 0.5f;
                     float hy1 = orig_cy - orig_sz * 0.5f, hy2 = orig_cy + orig_sz * 0.5f;
+
+                    // ── Pre-gate ──────────────────────────────────────────────
+                    // The validity gate further below rejects any hand whose crop
+                    // side is <= HAND_BOX_SIZE_THRESH, whatever the decoder returns.
+                    // Deciding that here — before the crop, the ViT-H backbone pass
+                    // and the 6-layer decoder loop — costs nothing and skips all
+                    // three.  On a two-person clip with one distant subject that is
+                    // typically half the hand crops in the frame.
+                    //
+                    // crop_and_normalise() below derives the crop side the gate
+                    // actually tests (HandCropRef::orig_sz is that side, not the raw
+                    // box), so compute the identical quantity here rather than
+                    // testing orig_sz and changing which hands get rejected.  The
+                    // crop centre it would produce is (orig_cx, orig_cy) exactly, so
+                    // the ref stored for a skipped hand matches what the full path
+                    // would have stored.
+                    const float gate_sz =
+                        fixed_aspect_bbox_size(hx2 - hx1, hy2 - hy1, HAND_BBOX_SCALE_FACTOR);
+                    if (!force_hand_valid && gate_sz <= HAND_BOX_SIZE_THRESH)
+                    {
+                        hand_refs.push_back({i, is_left, orig_cx, orig_cy, gate_sz, -1});
+                        continue;
+                    }
 
                     float* crop_ptr = nullptr;
                     hbatch_crops.resize(hbatch_crops.size() + 3 * plane);
@@ -1547,28 +1595,41 @@ struct Pipeline::Impl
                     compute_ray_cond(geom_cx, hcy, hcsz, fx, fy, geom_cam_cx, cy,
                                      hbatch_ray.data() + hbatch_ray.size() - 2 * ray_plane);
 
-                    hand_refs.push_back({i, is_left, hcx, hcy, hcsz});
+                    hand_refs.push_back({i, is_left, hcx, hcy, hcsz, n_hand_crops++});
                 }
             }
 
-            // ── decoder_hand.onnx: run all 2×B hand crops in one batch ─────────
+            // ── decoder_hand.onnx: run the surviving hand crops in one batch ───
             t0 = Clock::now();
-            const int HB = (int)hand_refs.size();
+            const int HB  = (int)hand_refs.size();   // hands considered (2 per person)
+            const int HBI = n_hand_crops;            // hands actually inferred
+            if (HBI < HB)
+                printf("[FSB] hand pre-gate: %d of %d hand crop(s) skipped (box <= %.0f px)\n",
+                       HB - HBI, HB, (double)HAND_BOX_SIZE_THRESH);
+
+            // Sized for every hand, inferred or not; the pre-gated ones keep the
+            // zeros and are skipped by the FK/gate loop below.
+            hand_mhr_raw.assign((size_t)HB * mhr_ffn_hand.out_dim, 0.f);
+            hand_cam_raw.assign((size_t)HB * 3, 0.f);
+
+            if (HBI > 0)
+            {
             // DIAGNOSTIC: dump the normalised hand-crop tensors (3,512,512 per side)
             // for pixel-level comparison against Python's real hand crops.
             if (const char* dp = getenv("FSB_DUMP_HAND_CROP_PREFIX"))
             {
                 for (int h = 0; h < HB; ++h)
                 {
+                    if (hand_refs[h].slot < 0) continue;
                     char path[512];
                     snprintf(path, sizeof(path), "%s_%s.bin", dp, hand_refs[h].is_left ? "left" : "right");
                     FILE* fp = fopen(path, "wb");
-                    if (fp) { fwrite(hbatch_crops.data() + (size_t)h*3*plane, sizeof(float), 3*plane, fp); fclose(fp); }
+                    if (fp) { fwrite(hbatch_crops.data() + (size_t)hand_refs[h].slot*3*plane, sizeof(float), 3*plane, fp); fclose(fp); }
                 }
             }
-            std::vector<int64_t> himg_shape{HB, 3, CROP_SIZE, CROP_SIZE};
-            std::vector<int64_t> hcond_shape{HB, 3};
-            std::vector<int64_t> hray_shape {HB, 2, FEAT_HW, FEAT_HW};
+            std::vector<int64_t> himg_shape{HBI, 3, CROP_SIZE, CROP_SIZE};
+            std::vector<int64_t> hcond_shape{HBI, 3};
+            std::vector<int64_t> hray_shape {HBI, 2, FEAT_HW, FEAT_HW};
 
             Ort::Value hfeat_in_t = Ort::Value::CreateTensor<float>(
                                         mi, hbatch_crops.data(), hbatch_crops.size(), himg_shape.data(), 4);
@@ -1576,19 +1637,19 @@ struct Pipeline::Impl
                                          Ort::RunOptions{nullptr},
                                          sess_backbone.input_names.data(),  &hfeat_in_t, 1,
                                          sess_backbone.output_names.data(), 1);
-            const float* hfeat_ptr = hand_backbone_out[0].GetTensorData<float>();
-            size_t hfeat_elems = (size_t)HB * BACKBONE_DIM * FEAT_HW * FEAT_HW;
-            std::vector<float> hand_features(hfeat_ptr, hfeat_ptr + hfeat_elems);
+            // As above: hand_backbone_out owns the buffer and outlives every use.
+            float* hand_features = hand_backbone_out[0].GetTensorMutableData<float>();
             // DIAGNOSTIC: dump hand-crop backbone features per side (C,FEAT_HW,FEAT_HW
             // layout) for comparison against Python's real captured ones.
             if (const char* dp = getenv("FSB_DUMP_HAND_FEAT_PREFIX"))
             {
                 for (int h = 0; h < HB; ++h)
                 {
+                    if (hand_refs[h].slot < 0) continue;
                     char path[512];
                     snprintf(path, sizeof(path), "%s_%s.bin", dp, hand_refs[h].is_left ? "left" : "right");
                     FILE* fp = fopen(path, "wb");
-                    if (fp) { fwrite(hand_features.data() + (size_t)h*BACKBONE_DIM*FEAT_HW*FEAT_HW,
+                    if (fp) { fwrite(hand_features + (size_t)hand_refs[h].slot*BACKBONE_DIM*FEAT_HW*FEAT_HW,
                                      sizeof(float), (size_t)BACKBONE_DIM*FEAT_HW*FEAT_HW, fp); fclose(fp); }
                 }
             }
@@ -1603,8 +1664,8 @@ struct Pipeline::Impl
                     FILE* fp = fopen(path, "wb");
                     if (fp)
                     {
-                        fwrite(hbatch_cond.data() + (size_t)h*3, sizeof(float), 3, fp);
-                        fwrite(hbatch_ray.data() + (size_t)h*2*ray_plane, sizeof(float), 2*ray_plane, fp);
+                        fwrite(hbatch_cond.data() + (size_t)hand_refs[h].slot*3, sizeof(float), 3, fp);
+                        fwrite(hbatch_ray.data() + (size_t)hand_refs[h].slot*2*ray_plane, sizeof(float), 2*ray_plane, fp);
                         fclose(fp);
                     }
                 }
@@ -1620,23 +1681,23 @@ struct Pipeline::Impl
             // between-layer step. One hand crop at a time (batch=1 per call,
             // matching pass-2's per-person loop pattern) rather than the
             // original's batched-HB call, for simplicity.
-            hand_mhr_raw.assign((size_t)HB * mhr_ffn_hand.out_dim, 0.f);
-            hand_cam_raw.assign((size_t)HB * 3, 0.f);
             static const float hand_zero_face72[72] = {};
 
             for (int h = 0; h < HB; ++h)
             {
                 const auto& ref = hand_refs[h];
+                if (ref.slot < 0) continue;   // pre-gated: hand_mhr/cam_raw stay zero
+                const size_t hs = (size_t)ref.slot;
                 std::vector<int64_t> f1_sh{1, BACKBONE_DIM, FEAT_HW, FEAT_HW};
                 std::vector<int64_t> c1_sh{1, 3};
                 std::vector<int64_t> r1_sh{1, 2, FEAT_HW, FEAT_HW};
                 Ort::Value hf_t = Ort::Value::CreateTensor<float>(
-                                      mi, hand_features.data() + (size_t)h*BACKBONE_DIM*FEAT_HW*FEAT_HW,
+                                      mi, hand_features + hs*BACKBONE_DIM*FEAT_HW*FEAT_HW,
                                       (size_t)BACKBONE_DIM*FEAT_HW*FEAT_HW, f1_sh.data(), 4);
                 Ort::Value hc_t = Ort::Value::CreateTensor<float>(
-                                      mi, hbatch_cond.data() + (size_t)h*3, 3, c1_sh.data(), 2);
+                                      mi, hbatch_cond.data() + hs*3, 3, c1_sh.data(), 2);
                 Ort::Value hr_t = Ort::Value::CreateTensor<float>(
-                                      mi, hbatch_ray.data() + (size_t)h*2*ray_plane, 2*ray_plane, r1_sh.data(), 4);
+                                      mi, hbatch_ray.data() + hs*2*ray_plane, 2*ray_plane, r1_sh.data(), 4);
                 // Same marshalling story as pass 1: pre's outputs feed the layer and
                 // update graphs and are never read by the CPU, so they stay in
                 // device memory instead of being copied out and re-uploaded per layer.
@@ -1774,7 +1835,8 @@ struct Pipeline::Impl
                 std::copy(h_mhr.begin(), h_mhr.end(), hand_mhr_raw.begin() + (size_t)h*mhr_ffn_hand.out_dim);
                 std::copy(h_cam.begin(), h_cam.end(), hand_cam_raw.begin() + (size_t)h*3);
             }
-            printf("[FSB] hand decoder+ffn (iterative): %.1f ms  (%d hand crop(s))\n", ms(t0), HB);
+            }   // if (HBI > 0)
+            printf("[FSB] hand decoder+ffn (iterative): %.1f ms  (%d hand crop(s))\n", ms(t0), HBI);
 
             // hand_mhr_raw/hand_cam_raw/hand_refs are used below (after the
             // per-person results are assembled) for the validity gate, pass-2
@@ -2153,7 +2215,6 @@ struct Pipeline::Impl
             t0 = Clock::now();
             static constexpr int KP_RIGHT_WRIST = 41, KP_LEFT_WRIST = 62;
             static constexpr int KP_RIGHT_ELBOW = 8,  KP_LEFT_ELBOW = 7;
-            static constexpr float HAND_BOX_SIZE_THRESH   = 64.f;    // px, original image
             // Python's real threshold (run_inference's hand_wrist_kps2d_thresh) — matched
             // exactly now that criterion 1 (rotation agreement) has been added below, per
             // "fix the validity gate to match Python's real criteria". An earlier version
@@ -2239,6 +2300,9 @@ struct Pipeline::Impl
             {
                 const auto& ref = hand_refs[h];
                 HandFK& F = hfk[h];
+                // Pre-gated hands were never decoded; HandFK defaults valid=false,
+                // which is what the gate below would have concluded anyway.
+                if (ref.slot < 0) continue;
                 const float* raw  = hand_mhr_raw.data() + (size_t)h * mhr_ffn_hand.out_dim;
                 const float* camr = hand_cam_raw.data() + (size_t)h * 3;
 
@@ -2528,15 +2592,17 @@ struct Pipeline::Impl
 
             // ── per-person: keypoint prompt → decoder_prompted → decode → splice ──
             t0 = Clock::now();
+            const bool skip_pass2 = cfg.skip_pass2 || getenv("FSB_SKIP_PASS2") != nullptr;
             for (int i = 0; i < B; ++i)
             {
                 MHRResult& r = results[i];
-                // DIAGNOSTIC: snapshot pass-1's result so it can be restored below,
-                // to isolate whether pass-2's unconditional replace (independent of
-                // any hand-crop splice) is itself the source of visible distortion.
-                MHRResult r_pass1_backup;
-                bool skip_pass2 = getenv("FSB_SKIP_PASS2") != nullptr;
-                if (skip_pass2) r_pass1_backup = r;
+                // Pass 1 alone already fixes the image alignment; pass 2 only
+                // re-decodes from the keypoint prompt and splices the hands.  This
+                // used to run the whole block and then restore a pass-1 snapshot
+                // over the top, which cost the full time and saved nothing —
+                // nothing outside `r` is written below, so leaving early is
+                // exactly equivalent and actually skips the work.
+                if (skip_pass2) continue;
                 int left_h = -1, right_h = -1;
                 for (int h = 0; h < HB; ++h)
                     if (hand_refs[h].person == i) (hand_refs[h].is_left ? left_h : right_h) = h;
@@ -2593,7 +2659,7 @@ struct Pipeline::Impl
                 std::vector<int64_t> p_sh{1, 1, 522};
 
                 Ort::Value pf_t = Ort::Value::CreateTensor<float>(
-                                      mi, features.data() + (size_t)i*BACKBONE_DIM*FEAT_HW*FEAT_HW,
+                                      mi, features + (size_t)i*BACKBONE_DIM*FEAT_HW*FEAT_HW,
                                       (size_t)BACKBONE_DIM*FEAT_HW*FEAT_HW, f_sh.data(), 4);
                 Ort::Value pc_t = Ort::Value::CreateTensor<float>(
                                       mi, batch_cond.data() + (size_t)i*3, 3, c_sh.data(), 2);
@@ -3078,7 +3144,6 @@ struct Pipeline::Impl
                     printf("[FSB]   person=%d pass-2 applied  right_valid=%d left_valid=%d\n",
                            i, right_valid, left_valid);
 
-                if (skip_pass2) r = r_pass1_backup;
             }
             printf("[FSB] pass-2 + IK + splice: %.1f ms  (%d person(s))\n", ms(t0), B);
         }
