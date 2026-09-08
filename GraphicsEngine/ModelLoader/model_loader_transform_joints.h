@@ -128,6 +128,17 @@ int mhr_lbs_compute_subset(const struct MHR_LBS_Data *d,
                            float       *out_verts,
                            float       *out_joints);
 
+/* Joint-only forward pass: the global skeleton (positions and/or quaternions)
+ * with no per-vertex work at all.  Both outputs are bit-identical to the
+ * corresponding mhr_lbs_compute() outputs — the skeleton depends only on
+ * model_params, so the shape/face blend, the pose correctives and the LBS
+ * scatter are all skippable when the caller wants nothing but joints.
+ * Either output may be NULL.  Returns 1 on success, 0 on failure. */
+int mhr_lbs_compute_joints(const struct MHR_LBS_Data *d,
+                           const float *model_params,
+                           float       *out_joints,
+                           float       *out_joint_quats);
+
 /* ── TRI bone transforms ────────────────────────────────────────────────────── */
 
 /**

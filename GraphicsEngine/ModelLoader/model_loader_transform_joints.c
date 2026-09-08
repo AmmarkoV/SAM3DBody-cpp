@@ -1467,8 +1467,6 @@ static int mhr_lbs_skeleton(const struct MHR_LBS_Data *d,
      * For the root joint (parent < 0), global = local directly.
      */
 
-    //fprintf(stderr,"[LBS] root joint: t=(%.4f,%.4f,%.4f) s=%.6f\n",
-    //        t_local[0], t_local[1], t_local[2], s_local[0]);
 
     /* Check for NaN/Inf in local transforms */
     { int bad = 0;
@@ -1499,7 +1497,6 @@ static int mhr_lbs_skeleton(const struct MHR_LBS_Data *d,
         }
     }
 
-    //fprintf(stderr,"[LBS] FK loop done\n");
 
     /* Step 5 — skin TRS = global(j) ∘ inv_bind(j)
      *
@@ -1528,7 +1525,6 @@ static int mhr_lbs_skeleton(const struct MHR_LBS_Data *d,
         skin_t[j*3+2] = g_t[j*3+2] + g_s[j] * rt[2];
     }
 
-    //fprintf(stderr,"[LBS] Skin TRS done\n");
     { int bad2 = 0;
       for(int j=0;j<nj;j++) {
           for(int c=0;c<4;c++) { if(!isfinite(skin_q[j*4+c])) bad2++; }
@@ -1615,15 +1611,6 @@ int mhr_lbs_compute(const struct MHR_LBS_Data *d,
     if (!unposed) return 0;
     memcpy(unposed, d->base_shape, (size_t)nv * 3 * sizeof(float));
 
-#if 0 /* DEBUG: base_shape bounds — re-enable to diagnose mesh scale issues */
-    // Debug: base_shape bounds
-    { float bx=1e9f,by=1e9f,bz=1e9f;
-      for(int i=0;i<nv*3;i+=3) { if(d->base_shape[i]<bx)bx=d->base_shape[i]; if(d->base_shape[i+1]<by)by=d->base_shape[i+1]; if(d->base_shape[i+2]<bz)bz=d->base_shape[i+2]; }
-      float tx=-1e9f,ty=-1e9f,tz=-1e9f;
-      for(int i=0;i<nv*3;i+=3) { if(d->base_shape[i]>tx)tx=d->base_shape[i]; if(d->base_shape[i+1]>ty)ty=d->base_shape[i+1]; if(d->base_shape[i+2]>tz)tz=d->base_shape[i+2]; }
-      fprintf(stderr,"[LBS] base_shape: x[%.3f,%.3f] y[%.3f,%.3f] z[%.3f,%.3f]\n",bx,tx,by,ty,bz,tz);
-    }
-#endif
 
     for (int i = 0; i < d->n_shape_pc; i++) {
         float c = shape_coeffs[i];
@@ -1638,25 +1625,7 @@ int mhr_lbs_compute(const struct MHR_LBS_Data *d,
         for (int k = 0; k < nv*3; k++) unposed[k] += c * fv[k];
     }
 
-#if 0 /* DEBUG: unposed bounds — re-enable to verify shape blend */
-    // Debug: unposed bounds
-    { float ux=1e9f,uy=1e9f,uz=1e9f;
-      for(int i=0;i<nv*3;i+=3) { if(unposed[i]<ux)ux=unposed[i]; if(unposed[i+1]<uy)uy=unposed[i+1]; if(unposed[i+2]<uz)uz=unposed[i+2]; }
-      float vx=-1e9f,vy=-1e9f,vz=-1e9f;
-      for(int i=0;i<nv*3;i+=3) { if(unposed[i]>vx)vx=unposed[i]; if(unposed[i+1]>vy)vy=unposed[i+1]; if(unposed[i+2]>vz)vz=unposed[i+2]; }
-      fprintf(stderr,"[LBS] unposed:    x[%.3f,%.3f] y[%.3f,%.3f] z[%.3f,%.3f]\n",ux,vx,uy,vy,uz,vz);
-    }
-#endif
 
-#if 0 /* DEBUG: incoming coefficient magnitudes — re-enable to check input range */
-    /* Debug: incoming coefficient magnitudes */
-    { float mp_max=0, sc_max=0, fc_max=0;
-      for(int i=0;i<204;i++) { float a=model_params[i]; if(a<0)a=-a; if(a>mp_max)mp_max=a; }
-      for(int i=0;i<d->n_shape_pc;i++) { float a=shape_coeffs[i]; if(a<0)a=-a; if(a>sc_max)sc_max=a; }
-      for(int i=0;i<d->n_face_pc;i++) { float a=face_coeffs[i]; if(a<0)a=-a; if(a>fc_max)fc_max=a; }
-      fprintf(stderr,"[LBS] input max abs: model_params=%.4f shape=%.4f face=%.4f  npc=%d\n", mp_max, sc_max, fc_max, npc);
-    }
-#endif
 
     /* Steps 2-5 — joint pipeline (shared with mhr_lbs_compute_subset) */
     float *joint_params = (float*)malloc((size_t)npr * sizeof(float));
@@ -1681,13 +1650,6 @@ int mhr_lbs_compute(const struct MHR_LBS_Data *d,
     /* Step 6 — LBS: sparse weighted accumulation */
     memset(out_verts, 0, (size_t)nv * 3 * sizeof(float));
 
-    //fprintf(stderr,"[LBS] LBS loop start, ns=%d\n", ns);
-#if 0 /* DEBUG: skin index range — re-enable to verify skin data integrity */
-    { int ji_max=0, vi_max=0;
-      for(int k=0;k<ns;k++) { if(d->skin_joint_idx[k]>ji_max) ji_max=d->skin_joint_idx[k]; if(d->skin_vert_idx[k]>vi_max) vi_max=d->skin_vert_idx[k]; }
-      fprintf(stderr,"[LBS] skin indices: ji_max=%d/127 vi_max=%d/%d\n", ji_max, vi_max, nv);
-    }
-#endif
 
     for (int k = 0; k < ns; k++) {
         int   ji = d->skin_joint_idx[k];
@@ -1703,8 +1665,6 @@ int mhr_lbs_compute(const struct MHR_LBS_Data *d,
         out_verts[vi*3+2] += w * (skin_t[ji*3+2] + sx * pv[2]);
     }
 
-    //fprintf(stderr,"[LBS] LBS loop done\n");
-    //fprintf(stderr,"[LBS] freeing unposed\n");
     free(unposed);
 
     /* Step 7 — coordinate flip + cm→m.
@@ -1716,7 +1676,6 @@ int mhr_lbs_compute(const struct MHR_LBS_Data *d,
         out_verts[v*3+2] *= -0.01f;   /* Z flip + cm→m */
     }
 
-    //fprintf(stderr,"[LBS] coord flip done\n");
 
     /* Step 8 — output joint world positions with Y,Z flip + cm→m. */
     if (out_joints) {
@@ -1733,11 +1692,61 @@ int mhr_lbs_compute(const struct MHR_LBS_Data *d,
         memcpy(out_joint_quats, g_q, (size_t)nj * 4 * sizeof(float));
     }
 
-    //fprintf(stderr,"[LBS] output joints done, returning\n");
 
     free(g_t); free(g_q); free(g_s);
     free(skin_t); free(skin_q); free(skin_s);
     return 1;
+}
+
+/* ── Joint-only forward pass ───────────────────────────────────────────────── */
+/* The hand-crop wrist gate needs one joint quaternion and nothing else, but was
+ * calling mhr_lbs_compute() — which blends 18439 vertices, applies the sparse
+ * pose correctives and runs the full LBS scatter, then discards all of it.
+ *
+ * out_joints / out_joint_quats are bit-identical to what mhr_lbs_compute() writes
+ * into the same arrays: both come straight out of mhr_lbs_skeleton(), and the
+ * skeleton depends only on model_params (the shape/face blend, the correctives
+ * and the scatter all feed vertices, never g_t/g_q).  So this is the same answer
+ * with the per-vertex half of the pipeline removed, not an approximation. */
+int mhr_lbs_compute_joints(const struct MHR_LBS_Data *d,
+                           const float *model_params,
+                           float       *out_joints,      /* [n_joints*3], optional */
+                           float       *out_joint_quats) /* [n_joints*4] XYZW, optional */
+{
+    if (!d || !model_params) return 0;
+
+    int nj  = d->n_joints;
+    int npr = d->pt_rows;
+
+    float *joint_params = (float*)malloc((size_t)npr * sizeof(float));
+    float *g_t    = (float*)malloc((size_t)nj * 3 * sizeof(float));
+    float *g_q    = (float*)malloc((size_t)nj * 4 * sizeof(float));
+    float *g_s    = (float*)malloc((size_t)nj * sizeof(float));
+    float *skin_t = (float*)malloc((size_t)nj * 3 * sizeof(float));
+    float *skin_q = (float*)malloc((size_t)nj * 4 * sizeof(float));
+    float *skin_s = (float*)malloc((size_t)nj * sizeof(float));
+    int ok = joint_params && g_t && g_q && g_s && skin_t && skin_q && skin_s &&
+             mhr_lbs_skeleton(d, model_params, joint_params,
+                              g_t, g_q, g_s, skin_t, skin_q, skin_s);
+
+    if (ok) {
+        /* Same Y,Z flip + cm->m as mhr_lbs_compute()'s Step 8. */
+        if (out_joints) {
+            for (int j = 0; j < nj; j++) {
+                out_joints[j*3+0] =  g_t[j*3+0] * 0.01f;
+                out_joints[j*3+1] = -g_t[j*3+1] * 0.01f;
+                out_joints[j*3+2] = -g_t[j*3+2] * 0.01f;
+            }
+        }
+        /* Step 8b — UNFLIPPED, matching Python's joint_global_rots. */
+        if (out_joint_quats)
+            memcpy(out_joint_quats, g_q, (size_t)nj * 4 * sizeof(float));
+    }
+
+    free(joint_params);
+    free(g_t); free(g_q); free(g_s);
+    free(skin_t); free(skin_q); free(skin_s);
+    return ok;
 }
 
 /* ── Keypoint-subset LBS ───────────────────────────────────────────────────── */

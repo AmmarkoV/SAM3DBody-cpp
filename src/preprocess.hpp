@@ -404,6 +404,8 @@ static inline void rot6d_to_euler(const float* d6, float* euler) {
 // matrices, not the Euler-angle-only path the rest of this file uses.
 
 // XYZW quaternion → row-major 3x3 rotation matrix.
+// bvh_writer.cpp keeps its own copy of this (it does not want this header's
+// OpenCV dependency); the two must agree on convention — change both or neither.
 inline void quat_to_mat3(const float q[4], float R[9])
 {
     float x=q[0], y=q[1], z=q[2], w=q[3];

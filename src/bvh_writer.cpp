@@ -244,6 +244,11 @@ inline void euler_mhr_to_quat(float ex, float ey, float ez, float* q)
     qmul(t, qz, qy);
     qmul(q, t, qx);
 }
+// XYZW quaternion -> row-major 3x3.  Deliberately duplicated from
+// preprocess.hpp's quat_to_mat3(): that header lives in namespace fsb and pulls
+// in OpenCV, which this file otherwise does not need.  The two are the same
+// convention (XYZW in, row-major out) and must stay that way — change both or
+// neither.
 inline void quat_to_mat3(const float* q, float m[9])
 {
     float x=q[0], y=q[1], z=q[2], w=q[3];

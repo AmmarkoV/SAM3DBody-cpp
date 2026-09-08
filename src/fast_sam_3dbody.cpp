@@ -211,6 +211,81 @@ static std::vector<float> cffn_run(const CFFN& ffn, const float* x, int B)
 // severity (see UpdateEnvWithCustomLogLevel() above) is not enough on its own.
 static bool g_ort_verbose = false;
 
+// ─── layout of the MHR regression output ─────────────────────────────────────
+// The decoder heads emit one flat 519-float vector per person.  Every consumer
+// used to index it with bare integer literals, repeated ~35 times across three
+// near-identical decode paths, with the arithmetic spelled out in a trailing
+// comment at two of them and nowhere else.  Naming the offsets puts the one
+// authoritative description here; the static_assert keeps it honest.
+struct MhrOut
+{
+    static constexpr int GLOBAL_ROT = 0;    // 6D continuous global orientation
+    static constexpr int BODY       = 6;    // 130 joints x 2 continuous params
+    static constexpr int SHAPE      = 266;  // body shape PCA coefficients
+    static constexpr int SCALE      = 311;  // per-joint scale PCA coefficients
+    static constexpr int HAND       = 339;  // hand pose PCA coefficients
+    static constexpr int FACE       = 447;  // face expression coefficients
+
+    static constexpr int GLOBAL_ROT_N = 6,  BODY_N = 260, SHAPE_N = 45;
+    static constexpr int SCALE_N      = 28, HAND_N = 108, FACE_N  = 72;
+    static constexpr int TOTAL        = 519;
+
+    // What MHRResult::pred_pose_raw stores: the global rotation plus the body
+    // pose, i.e. everything ahead of the shape block.
+    static constexpr int POSE_N = GLOBAL_ROT_N + BODY_N;
+};
+static_assert(MhrOut::BODY  == MhrOut::GLOBAL_ROT + MhrOut::GLOBAL_ROT_N &&
+              MhrOut::SHAPE == MhrOut::BODY       + MhrOut::BODY_N       &&
+              MhrOut::SCALE == MhrOut::SHAPE      + MhrOut::SHAPE_N      &&
+              MhrOut::HAND  == MhrOut::SCALE      + MhrOut::SCALE_N      &&
+              MhrOut::FACE  == MhrOut::HAND       + MhrOut::HAND_N       &&
+              MhrOut::TOTAL == MhrOut::FACE       + MhrOut::FACE_N,
+              "MhrOut offsets and block sizes disagree");
+
+// ─── diagnostic hooks (FSB_* environment variables) ──────────────────────────
+// Every one of these was added while chasing a specific discrepancy documented
+// in POSEREFINE.md / PLAN.md, and they are all worth keeping — but they were
+// scattered as bare getenv() calls, 20 of them on the per-frame path (some per
+// hand, per person, per frame).  That made the set of available knobs
+// undiscoverable and put an environ scan in the hot loop.  Reading them once
+// into one named list fixes both; the default member initialisers run at static
+// init, long before any frame is processed.
+//
+//   `debug` in particular re-enables the per-frame pose traces (camera solves,
+//   wrist quaternions, gate decisions, vertex extents).  Those used to print
+//   unconditionally — ~33 lines per frame on top of the stage timings — and two
+//   of them did real work solely to have something to print (vertdbg scanned
+//   all 18439 vertices for min/max, hand[] scanned 519 floats).
+//
+// A null char pointer means "disabled"; the dump_* entries name an output path
+// or a filename prefix.
+static const struct FsbDiag
+{
+    // behaviour switches
+    bool debug              = getenv("FSB_DEBUG")             != nullptr;
+    bool force_hand_valid   = getenv("FSB_FORCE_HAND_VALID")  != nullptr;
+    bool skip_pass2         = getenv("FSB_SKIP_PASS2")        != nullptr;
+    bool skip_wrist_splice  = getenv("FSB_SKIP_WRIST_SPLICE") != nullptr;
+    bool zero_rot_pass1     = getenv("FSB_ZERO_ROT_PASS1")    != nullptr;
+    bool q2_real_hand       = getenv("FSB_Q2_REAL_HAND")      != nullptr;
+    bool dump_hand_joint78  = getenv("FSB_DUMP_HAND_JOINT78") != nullptr;
+
+    // dump destinations / overrides (null = off)
+    const char* dump_hand_tables      = getenv("FSB_DUMP_HAND_TABLES");
+    const char* dump_hand_crop        = getenv("FSB_DUMP_HAND_CROP_PREFIX");
+    const char* dump_hand_feat        = getenv("FSB_DUMP_HAND_FEAT_PREFIX");
+    const char* dump_hand_condray     = getenv("FSB_DUMP_HAND_CONDRAY_PREFIX");
+    const char* dump_hand108          = getenv("FSB_DUMP_HAND108_PREFIX");
+    const char* dump_hand_raw         = getenv("FSB_DUMP_HAND_RAW_PREFIX");
+    const char* dump_hand_finger_q    = getenv("FSB_DUMP_HAND_FINGER_Q");
+    const char* dump_pass1_q1         = getenv("FSB_DUMP_PASS1_Q1");
+    const char* dump_pass2_q2         = getenv("FSB_DUMP_PASS2_Q2");
+    const char* dump_p2_body_euler    = getenv("FSB_DUMP_P2_BODY_EULER");
+    const char* dump_mhr_model_params = getenv("FSB_DUMP_MHR_MODEL_PARAMS");
+    const char* override_hand108      = getenv("FSB_OVERRIDE_HAND108_PREFIX");
+    const char* global_rot_override   = getenv("FSB_GLOBAL_ROT_OVERRIDE");
+} g_diag;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ONNX Runtime session wrapper
 // ─────────────────────────────────────────────────────────────────────────────
@@ -683,7 +758,7 @@ struct Pipeline::Impl
                 if (lbs_data)
                 {
                     printf("OK (%d joints, %d vertices)\n", lbs_data->n_joints, lbs_data->n_verts);
-                    if (getenv("FSB_DUMP_HAND_TABLES") && lbs_data->hand_joint_idxs_left)
+                    if (g_diag.dump_hand_tables && lbs_data->hand_joint_idxs_left)
                     {
                         printf("[DIAG] hand_joint_idxs_left: ");
                         for (int k = 0; k < 27; ++k) printf("%d ", lbs_data->hand_joint_idxs_left[k]);
@@ -1268,6 +1343,9 @@ struct Pipeline::Impl
         std::vector<int64_t> ray_shape {B, 2, FEAT_HW, FEAT_HW};
 
         std::vector<float> pose_tokens(token_elems);
+        // Filled either by the iterative pass-1 loop below (which gets mhr/cam
+        // out of the fused head graph for free) or by the CPU FFNs after it.
+        std::vector<float> mhr_raw, cam_raw;
         // Hoisted to function scope: populated below (iterative refined-pose
         // path) or left zeroed (plain path, where hand crops are never
         // built) — used again after the results-assembly loop (gate / pass-2
@@ -1335,9 +1413,9 @@ struct Pipeline::Impl
                 {
                     float g_rot[3]; rot6d_to_euler(praw, g_rot);
                     std::array<float,133> b_euler{};
-                    compact_cont_to_body_params(praw + 6, b_euler.data());
+                    compact_cont_to_body_params(praw + MhrOut::BODY, b_euler.data());
                     ModelParams204 mpi = build_model_params(g_rot, b_euler.data(), nullptr, true);
-                    apply_hand_pose(mpi.data, praw + 339,
+                    apply_hand_pose(mpi.data, praw + MhrOut::HAND,
                                      lbs_data->hand_pose_mean, lbs_data->hand_pose_comps,
                                      lbs_data->hand_joint_idxs_left, lbs_data->hand_joint_idxs_right);
                     if (lbs_data->scale_mean && lbs_data->scale_comps)
@@ -1346,9 +1424,9 @@ struct Pipeline::Impl
                         for (int j = 0; j < ns; ++j) mpi.data[136+j] = lbs_data->scale_mean[j];
                         for (int k = 0; k < npc; ++k)
                             for (int j = 0; j < ns; ++j)
-                                mpi.data[136+j] += praw[311+k] * lbs_data->scale_comps[k*ns+j];
+                                mpi.data[136+j] += praw[MhrOut::SCALE + k] * lbs_data->scale_comps[k*ns+j];
                     }
-                    if (!kp3d_from_model(mpi.data, praw + 266, zero_face72_p1, kp3d_out))
+                    if (!kp3d_from_model(mpi.data, praw + MhrOut::SHAPE, zero_face72_p1, kp3d_out))
                         return false;
                     float s_val = -pcam[0], t_x = pcam[1], t_y = -pcam[2];
                     float bw = dets[i].x2-dets[i].x1, bh = dets[i].y2-dets[i].y1;
@@ -1428,11 +1506,24 @@ struct Pipeline::Impl
                     std::memcpy(hand_cls_out[i].data(), hc, 4*sizeof(float));
                 }
 
-                std::vector<float> pose_final;
+                // The head graph regresses mhr/cam from this very token, so take
+                // them here instead of streaming pose_tokens back through the CPU
+                // FFNs below — the two 1024x1024 matmuls per person were costing
+                // more than the transformer layer that produced the token.
+                std::vector<float> pose_final, mhr_final, cam_final;
                 decode_head(sess_decoder_pass1_head, sess_decoder_pass1_normfinal,
-                            mhr_ffn, cam_ffn, token, &pose_final, nullptr, nullptr);
+                            mhr_ffn, cam_ffn, token, &pose_final, &mhr_final, &cam_final);
                 std::memcpy(pose_tokens.data() + (size_t)i*DECODER_DIM, pose_final.data(),
                             (size_t)DECODER_DIM*sizeof(float));
+                if (mhr_raw.empty())
+                {
+                    mhr_raw.assign((size_t)B * mhr_ffn.out_dim, 0.f);
+                    cam_raw.assign((size_t)B * cam_ffn.out_dim, 0.f);
+                }
+                std::copy(mhr_final.begin(), mhr_final.end(),
+                          mhr_raw.begin() + (size_t)i * mhr_ffn.out_dim);
+                std::copy(cam_final.begin(), cam_final.end(),
+                          cam_raw.begin() + (size_t)i * cam_ffn.out_dim);
             }
             double dt_dec = ms(t0);
             timers.decoder += dt_dec;
@@ -1467,8 +1558,11 @@ struct Pipeline::Impl
 
         // ── MHR head (CPU FFN) ────────────────────────────────────────────────
         t0 = Clock::now();
-        std::vector<float> mhr_raw  = cffn_run(mhr_ffn, pose_tokens.data(), B);
-        std::vector<float> cam_raw  = cffn_run(cam_ffn, pose_tokens.data(), B);
+        if (mhr_raw.empty())
+        {
+            mhr_raw = cffn_run(mhr_ffn, pose_tokens.data(), B);
+            cam_raw = cffn_run(cam_ffn, pose_tokens.data(), B);
+        }
         double dt_ffn = ms(t0);
         timers.mhr_ffn += dt_ffn;
         printf("[FSB] MHR FFN:    %.1f ms\n", dt_ffn);
@@ -1516,7 +1610,7 @@ struct Pipeline::Impl
 
             // FSB_FORCE_HAND_VALID deliberately resurrects box-invalid hands for
             // debugging, so it has to suppress the pre-gate too.
-            const bool force_hand_valid = getenv("FSB_FORCE_HAND_VALID") != nullptr;
+            const bool force_hand_valid = g_diag.force_hand_valid;
             int n_hand_crops = 0;   // rows actually placed in the hand-crop batch
             for (int i = 0; i < B; ++i)
             {
@@ -1616,7 +1710,7 @@ struct Pipeline::Impl
             {
             // DIAGNOSTIC: dump the normalised hand-crop tensors (3,512,512 per side)
             // for pixel-level comparison against Python's real hand crops.
-            if (const char* dp = getenv("FSB_DUMP_HAND_CROP_PREFIX"))
+            if (const char* dp = g_diag.dump_hand_crop)
             {
                 for (int h = 0; h < HB; ++h)
                 {
@@ -1641,7 +1735,7 @@ struct Pipeline::Impl
             float* hand_features = hand_backbone_out[0].GetTensorMutableData<float>();
             // DIAGNOSTIC: dump hand-crop backbone features per side (C,FEAT_HW,FEAT_HW
             // layout) for comparison against Python's real captured ones.
-            if (const char* dp = getenv("FSB_DUMP_HAND_FEAT_PREFIX"))
+            if (const char* dp = g_diag.dump_hand_feat)
             {
                 for (int h = 0; h < HB; ++h)
                 {
@@ -1655,7 +1749,7 @@ struct Pipeline::Impl
             }
             // DIAGNOSTIC: dump hand-crop cond[3]/ray[2,32,32] per side (the
             // decoder_pre inputs), for the same comparison.
-            if (const char* dp = getenv("FSB_DUMP_HAND_CONDRAY_PREFIX"))
+            if (const char* dp = g_diag.dump_hand_condray)
             {
                 for (int h = 0; h < HB; ++h)
                 {
@@ -1728,9 +1822,9 @@ struct Pipeline::Impl
                 {
                     float g_rot[3]; rot6d_to_euler(praw, g_rot);
                     std::array<float,133> b_euler{};
-                    compact_cont_to_body_params(praw + 6, b_euler.data());
+                    compact_cont_to_body_params(praw + MhrOut::BODY, b_euler.data());
                     ModelParams204 mpi = build_model_params(g_rot, b_euler.data(), nullptr, true);
-                    apply_hand_pose(mpi.data, praw + 339,
+                    apply_hand_pose(mpi.data, praw + MhrOut::HAND,
                                      lbs_data->hand_pose_mean, lbs_data->hand_pose_comps,
                                      lbs_data->hand_joint_idxs_left, lbs_data->hand_joint_idxs_right);
                     if (lbs_data->scale_mean && lbs_data->scale_comps)
@@ -1739,7 +1833,7 @@ struct Pipeline::Impl
                         for (int j = 0; j < ns; ++j) mpi.data[136+j] = lbs_data->scale_mean[j];
                         for (int k = 0; k < npc; ++k)
                             for (int j = 0; j < ns; ++j)
-                                mpi.data[136+j] += praw[311+k] * lbs_data->scale_comps[k*ns+j];
+                                mpi.data[136+j] += praw[MhrOut::SCALE + k] * lbs_data->scale_comps[k*ns+j];
                     }
                     {
                         float R_ori[9]; mp_rot_to_mat3(mpi.data + 3, R_ori);
@@ -1757,7 +1851,7 @@ struct Pipeline::Impl
                         mpi.data[3] = mp_rot_new[0]; mpi.data[4] = mp_rot_new[1]; mpi.data[5] = mp_rot_new[2];
                         for (int idx : HAND_NONHAND_PARAM_IDXS) mpi.data[idx] = 0.f;
                     }
-                    if (!kp3d_from_model(mpi.data, praw + 266, hand_zero_face72, kp3d_out))
+                    if (!kp3d_from_model(mpi.data, praw + MhrOut::SHAPE, hand_zero_face72, kp3d_out))
                         return false;
                     static constexpr float HAND_CAM_SCALE_FACTOR = 10.f;
                     float geom_cx     = ref.is_left ? (float(W) - ref.orig_cx) : ref.orig_cx;
@@ -1841,7 +1935,7 @@ struct Pipeline::Impl
             // hand_mhr_raw/hand_cam_raw/hand_refs are used below (after the
             // per-person results are assembled) for the validity gate, pass-2
             // keypoint prompt, and wrist-IK fusion. Report per-hand sanity now.
-            for (int h = 0; h < HB; ++h)
+            for (int h = 0; g_diag.debug && h < HB; ++h)
             {
                 const auto& ref = hand_refs[h];
                 const float* raw = hand_mhr_raw.data() + (size_t)h * mhr_ffn_hand.out_dim;
@@ -1874,9 +1968,9 @@ struct Pipeline::Impl
                 const float* raw_i = mhr_raw.data() + i * NPOSE;
                 // Parse: global_rot_6d[6] + body_cont[260] + shape[45] + scale[28] + hand[108] + face[72]
                 const float* global_rot_6d  = raw_i;
-                const float* body_cont      = raw_i + 6;
-                const float* shape          = raw_i + 266;
-                const float* face           = raw_i + 447;
+                const float* body_cont      = raw_i + MhrOut::BODY;
+                const float* shape          = raw_i + MhrOut::SHAPE;
+                const float* face           = raw_i + MhrOut::FACE;
 
                 // Convert global rot 6D → Euler
                 float global_rot_euler[3];
@@ -1924,7 +2018,7 @@ struct Pipeline::Impl
 
             const float* vp = body_out[0].GetTensorData<float>();
             const float* sp = body_out[1].GetTensorData<float>();
-            size_t vn = (size_t)B * 18439 * 3;
+            size_t vn = (size_t)B * meta.num_vertices * 3;
             size_t sn = (size_t)B * 127   * 8;
             all_verts.assign(vp, vp + vn);
             all_skel.assign(sp,  sp + sn);
@@ -1938,16 +2032,16 @@ struct Pipeline::Impl
             use_lbs_skel = true;
             t0 = Clock::now();
             const int NPOSE = (int)meta.npose;
-            all_verts.resize(B * 18439 * 3);
+            all_verts.resize((size_t)B * meta.num_vertices * 3);
             all_skel.resize(B * 127 * 3);  // LBS outputs joints as [127, 3]
 
             for (int i = 0; i < B; ++i)
             {
                 const float* raw_i = mhr_raw.data() + i * NPOSE;
                 const float* global_rot_6d = raw_i;
-                const float* body_cont     = raw_i + 6;
-                //const float* shape         = raw_i + 266;
-                //const float* face          = raw_i + 447;
+                const float* body_cont     = raw_i + MhrOut::BODY;
+                //const float* shape         = raw_i + MhrOut::SHAPE;
+                //const float* face          = raw_i + MhrOut::FACE;
 
                 float global_rot_euler[3];
                 rot6d_to_euler(global_rot_6d, global_rot_euler);
@@ -1958,13 +2052,13 @@ struct Pipeline::Impl
                 ModelParams204 mp = build_model_params(global_rot_euler, body_euler, nullptr, true);
 
                 // Apply hand pose PCA decode (mirrors render binary + Python replace_hands_in_pose)
-                const float* hand_pose = raw_i + 339;  // layout: 6+260+45+28=339
+                const float* hand_pose = raw_i + MhrOut::HAND;
                 apply_hand_pose(mp.data, hand_pose,
                                 lbs_data->hand_pose_mean, lbs_data->hand_pose_comps,
                                 lbs_data->hand_joint_idxs_left, lbs_data->hand_joint_idxs_right);
 
                 // Apply scale decode: scales = scale_mean + scale_params @ scale_comps
-                const float* scale_params = raw_i + 311;  // layout: 6+260+45=311
+                const float* scale_params = raw_i + MhrOut::SCALE;
                 if (lbs_data->scale_mean && lbs_data->scale_comps)
                 {
                     const int ns = lbs_data->n_scale_out;  // 68
@@ -1975,28 +2069,28 @@ struct Pipeline::Impl
                             mp.data[136+j] += scale_params[k] * lbs_data->scale_comps[k * ns + j];
                 }
 
-                float* verts_out  = all_verts.data() + (size_t)i * 18439 * 3;
+                float* verts_out  = all_verts.data() + (size_t)i * meta.num_vertices * 3;
                 float* joints_out = all_skel.data() + (size_t)i * 127 * 3;
 
                 static const float zero_face[72] = {};
 #ifdef FSB_CUDA
                 if (lbs_cuda) {
                     mhr_lbs_cuda_compute(lbs_cuda, lbs_data, mp.data,
-                                         raw_i + 266,
-                                         cfg.zero_face_params ? zero_face : raw_i + 447,
+                                         raw_i + MhrOut::SHAPE,
+                                         cfg.zero_face_params ? zero_face : raw_i + MhrOut::FACE,
                                          verts_out, joints_out);
                 } else
 #endif
                 {
                     mhr_lbs_compute(lbs_data,
                                     mp.data,
-                                    raw_i + 266,  /* shape */
-                                    cfg.zero_face_params ? zero_face : raw_i + 447,  /* face */
+                                    raw_i + MhrOut::SHAPE,  /* shape */
+                                    cfg.zero_face_params ? zero_face : raw_i + MhrOut::FACE,  /* face */
                                     verts_out,
                                     joints_out,
                                     nullptr);
                 }
-                printf("[FSB] LBS person %d done\n", i);
+                if (g_diag.debug) printf("[FSB] LBS person %d done\n", i);
             }
             double dt_lbs = ms(t0);
             timers.body_model += dt_lbs;
@@ -2041,7 +2135,7 @@ struct Pipeline::Impl
             // path needs the 6D continuous representation to rebuild prev_estimate
             // for forward_decoder; the Euler angles already stored in global_rot /
             // body_pose cannot reconstruct it.
-            std::memcpy(r.pred_pose_raw.data(), p, 266 * sizeof(float));
+            std::memcpy(r.pred_pose_raw.data(), p, MhrOut::POSE_N * sizeof(float));
 
             // Camera: convert raw head output [s, tx, ty] → [tx+cx, ty+cy, tz]
             // Mirrors Python cam_raw_to_pred_cam_t in fast_sam_3dbody_frontend-3D.py
@@ -2073,33 +2167,33 @@ struct Pipeline::Impl
             r.global_rot = { ge[2], ge[1], ge[0] };
 
             // Body pose
-            const float* bc = p + 6;
+            const float* bc = p + MhrOut::BODY;
             float be[133] = {};
             compact_cont_to_body_params(bc, be);
             r.body_pose.assign(be, be + 133);
             pass1_wrist_euler[i] = { be[41], be[43], be[42], be[31], be[33], be[32] };  // [left, right]
 
             // Shape [45]
-            r.shape.assign(p + 266, p + 266 + 45);
+            r.shape.assign(p + MhrOut::SHAPE, p + MhrOut::SHAPE + MhrOut::SHAPE_N);
 
             // Scale [28]
-            r.scale.assign(p + 311, p + 311 + 28);
+            r.scale.assign(p + MhrOut::SCALE, p + MhrOut::SCALE + MhrOut::SCALE_N);
 
             // Hand pose [108]
-            r.hand_pose.assign(p + 339, p + 339 + 108);
+            r.hand_pose.assign(p + MhrOut::HAND, p + MhrOut::HAND + MhrOut::HAND_N);
 
             // Face [72]
-            r.face_params.assign(p + 447, p + 447 + 72);
+            r.face_params.assign(p + MhrOut::FACE, p + MhrOut::FACE + MhrOut::FACE_N);
 
             // Model params [204] for native C LBS – includes hand pose + scale decode
             {
                 float ge[3];
                 rot6d_to_euler(p, ge);
                 float be[133] = {};
-                compact_cont_to_body_params(p + 6, be);
+                compact_cont_to_body_params(p + MhrOut::BODY, be);
                 ModelParams204 mp = build_model_params(ge, be, nullptr, true);
                 // Hand pose PCA decode (mirrors Python replace_hands_in_pose)
-                apply_hand_pose(mp.data, p + 339,
+                apply_hand_pose(mp.data, p + MhrOut::HAND,
                                 lbs_data ? lbs_data->hand_pose_mean   : nullptr,
                                 lbs_data ? lbs_data->hand_pose_comps  : nullptr,
                                 lbs_data ? lbs_data->hand_joint_idxs_left  : nullptr,
@@ -2112,7 +2206,7 @@ struct Pipeline::Impl
                     for (int j = 0; j < ns; ++j) mp.data[136+j] = lbs_data->scale_mean[j];
                     for (int k = 0; k < np; ++k)
                         for (int j = 0; j < ns; ++j)
-                            mp.data[136+j] += p[311+k] * lbs_data->scale_comps[k * ns + j];
+                            mp.data[136+j] += p[MhrOut::SCALE + k] * lbs_data->scale_comps[k * ns + j];
                 }
                 std::memcpy(r.mhr_model_params.data(), mp.data, 204 * sizeof(float));
             }
@@ -2124,9 +2218,9 @@ struct Pipeline::Impl
             // Vertices (optional)
             if (!all_verts.empty())
             {
-                size_t off = (size_t)i * 18439 * 3;
+                size_t off = (size_t)i * meta.num_vertices * 3;
                 r.pred_vertices.assign(all_verts.begin() + off,
-                                       all_verts.begin() + off + 18439*3);
+                                       all_verts.begin() + off + (size_t)meta.num_vertices*3);
                 // mhr_lbs_compute already applies y,z flip + cm→m — no additional flip needed.
 
                 // Compute 70 MHR keypoints from vertices + skeleton joints
@@ -2158,7 +2252,10 @@ struct Pipeline::Impl
                     r.skeleton_3d = joint_coords;
 
                     // Apply keypoint_mapping: sparse matrix-vector multiply
-                    // [vertices(18439*3) + joints(127*3)] → keypoints_3d[70*3]
+                    // [vertices + joints] → keypoints_3d[70*3].  Columns below
+                    // nv address mesh vertices, columns at or above it address
+                    // joints; KpEntry::col is signed, hence the signed copy.
+                    const int nv = (int)meta.num_vertices;
                     const float* verts_ptr = r.pred_vertices.data();
                     const float* joints_ptr = joint_coords.data();
                     std::vector<float> kps_3d(70 * 3, 0.f);
@@ -2172,10 +2269,10 @@ struct Pipeline::Impl
                             int row = entry.row * 3 + c;
                             int col = entry.col;
                             float src_val = 0.f;
-                            if (col < 18439)
+                            if (col < nv)
                                 src_val = verts_ptr[col * 3 + c];
                             else
-                                src_val = joints_ptr[(col - 18439) * 3 + c];
+                                src_val = joints_ptr[(col - nv) * 3 + c];
                             kps_3d[row] += src_val * coord_val;
                         }
                     }
@@ -2241,8 +2338,6 @@ struct Pipeline::Impl
             const int HB = (int)hand_refs.size();
             std::vector<HandFK> hfk(HB);
 
-            std::vector<float> hv_scratch((size_t)lbs_data->n_verts * 3);
-            std::vector<float> hj_scratch((size_t)lbs_data->n_joints * 3);
             std::vector<float> hq_scratch((size_t)lbs_data->n_joints * 4);
             static const float zero_face72[72] = {};
 
@@ -2265,11 +2360,13 @@ struct Pipeline::Impl
                 if (pr.body_pose.size() < 133 || pr.global_rot.size() < 3) continue;
                 float g_rxryrz[3] = { pr.global_rot[2], pr.global_rot[1], pr.global_rot[0] };
                 ModelParams204 mp1 = build_model_params(g_rxryrz, pr.body_pose.data(), nullptr, true);
-                std::vector<float> zshape1((size_t)lbs_data->n_shape_pc, 0.f);
-                std::vector<float> v1((size_t)lbs_data->n_verts*3), j1((size_t)lbs_data->n_joints*3),
-                                   q1((size_t)lbs_data->n_joints*4);
-                if (!mhr_lbs_compute(lbs_data, mp1.data, zshape1.data(), zero_face72,
-                                      v1.data(), j1.data(), q1.data()))
+                // Only q1 (per-joint global quats) is read below — the 18439 vertices
+                // and 127 joint positions this used to compute were never touched.
+                // The zero shape vector it passed is gone with them: the skeleton
+                // does not depend on the shape blend at all, which is what made
+                // passing zeros correct in the first place.
+                std::vector<float> q1((size_t)lbs_data->n_joints*4);
+                if (!mhr_lbs_compute_joints(lbs_data, mp1.data, nullptr, q1.data()))
                     continue;
                 float lowarm_R1r[9]; quat_to_mat3(q1.data() + 40*4, lowarm_R1r);
                 float pre_R1r[9];    quat_to_mat3(lbs_data->joint_prerotations + 41*4, pre_R1r);
@@ -2283,9 +2380,9 @@ struct Pipeline::Impl
                 // person 0 -- used to localize where the left-arm chain diverges
                 // from Python's real joint_global_rots (see POSEREFINE.md "still
                 // relatively far from official" investigation).
-                if (pi == 0 && getenv("FSB_DUMP_PASS1_Q1"))
+                if (pi == 0 && g_diag.dump_pass1_q1)
                 {
-                    FILE* fp = fopen(getenv("FSB_DUMP_PASS1_Q1"), "w");
+                    FILE* fp = fopen(g_diag.dump_pass1_q1, "w");
                     if (fp)
                     {
                         for (int j = 0; j < lbs_data->n_joints; ++j)
@@ -2310,7 +2407,7 @@ struct Pipeline::Impl
                 compact_cont_to_body_params(raw + 6, F.body_euler.data());
                 std::copy(raw + 339, raw + 339 + 108, F.hand108.begin());
                 std::copy(raw + 311, raw + 311 + 28,  F.scale28.begin());
-                if (const char* dp = getenv("FSB_DUMP_HAND108_PREFIX"))
+                if (const char* dp = g_diag.dump_hand108)
                 {
                     char path[512];
                     snprintf(path, sizeof(path), "%s_%s.txt", dp, ref.is_left ? "left" : "right");
@@ -2320,7 +2417,7 @@ struct Pipeline::Impl
                 // DIAGNOSTIC: dump the full hand-crop regression output (519-dim
                 // mhr raw + 3-dim cam) per side, for comparison against Python's
                 // real mhr_hand output (pred_pose_raw/shape/scale/hand/face/pred_cam).
-                if (const char* dp = getenv("FSB_DUMP_HAND_RAW_PREFIX"))
+                if (const char* dp = g_diag.dump_hand_raw)
                 {
                     char path[512];
                     snprintf(path, sizeof(path), "%s_%s.txt", dp, ref.is_left ? "left" : "right");
@@ -2335,7 +2432,7 @@ struct Pipeline::Impl
                 // DIAGNOSTIC: override with Python's real captured hand108 (one file
                 // per side) to isolate whether the finger-PCA regression gap is
                 // visually significant — see POSEREFINE.md "still not 1:1 on hands".
-                if (const char* op = getenv("FSB_OVERRIDE_HAND108_PREFIX"))
+                if (const char* op = g_diag.override_hand108)
                 {
                     char path[512];
                     snprintf(path, sizeof(path), "%s_%s.txt", op, ref.is_left ? "left" : "right");
@@ -2369,7 +2466,7 @@ struct Pipeline::Impl
                     t_y + 2.f*(ref.orig_cy - cy)/bs,
                     2.f*fx/bs
                 };
-                printf("[FSB]   camdbg h=%d %s: raw_cam=(%.6f,%.6f,%.6f) orig_cx=%.3f orig_cy=%.3f "
+                if (g_diag.debug) printf("[FSB]   camdbg h=%d %s: raw_cam=(%.6f,%.6f,%.6f) orig_cx=%.3f orig_cy=%.3f "
                        "orig_sz=%.3f fx=%.3f geom_cam_cx=%.3f cy=%.3f s_val=%.6f bs=%.4f "
                        "pred_cam_t=(%.4f,%.4f,%.4f)\n",
                        h, ref.is_left?"left":"right", camr[0], camr[1], camr[2],
@@ -2414,8 +2511,12 @@ struct Pipeline::Impl
                     for (int idx : HAND_NONHAND_PARAM_IDXS) mp.data[idx] = 0.f;
                 }
 
-                if (!mhr_lbs_compute(lbs_data, mp.data, F.shape45.data(), zero_face72,
-                                     hv_scratch.data(), hj_scratch.data(), hq_scratch.data()))
+                // Only hq_scratch is read below (joint 42's global quaternion, and
+                // joint 78 under FSB_DUMP_HAND_JOINT78), so ask for the skeleton
+                // alone.  This used to call mhr_lbs_compute(), which blended all
+                // 18439 vertices and ran the full scatter to produce hv_scratch /
+                // hj_scratch — neither of which anything ever read.
+                if (!mhr_lbs_compute_joints(lbs_data, mp.data, nullptr, hq_scratch.data()))
                     continue;
 
                 // Always joint 42 (r_wrist) — the hand-crop's own skeleton is always
@@ -2453,7 +2554,7 @@ struct Pipeline::Impl
                     float x=F.wrist_quat[0], y=F.wrist_quat[1], z=F.wrist_quat[2], w=F.wrist_quat[3];
                     F.wrist_quat = { w, -z, y, -x };
                 }
-                if (getenv("FSB_DUMP_HAND_JOINT78"))
+                if (g_diag.dump_hand_joint78)
                 {
                     float R42[9]; quat_to_mat3(hq_scratch.data() + 42*4, R42);
                     float R78[9]; quat_to_mat3(hq_scratch.data() + 78*4, R78);
@@ -2470,7 +2571,7 @@ struct Pipeline::Impl
                 // apply_hand_pose()/compact_cont_to_hand_params() the same way the
                 // wrist-mirror bug was found — see POSEREFINE.md "lift the hand
                 // transforms ... check for axis or handedness errors".
-                if (const char* fp_path = getenv("FSB_DUMP_HAND_FINGER_Q"))
+                if (const char* fp_path = g_diag.dump_hand_finger_q)
                 {
                     static const int finger_joints[] = {
                         42,                      // r_wrist
@@ -2492,6 +2593,7 @@ struct Pipeline::Impl
                         fclose(fp);
                     }
                 }
+                if (g_diag.debug)
                 {
                     float Rdbg[9]; quat_to_mat3(F.wrist_quat.data(), Rdbg);
                     printf("[FSB]   wristquatdbg h=%d %s: R=[[%.4f %.4f %.4f] [%.4f %.4f %.4f] [%.4f %.4f %.4f]]\n",
@@ -2579,8 +2681,8 @@ struct Pipeline::Impl
                 F.valid = valid_box && valid_dist && valid_angle;
                 // Dev escape hatch for gate-threshold tuning/debugging without a
                 // rebuild — bypasses the distance and angle checks, box-size still applies.
-                if (getenv("FSB_FORCE_HAND_VALID")) F.valid = valid_box;
-                printf("[FSB]   gate-debug h=%d person=%d %s: orig_sz=%.1f valid_box=%d "
+                if (g_diag.force_hand_valid) F.valid = valid_box;
+                if (g_diag.debug) printf("[FSB]   gate-debug h=%d person=%d %s: orig_sz=%.1f valid_box=%d "
                        "hand_wrist2d=(%.1f,%.1f) body_wrist2d=(%.1f,%.1f) dist_norm=%.3f valid_dist=%d "
                        "angle_diff=%.3f valid_angle=%d valid=%d\n",
                        h, ref.person, ref.is_left?"left":"right", ref.orig_sz, valid_box,
@@ -2592,7 +2694,7 @@ struct Pipeline::Impl
 
             // ── per-person: keypoint prompt → decoder_prompted → decode → splice ──
             t0 = Clock::now();
-            const bool skip_pass2 = cfg.skip_pass2 || getenv("FSB_SKIP_PASS2") != nullptr;
+            const bool skip_pass2 = cfg.skip_pass2 || g_diag.skip_pass2;
             for (int i = 0; i < B; ++i)
             {
                 MHRResult& r = results[i];
@@ -2645,7 +2747,8 @@ struct Pipeline::Impl
                 // prev_estimate[522] = cat(pred_pose_raw[266], shape[45], scale[28], hand[108], face[72], pred_cam_raw[3])
                 float prev_est[522];
                 float* pe = prev_est;
-                std::memcpy(pe, r.pred_pose_raw.data(), 266*sizeof(float)); pe += 266;
+                std::memcpy(pe, r.pred_pose_raw.data(), MhrOut::POSE_N*sizeof(float));
+                pe += MhrOut::POSE_N;
                 std::memcpy(pe, r.shape.data(),      45*sizeof(float));     pe += 45;
                 std::memcpy(pe, r.scale.data(),      28*sizeof(float));     pe += 28;
                 std::memcpy(pe, r.hand_pose.data(), 108*sizeof(float));     pe += 108;
@@ -2706,9 +2809,9 @@ struct Pipeline::Impl
                 {
                     float g_rot[3]; rot6d_to_euler(praw, g_rot);
                     std::array<float,133> b_euler{};
-                    compact_cont_to_body_params(praw + 6, b_euler.data());
+                    compact_cont_to_body_params(praw + MhrOut::BODY, b_euler.data());
                     ModelParams204 mpi = build_model_params(g_rot, b_euler.data(), nullptr, true);
-                    apply_hand_pose(mpi.data, praw + 339,
+                    apply_hand_pose(mpi.data, praw + MhrOut::HAND,
                                      lbs_data->hand_pose_mean, lbs_data->hand_pose_comps,
                                      lbs_data->hand_joint_idxs_left, lbs_data->hand_joint_idxs_right);
                     if (lbs_data->scale_mean && lbs_data->scale_comps)
@@ -2717,9 +2820,9 @@ struct Pipeline::Impl
                         for (int j = 0; j < ns; ++j) mpi.data[136+j] = lbs_data->scale_mean[j];
                         for (int k = 0; k < npc; ++k)
                             for (int j = 0; j < ns; ++j)
-                                mpi.data[136+j] += praw[311+k] * lbs_data->scale_comps[k*ns+j];
+                                mpi.data[136+j] += praw[MhrOut::SCALE + k] * lbs_data->scale_comps[k*ns+j];
                     }
-                    if (!kp3d_from_model(mpi.data, praw + 266, zero_face72, kp3d_out))
+                    if (!kp3d_from_model(mpi.data, praw + MhrOut::SHAPE, zero_face72, kp3d_out))
                         return false;
                     float s_val = -pcam[0], t_x = pcam[1], t_y = -pcam[2];
                     float bw = r.bbox[2]-r.bbox[0], bh = r.bbox[3]-r.bbox[1];
@@ -2794,7 +2897,7 @@ struct Pipeline::Impl
                 // Pass 2's decode REPLACES the pass-1 output wholesale (matches Python:
                 // output.update({"mhr": pose_output}) is unconditional — only the
                 // wrist/hand/scale/shape splice below is gated by per-hand validity).
-                std::memcpy(r.pred_pose_raw.data(), p2, 266*sizeof(float));
+                std::memcpy(r.pred_pose_raw.data(), p2, MhrOut::POSE_N*sizeof(float));
                 std::memcpy(r.pred_cam_raw.data(),  p2_cam.data(), 3*sizeof(float));
                 float p2_global_rot_euler[3];
                 rot6d_to_euler(p2, p2_global_rot_euler);
@@ -2809,7 +2912,7 @@ struct Pipeline::Impl
                 std::copy(r.body_pose.begin(), r.body_pose.end(), pass1_body_euler_snapshot.begin());
                 // r.global_rot is stored [rz,ry,rx]; build_model_params wants [rx,ry,rz].
                 float pass1_global_rot_rxryrz[3] = { r.global_rot[2], r.global_rot[1], r.global_rot[0] };
-                printf("[FSB]   pass1v2dbg person=%d pass1_global_rot=(%.3f,%.3f,%.3f) "
+                if (g_diag.debug) printf("[FSB]   pass1v2dbg person=%d pass1_global_rot=(%.3f,%.3f,%.3f) "
                        "pass2_global_rot=(%.3f,%.3f,%.3f) pass1_cam_t=(%.3f,%.3f,%.3f) "
                        "pass2_cam=(s=%.3f,tx=%.3f,ty=%.3f)\n",
                        i, r.global_rot.size()>2?r.global_rot[0]:0.f, r.global_rot.size()>1?r.global_rot[1]:0.f,
@@ -2822,7 +2925,7 @@ struct Pipeline::Impl
                 // truth (e.g. Python's real [rz,ry,rx]) to isolate whether OUR root
                 // rotation (not just the OpenGL camera matrices, already proven fine)
                 // is a source of the visible whole-body misalignment.
-                if (const char* gpath = getenv("FSB_GLOBAL_ROT_OVERRIDE")) {
+                if (const char* gpath = g_diag.global_rot_override) {
                     FILE* fp = fopen(gpath, "r");
                     if (fp) {
                         float rz, ry, rx;
@@ -2840,8 +2943,8 @@ struct Pipeline::Impl
                     }
                 }
                 std::array<float,133> p2_body_euler{};
-                compact_cont_to_body_params(p2 + 6, p2_body_euler.data());
-                if (const char* dump_path = getenv("FSB_DUMP_P2_BODY_EULER"))
+                compact_cont_to_body_params(p2 + MhrOut::BODY, p2_body_euler.data());
+                if (const char* dump_path = g_diag.dump_p2_body_euler)
                 {
                     FILE* fp = fopen(dump_path, "w");
                     if (fp)
@@ -2850,10 +2953,10 @@ struct Pipeline::Impl
                         fclose(fp);
                     }
                 }
-                r.shape.assign(p2 + 266, p2 + 266 + 45);
-                r.scale.assign(p2 + 311, p2 + 311 + 28);
-                r.hand_pose.assign(p2 + 339, p2 + 339 + 108);
-                r.face_params.assign(p2 + 447, p2 + 447 + 72);
+                r.shape.assign(p2 + MhrOut::SHAPE, p2 + MhrOut::SHAPE + MhrOut::SHAPE_N);
+                r.scale.assign(p2 + MhrOut::SCALE, p2 + MhrOut::SCALE + MhrOut::SCALE_N);
+                r.hand_pose.assign(p2 + MhrOut::HAND, p2 + MhrOut::HAND + MhrOut::HAND_N);
+                r.face_params.assign(p2 + MhrOut::FACE, p2 + MhrOut::FACE + MhrOut::FACE_N);
                 {
                     std::array<float,3> pass1_cam_t = r.pred_cam_t;
                     float s_val = -p2_cam[0], t_x = p2_cam[1], t_y = -p2_cam[2];
@@ -2861,7 +2964,7 @@ struct Pipeline::Impl
                     float bbox_cx = (r.bbox[0]+r.bbox[2])*0.5f, bbox_cy = (r.bbox[1]+r.bbox[3])*0.5f;
                     float bs = fixed_aspect_bbox_size(bw,bh)*s_val + 1e-8f;
                     r.pred_cam_t = { t_x + 2.f*(bbox_cx-cx)/bs, t_y + 2.f*(bbox_cy-cy)/bs, 2.f*fx/bs };
-                    printf("[FSB]   camv2dbg person=%d pass1_cam_t=(%.3f,%.3f,%.3f) pass2_cam_t=(%.3f,%.3f,%.3f)\n",
+                    if (g_diag.debug) printf("[FSB]   camv2dbg person=%d pass1_cam_t=(%.3f,%.3f,%.3f) pass2_cam_t=(%.3f,%.3f,%.3f)\n",
                            i, pass1_cam_t[0], pass1_cam_t[1], pass1_cam_t[2],
                            r.pred_cam_t[0], r.pred_cam_t[1], r.pred_cam_t[2]);
                 }
@@ -2884,21 +2987,21 @@ struct Pipeline::Impl
                     // criteria" — see POSEREFINE.md. Set FSB_ZERO_ROT_PASS1 to go back to the
                     // old (unfaithful but empirically smaller-error) pass-1-based reference
                     // for comparison/debugging.
-                    bool use_pass1_for_zero_rot = getenv("FSB_ZERO_ROT_PASS1") != nullptr;
+                    bool use_pass1_for_zero_rot = g_diag.zero_rot_pass1;
                     ModelParams204 mp2 = use_pass1_for_zero_rot
                         ? build_model_params(pass1_global_rot_rxryrz, pass1_body_euler_snapshot.data(), nullptr, true)
                         : build_model_params(p2_global_rot_euler, p2_body_euler.data(), nullptr, true);
-                    // hand/scale not needed for FK (arms only), zero_face/zero-shape are fine —
-                    // only joint rotations are used, not vertices.
-                    std::vector<float> zshape((size_t)lbs_data->n_shape_pc, 0.f);
-                    // DIAGNOSTIC: test whether using the REAL (non-zero) shape changes the
-                    // FK's joint rotations -- see POSEREFINE.md wrist-IK bug hunt.
-                    const float* shape_for_q2 = getenv("FSB_Q2_REAL_SHAPE") ? r.shape.data() : zshape.data();
+                    // hand/scale not needed for FK (arms only) — only joint rotations
+                    // are used, not vertices.  The zero-shape vector and the
+                    // FSB_Q2_REAL_SHAPE diagnostic that toggled it against the real
+                    // shape are gone: mhr_lbs_compute_joints() takes no shape at all,
+                    // so "does the real shape change the FK rotations?" is now answered
+                    // structurally (it cannot) rather than by experiment.
                     // DIAGNOSTIC: Python's real reference FK for this step uses the ACTUAL
                     // decoded hand pose from both hand crops (updated_hand_pose, built
                     // UNCONDITIONALLY regardless of gate validity), not zeroed hand joints.
                     // Test whether applying that here changes lowarm_R.
-                    if (getenv("FSB_Q2_REAL_HAND") && left_h >= 0 && right_h >= 0)
+                    if (g_diag.q2_real_hand && left_h >= 0 && right_h >= 0)
                     {
                         std::array<float,108> updated_hand_pose_test{};
                         std::copy(hfk[left_h].hand108.begin(), hfk[left_h].hand108.begin()+54,
@@ -2909,15 +3012,14 @@ struct Pipeline::Impl
                                          lbs_data->hand_pose_mean, lbs_data->hand_pose_comps,
                                          lbs_data->hand_joint_idxs_left, lbs_data->hand_joint_idxs_right);
                     }
-                    std::vector<float> v2((size_t)lbs_data->n_verts*3), j2((size_t)lbs_data->n_joints*3),
-                                       q2((size_t)lbs_data->n_joints*4);
-                    if (mhr_lbs_compute(lbs_data, mp2.data, shape_for_q2, zero_face72,
-                                        v2.data(), j2.data(), q2.data()))
+                    // As with q1 above: only q2 is read, so skip the per-vertex half.
+                    std::vector<float> q2((size_t)lbs_data->n_joints*4);
+                    if (mhr_lbs_compute_joints(lbs_data, mp2.data, nullptr, q2.data()))
                     {
                         // DIAGNOSTIC: dump pass-2 FK per-joint global quats
                         // (splice "zero rotation" source) for comparison against
                         // Python's real pass-2 joint_global_rots.
-                        if (const char* dp = getenv("FSB_DUMP_PASS2_Q2"))
+                        if (const char* dp = g_diag.dump_pass2_q2)
                         {
                             FILE* fp = fopen(dp, "w");
                             if (fp)
@@ -2953,7 +3055,7 @@ struct Pipeline::Impl
 
                             float pred_global_R[9]; quat_to_mat3(hfk[h].wrist_quat.data(), pred_global_R);
 
-                            printf("[FSB]   zerorotdbg lr=%d lowarm_j=%d wristtwist_j=%d\n"
+                            if (g_diag.debug) printf("[FSB]   zerorotdbg lr=%d lowarm_j=%d wristtwist_j=%d\n"
                                    "     lowarm_R=[%.4f %.4f %.4f / %.4f %.4f %.4f / %.4f %.4f %.4f]\n"
                                    "     pre_R=   [%.4f %.4f %.4f / %.4f %.4f %.4f / %.4f %.4f %.4f]\n"
                                    "     zero_rot_R=[%.4f %.4f %.4f / %.4f %.4f %.4f / %.4f %.4f %.4f]\n"
@@ -2984,7 +3086,7 @@ struct Pipeline::Impl
                             float wx, wz, wy;
                             rotmat_to_euler_xzy(fused_R, &wx, &wz, &wy);
                             fix_wrist_euler(wx, wz, wy);
-                            printf("[FSB]   splicedwristdbg lr=%d(%s) wx=%.4f wz=%.4f wy=%.4f\n",
+                            if (g_diag.debug) printf("[FSB]   splicedwristdbg lr=%d(%s) wx=%.4f wz=%.4f wy=%.4f\n",
                                    lr, lr==0?"right":"left", wx, wz, wy);
 
                             // body_pose PARAM indices: left=[41,43,42], right=[31,33,32]
@@ -2995,7 +3097,7 @@ struct Pipeline::Impl
                             // DIAGNOSTIC: temporarily skipped via env var to isolate whether
                             // the wrist-rotation splice (not the scale splice, already disabled
                             // above) is the actual source of the visible mesh distortion.
-                            if (!getenv("FSB_SKIP_WRIST_SPLICE"))
+                            if (!g_diag.skip_wrist_splice)
                             {
                                 static const int idx_r[3] = {31,33,32}, idx_l[3] = {41,43,42};
                                 const int* idx = lr==0 ? idx_r : idx_l;
@@ -3074,7 +3176,7 @@ struct Pipeline::Impl
                             mp_final.data[136+j] += r.scale[k] * lbs_data->scale_comps[k*ns+j];
                 }
                 std::memcpy(r.mhr_model_params.data(), mp_final.data, 204*sizeof(float));
-                if (const char* dump_path = getenv("FSB_DUMP_MHR_MODEL_PARAMS"))
+                if (const char* dump_path = g_diag.dump_mhr_model_params)
                 {
                     FILE* fp = fopen(dump_path, "w");
                     if (fp)
@@ -3088,12 +3190,27 @@ struct Pipeline::Impl
                 {
                     static const float zero_face_out[72] = {};
                     std::vector<float> fverts((size_t)lbs_data->n_verts*3), fjoints((size_t)lbs_data->n_joints*3);
-                    if (mhr_lbs_compute(lbs_data, mp_final.data, r.shape.data(),
-                                        cfg.zero_face_params ? zero_face_out : r.face_params.data(),
-                                        fverts.data(), fjoints.data(), nullptr))
+                    const float* face_in = cfg.zero_face_params ? zero_face_out
+                                                                : r.face_params.data();
+                    // Same full-mesh rebuild as the pass-1 assembly above, so take
+                    // the same GPU path when it is available — this is the only
+                    // remaining caller that was still forcing all 18439 vertices
+                    // through the CPU implementation.
+                    int lbs_ok;
+#ifdef FSB_CUDA
+                    if (lbs_cuda)
+                        lbs_ok = mhr_lbs_cuda_compute(lbs_cuda, lbs_data, mp_final.data,
+                                                      r.shape.data(), face_in,
+                                                      fverts.data(), fjoints.data());
+                    else
+#endif
+                        lbs_ok = mhr_lbs_compute(lbs_data, mp_final.data, r.shape.data(),
+                                                 face_in, fverts.data(), fjoints.data(), nullptr);
+                    if (lbs_ok)
                     {
                         r.pred_vertices = fverts;
                         r.skeleton_3d   = fjoints;
+                        if (g_diag.debug)
                         {
                             float vmin[3]={1e9f,1e9f,1e9f}, vmax[3]={-1e9f,-1e9f,-1e9f};
                             for (size_t vi = 0; vi < fverts.size()/3; ++vi)
@@ -3109,11 +3226,12 @@ struct Pipeline::Impl
                         }
 
                         std::vector<float> kps3d(70*3, 0.f);
+                        const int nv = (int)meta.num_vertices;
                         for (const auto& e : kp_mapping)
                         {
                             for (int c = 0; c < 3; ++c)
                             {
-                                float src = (e.col < 18439) ? fverts[e.col*3+c] : fjoints[(e.col-18439)*3+c];
+                                float src = (e.col < nv) ? fverts[e.col*3+c] : fjoints[(e.col-nv)*3+c];
                                 kps3d[e.row*3+c] += src * e.val;
                             }
                         }
@@ -3129,7 +3247,7 @@ struct Pipeline::Impl
                             kps2d[k*2+1] = dy/dz*fy + cy;
                         }
                         r.keypoints_2d = kps2d;
-                        printf("[FSB]   kp2ddbg person=%d l_sh=(%.1f,%.1f) r_sh=(%.1f,%.1f) "
+                        if (g_diag.debug) printf("[FSB]   kp2ddbg person=%d l_sh=(%.1f,%.1f) r_sh=(%.1f,%.1f) "
                                "l_elb=(%.1f,%.1f) r_elb=(%.1f,%.1f) l_hip=(%.1f,%.1f) r_hip=(%.1f,%.1f) "
                                "r_wrist=(%.1f,%.1f) l_wrist=(%.1f,%.1f) scale8=%.4f scale9=%.4f\n",
                                i, kps2d[5*2],kps2d[5*2+1], kps2d[6*2],kps2d[6*2+1],
@@ -3141,7 +3259,7 @@ struct Pipeline::Impl
                 }
 
                 if (right_valid || left_valid)
-                    printf("[FSB]   person=%d pass-2 applied  right_valid=%d left_valid=%d\n",
+                    if (g_diag.debug) printf("[FSB]   person=%d pass-2 applied  right_valid=%d left_valid=%d\n",
                            i, right_valid, left_valid);
 
             }
@@ -3149,7 +3267,7 @@ struct Pipeline::Impl
         }
 
         printf("[FSB] total: %.1f ms  (%d persons)\n", ms(t_total), B);
-        printf("[FSB] returning results vector\n");
+        if (g_diag.debug) printf("[FSB] returning results vector\n");
         return results;
     }
 
@@ -3216,6 +3334,24 @@ struct Pipeline::Impl
         sess_decoder.free();
         sess_body.free();
         sess_yolo.free();
+
+        // The refined-pose graphs — 31 further sessions across three groups —
+        // used to be left dangling here, so only 4 of ~35 were released.  Under
+        // --trt each one owns a deserialised TensorRT engine, so leaking them
+        // costs device memory every time a Pipeline is reloaded in a long-lived
+        // process (the ROS node and sam_3dbody_net both do that).
+        for (OrtSession* s : { &sess_decoder_pass1_pre,     &sess_decoder_pass1_normfinal,
+                               &sess_decoder_pass1_update,  &sess_decoder_pass1_handbox,
+                               &sess_decoder_pass1_head,
+                               &sess_decoder_hand_pre,      &sess_decoder_hand_normfinal,
+                               &sess_decoder_hand_update,   &sess_decoder_hand_head,
+                               &sess_decoder_prompted_pre,  &sess_decoder_prompted_normfinal,
+                               &sess_decoder_prompted_update, &sess_decoder_prompted_head })
+            s->free();
+        for (std::array<OrtSession,6>* g : { &sess_decoder_pass1_layers,
+                                             &sess_decoder_hand_layers,
+                                             &sess_decoder_prompted_layers })
+            for (OrtSession& layer : *g) layer.free();
         if (lbs_cuda) { mhr_lbs_cuda_free(lbs_cuda); lbs_cuda = nullptr; }
         if (lbs_kp_subset) { mhr_lbs_subset_free(lbs_kp_subset); lbs_kp_subset = nullptr; }
         if (lbs_data)
