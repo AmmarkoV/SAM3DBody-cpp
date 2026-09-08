@@ -85,6 +85,7 @@ struct CommonConfig
     bool        use_trt        = false;
     bool        fp16           = true;    // can be disabled with --no-fp16
     bool        ort_verbose    = false;   // --ort-verbose: print per-node EP assignment at session load
+    int         pipeline_depth = 1;       // --pipeline N: run N frames concurrently
 
     // ── YOLO person detector tuning ──────────────────────────────────────────
     // The renderer doesn't use these (it inherits whatever the pipeline
@@ -183,6 +184,7 @@ inline bool parse_common_arg(int argc, const char* const* argv, int& i,
     CLI_BOOL("--trt",                  use_trt, true)
     CLI_BOOL("--no-fp16",              fp16,    false)
     CLI_BOOL("--ort-verbose",          ort_verbose, true)
+    CLI_INT ("--pipeline",             pipeline_depth)
 
     // Detector tuning.  --detector-threshold is the preferred, self-describing
     // spelling; --thresh is kept as a back-compat alias.  Both record that the
@@ -679,6 +681,7 @@ inline void apply_common_to_pipeline_cfg(const CommonConfig& c,
     pc.use_trt_ep     = c.use_trt;
     pc.use_fp16       = c.fp16;
     pc.ort_verbose    = c.ort_verbose;
+    pc.pipeline_depth = c.pipeline_depth;
     pc.person_thresh  = c.person_thresh;
     pc.person_nms_iou = c.person_nms_iou;
     pc.max_persons    = c.max_persons;
@@ -714,6 +717,10 @@ inline void print_common_args_help(FILE* fp)
         "  --cuda     N                   CUDA device (-1 = CPU; default 0)\n"
         "  --trt                          Use ONNX Runtime TensorRT EP\n"
         "  --no-fp16                      Disable FP16\n"
+        "  --pipeline N                   Process N frames concurrently on a worker pool (default 1).\n"
+        "                                 N=1 is the ordinary synchronous path.  N>1 trades latency for\n"
+        "                                 throughput: results lag submission by up to N frames and the\n"
+        "                                 per-frame [FSB] stage lines from the N workers interleave.\n"
         "  --ort-verbose                  Print ORT's per-node execution-provider assignment table at\n"
         "                                 session load (shows which ops got pinned to the CPU EP and are\n"
         "                                 forcing Memcpy nodes at CUDA/TensorRT graph boundaries)\n"

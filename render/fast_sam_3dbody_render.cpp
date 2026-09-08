@@ -652,6 +652,7 @@ int main(int argc, const char** argv) {
     bool        filter_root_rot   = false;  // enabled by --butterworth-root-rotation
     float       rot_clamp_deg     = 1.0f;   // rejection threshold in degrees/frame
     int         max_frames        = -1;     // --frames N: stop after N frames
+    int         pipeline_depth    = 1;      // --pipeline N: frames processed concurrently
     int         start_frame       = 0;      // --start N: seek to frame N first
     int         max_persons       = 0;      // --max-persons N: 0 = unlimited
     int         detector          = fsb::PipelineConfig::DET_YOLO_POSE; // --detector
@@ -768,6 +769,7 @@ int main(int argc, const char** argv) {
     max_frames                     = cc.max_frames;
     start_frame                    = cc.start_frame;
     max_persons                    = cc.max_persons;
+    pipeline_depth                 = cc.pipeline_depth;
     detector                       = detector_kind_from_string(cc.detector);
 
     // ── Pipeline ─────────────────────────────────────────────────────────────
@@ -784,6 +786,7 @@ int main(int argc, const char** argv) {
         cfg.use_fp16        = fp16;
         cfg.ort_verbose     = cc.ort_verbose;      // --ort-verbose
         cfg.max_persons     = max_persons;
+        cfg.pipeline_depth  = pipeline_depth;      // --pipeline N
         cfg.detector        = detector;
         cfg.person_thresh   = cc.person_thresh;   // honour --detector-threshold / per-detector default
         cfg.person_nms_iou  = cc.person_nms_iou;
@@ -1070,9 +1073,17 @@ int main(int argc, const char** argv) {
     const int frame_stop   = (max_frames > 0) ? start_frame + max_frames : -1;
 
     cv::Mat frame;
+    // --pipeline N>1: results come back lagging submission, so once the stream
+    // ends we keep looping to flush the frames still inside the pool.
+    const bool pipelining = pipeline_depth > 1;
+    bool       draining   = false;
     while (glx3_checkEvents()) 
     {
-        if (is_image)
+        if (draining)
+        {
+            // flushing the pool: no new frames go in
+        }
+        else if (is_image)
         {
             frame = static_img;
         } else
@@ -1096,12 +1107,27 @@ int main(int argc, const char** argv) {
             }
             cap >> frame;                 // newest available frame
             t_last_grab = NS_NOW();
-            if (frame.empty()) break;
+            if (frame.empty())
+            {
+                if (!pipelining) break;
+                draining = true;          // flush what is still in the pool
+            }
         }
 
         // Inference
         long long t_infer = NS_NOW();
-        auto results = pipeline.process_bgr(frame.data, frame.cols, frame.rows);
+        auto results = draining
+                     ? pipeline.drain()
+                     : pipeline.process_bgr(frame.data, frame.cols, frame.rows);
+        // When pipelining, the results belong to an earlier frame — display that
+        // one instead, or the overlay would sit on the wrong image.  A null here
+        // means no frame came back: either the pool is still filling (keep going,
+        // results are empty) or it has run dry (we are done).
+        int rw = 0, rh = 0;
+        if (const uint8_t* rp = pipeline.last_result_bgr(rw, rh))
+            frame = cv::Mat(rh, rw, CV_8UC3, const_cast<uint8_t*>(rp));
+        else if (draining)
+            break;
         double latency_ms = (NS_NOW() - t_infer) / 1e6;
 
         // Patch arm/collar/head angles in mhr_model_params.
@@ -1465,8 +1491,13 @@ int main(int argc, const char** argv) {
         ++frame_index;   // lockstep with bvh_writer's session frame counter
         ++processed_frames;
 
-        if (frame_stop > 0 && frame_index >= frame_stop) break;
-        if (is_image) break;   // keep window open only for live sources
+        if (!draining && frame_stop > 0 && frame_index >= frame_stop)
+        {
+            if (!pipelining) break;
+            draining = true;   // stop submitting; the drain loop above ends when
+                               // last_result_bgr() reports the pool is empty
+        }
+        if (is_image && !draining) break;   // keep window open only for live sources
     }
 
     // ── Frame-sync summary (live sources only) ────────────────────────────────

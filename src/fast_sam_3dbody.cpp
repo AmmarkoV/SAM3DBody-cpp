@@ -13,6 +13,7 @@
 
 #include "fast_sam_3dbody.h"
 #include "preprocess.hpp"
+#include "pthreadWorkerPool.h"
 
 // ── ggml headers ─────────────────────────────────────────────────────────────
 #if __has_include(<ggml/ggml.h>)
@@ -51,6 +52,8 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <mutex>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <cstdio>
@@ -302,6 +305,11 @@ struct OrtSession
     // True when the session actually landed on a GPU EP (TensorRT or CUDA) and
     // not on the CPU fallback — i.e. whether binding I/O to device memory works.
     bool                  on_gpu = false;
+    // True only when the TensorRT EP actually took the graph.  --pipeline needs
+    // this: the TRT EP serialises internally around its execution context, so
+    // concurrent Run() on one session is safe, whereas the CUDA EP is not (see
+    // pipeline_start()).
+    bool                  on_trt = false;
 
     // fixed_batch > 0 pins the model's symbolic "B" dimension to that value.  ORT
     // can then constant-fold the shape arithmetic that a dynamic batch forces it
@@ -410,6 +418,7 @@ struct OrtSession
                     fprintf(stderr, "[ORT] WARNING: '%s' running on CPU (GPU EPs unavailable)\n",
                             path.c_str());
                 on_gpu = (ep != EP_CPU);
+                on_trt = (ep == EP_TRT);
                 break;  // success
             }
             catch (const Ort::Exception& ex)
@@ -951,6 +960,17 @@ struct Pipeline::Impl
         uint64_t persons    = 0;     // total person crops processed
     } timers;
 
+    // --pipeline N>1 runs N frames through the stages concurrently, so the two
+    // pieces of shared mutable state the per-frame path touches need guarding.
+    // Everything else it uses is either per-frame (FrameContext), read-only
+    // (the ORT sessions, lbs_data, kp_mapping, meta, the FFN weights) or a
+    // const function-local static.
+    std::mutex timers_mu;
+    std::mutex lbs_cuda_mu;   // MHR_LBS_CUDACtx reuses one set of device buffers
+
+    void add_time (double&   f, double   v) { std::lock_guard<std::mutex> lk(timers_mu); f += v; }
+    void add_count(uint64_t& f, uint64_t v) { std::lock_guard<std::mutex> lk(timers_mu); f += v; }
+
     // ── load ──────────────────────────────────────────────────────────────────
     bool load(const PipelineConfig& c)
     {
@@ -1285,6 +1305,7 @@ struct Pipeline::Impl
         }
 
         loaded = true;
+        pipeline_start();          // no-op unless --pipeline N>1
         return true;
     }
 
@@ -1389,8 +1410,156 @@ struct Pipeline::Impl
     // ── process_bgr ───────────────────────────────────────────────────────────
     std::vector<MHRResult> process_bgr(const uint8_t* bgr, int W, int H)
     {
+        if (cfg.pipeline_depth > 1 && pipe_started)
+            return pipeline_submit(bgr, W, H);
+
         cv::Mat img(H, W, CV_8UC3, const_cast<uint8_t*>(bgr));
         return process_mat(img, W, H);
+    }
+
+    // ─── frame pipelining (--pipeline N) ─────────────────────────────────────
+    // Frame-level parallelism, not person-level.  Roughly two thirds of a frame
+    // is a single batched backbone Run that no amount of per-person threading
+    // can split, so the win here comes from overlapping one frame's CPU tail
+    // (LBS, keypoint mapping, splice) and ONNX submission with the next frame's
+    // GPU work, rather than from trying to widen any one stage.
+    //
+    // The pool is a fork/join barrier: all N workers are released together and
+    // waited on together, so frames are processed in batches of N.  Results
+    // therefore lag submission by up to N frames, and the first N-1 calls to
+    // process_bgr() return empty while the batch fills.
+    struct PipelineSlot
+    {
+        cv::Mat                frame;      // owned copy: the caller's buffer is
+                                           // only valid for its own call
+        std::vector<MHRResult> results;
+        long long              index  = -1;
+        bool                   filled = false;
+    };
+
+    struct workerPool         pipe_pool{};
+    bool                      pipe_started = false;
+    std::vector<PipelineSlot> pipe_slots;    // the batch currently being filled
+    int                       pipe_fill = 0;
+    std::deque<PipelineSlot>  pipe_done;     // finished, awaiting collection
+    PipelineSlot              pipe_last;     // most recently handed back
+    long long                 pipe_submitted = 0;
+
+    bool pipeline_start()
+    {
+        const int n = cfg.pipeline_depth;
+        if (n <= 1 || pipe_started) return false;
+
+        // Concurrent Ort::Session::Run() on ONE session is only safe here when
+        // the TensorRT EP owns the graph — it serialises internally around its
+        // execution context.  Under the CUDA EP it corrupts: measured 4 crashes
+        // in 6 runs of 25 frames at depth 2, each aborting in a DIFFERENT
+        // backbone node (Concat_2 / Expand_2 / qkv/MatMul / qkv/Cast) with
+        // nonsense allocation sizes — the signature of arena corruption, not one
+        // bad operator.  The backbone is the graph that matters: it is the
+        // largest, and every path runs it.  Refuse rather than hand the user a
+        // race, and say why.
+        if (!sess_backbone.on_trt)
+        {
+            fprintf(stderr,
+                "[FSB] --pipeline %d ignored: frame pipelining needs the TensorRT EP\n"
+                "      for the backbone (add --trt).  Running several frames through a\n"
+                "      CUDA-EP session concurrently corrupts ONNX Runtime's arena in\n"
+                "      this build.  Continuing single-threaded.\n", n);
+            return false;
+        }
+        pipe_slots.resize(n);
+        if (!threadpoolCreate(&pipe_pool, (unsigned int)n,
+                              (void*)&Impl::pipeline_worker, this))
+        {
+            fprintf(stderr, "[FSB] --pipeline %d: could not create the worker pool, "
+                            "falling back to single-threaded.\n", n);
+            pipe_slots.clear();
+            return false;
+        }
+        pipe_started = true;
+        printf("[FSB] frame pipeline: %d frames in flight "
+               "(results lag submission by up to %d frames)\n", n, n);
+        return true;
+    }
+
+    void pipeline_stop()
+    {
+        if (!pipe_started) return;
+        threadpoolDestroy(&pipe_pool);
+        pipe_started = false;
+        pipe_slots.clear();
+        pipe_done.clear();
+        pipe_fill = 0;
+    }
+
+    // Pool worker entry point.  Every thread runs this and picks its frame by
+    // threadID; threadpoolWorkerLoopCondition() exits the thread when the pool
+    // is destroyed.  A static member rather than a free function because Impl is
+    // private to Pipeline.
+    static void* pipeline_worker(void* arg)
+    {
+        struct threadContext* ctx  = (struct threadContext*)arg;
+        Impl*                 impl = (Impl*)ctx->argumentToPass;
+
+        threadpoolWorkerInitialWait(ctx);
+        while (threadpoolWorkerLoopCondition(ctx))
+        {
+            impl->pipeline_worker_run((int)ctx->threadID);
+            threadpoolWorkerLoopEnd(ctx);
+        }
+        return nullptr;
+    }
+
+    // Called on a pool worker.  Slots beyond the fill level are idle, which is
+    // how a partial final batch is drained.
+    void pipeline_worker_run(int id)
+    {
+        if (id < 0 || id >= (int)pipe_slots.size()) return;
+        PipelineSlot& s = pipe_slots[id];
+        if (!s.filled) return;
+        s.results = process_mat(s.frame, s.frame.cols, s.frame.rows);
+    }
+
+    void pipeline_run_batch()
+    {
+        threadpoolMainThreadPrepareWorkForWorkers(&pipe_pool);
+        threadpoolMainThreadKickWorkers(&pipe_pool);
+        threadpoolMainThreadWaitForKickedWorkersToFinishTimeoutSeconds(&pipe_pool, 0);
+        for (auto& s : pipe_slots)
+            if (s.filled) { pipe_done.push_back(std::move(s)); s = PipelineSlot{}; }
+        pipe_fill = 0;
+    }
+
+    std::vector<MHRResult> pipeline_collect()
+    {
+        if (pipe_done.empty()) { pipe_last = PipelineSlot{}; return {}; }
+        pipe_last = std::move(pipe_done.front());
+        pipe_done.pop_front();
+        return std::move(pipe_last.results);
+    }
+
+    std::vector<MHRResult> pipeline_submit(const uint8_t* bgr, int W, int H)
+    {
+        PipelineSlot& s = pipe_slots[pipe_fill];
+        cv::Mat(H, W, CV_8UC3, const_cast<uint8_t*>(bgr)).copyTo(s.frame);
+        s.index  = pipe_submitted++;
+        s.filled = true;
+        ++pipe_fill;
+
+        if (pipe_fill == (int)pipe_slots.size())
+            pipeline_run_batch();
+
+        return pipeline_collect();
+    }
+
+    // End of stream: run whatever partial batch is buffered, then hand back one
+    // pending result per call.  Empty return means the pipeline is empty.
+    std::vector<MHRResult> pipeline_drain()
+    {
+        if (pipe_done.empty() && pipe_fill > 0)
+            pipeline_run_batch();
+        return pipeline_collect();
     }
 
     // camera intrinsics for this frame
@@ -1560,14 +1729,14 @@ struct Pipeline::Impl
         if (cfg.max_persons > 0 && (int)dets.size() > cfg.max_persons)
             dets.resize(cfg.max_persons);
         double dt_detect = ms(t0);
-        timers.detection += dt_detect;
+        add_time(timers.detection, dt_detect);
         printf("[FSB] detection: %.1f ms  persons: %zu\n", dt_detect, dets.size());
 
         // Nothing detected – no crops to regress.  Returning early also keeps
         // the ONNX sessions from being run with a zero-sized batch.
         if (dets.empty())
         {
-            timers.frames += 1;
+            add_count(timers.frames, 1);
             return false;
         }
         return true;
@@ -1586,8 +1755,8 @@ struct Pipeline::Impl
 
         // ── per-person crops ──────────────────────────────────────────────────
         const int B = ctx.B = (int)dets.size();
-        timers.frames  += 1;
-        timers.persons += (uint64_t)B;
+        add_count(timers.frames, 1);
+        add_count(timers.persons, (uint64_t)B);
 
         // Pre-allocate batch buffers
         auto& batch_crops = ctx.batch_crops; batch_crops.assign((size_t)B * 3 * CROP_PLANE, 0.f);
@@ -1616,7 +1785,7 @@ struct Pipeline::Impl
             compute_ray_cond(ccx, ccy, csz, fx, fy, cx, cy, ray_ptr);
         }
         double dt_pre = ms(t0);
-        timers.preprocess += dt_pre;
+        add_time(timers.preprocess, dt_pre);
         printf("[FSB] preprocess: %.1f ms\n", dt_pre);
     }
 
@@ -1644,7 +1813,7 @@ struct Pipeline::Impl
         // directly rather than memcpy'ing 5.2 MB per person into a vector.
         float* features = ctx.features = ctx.backbone_out[0].GetTensorMutableData<float>();
         double dt_bb = ms(t0);
-        timers.backbone += dt_bb;
+        add_time(timers.backbone, dt_bb);
         printf("[FSB] backbone:   %.1f ms\n", dt_bb);
     }
 
@@ -1768,7 +1937,7 @@ struct Pipeline::Impl
                           cam_raw.begin() + (size_t)i * cam_ffn.out_dim);
             }
             double dt_dec = ms(t0);
-            timers.decoder += dt_dec;
+            add_time(timers.decoder, dt_dec);
             printf("[FSB] decoder (pass1, iterative): %.1f ms\n", dt_dec);
         }
         else
@@ -1794,7 +1963,7 @@ struct Pipeline::Impl
                                    dec_out_names.data(), 1);
             std::memcpy(pose_tokens.data(), decoder_out[0].GetTensorData<float>(), token_elems*sizeof(float));
             double dt_dec = ms(t0);
-            timers.decoder += dt_dec;
+            add_time(timers.decoder, dt_dec);
             printf("[FSB] decoder:    %.1f ms\n", dt_dec);
         }
     }
@@ -1816,7 +1985,7 @@ struct Pipeline::Impl
             cam_raw = cffn_run(cam_ffn, pose_tokens.data(), B);
         }
         double dt_ffn = ms(t0);
-        timers.mhr_ffn += dt_ffn;
+        add_time(timers.mhr_ffn, dt_ffn);
         printf("[FSB] MHR FFN:    %.1f ms\n", dt_ffn);
     }
 
@@ -2245,7 +2414,7 @@ struct Pipeline::Impl
             all_verts.assign(vp, vp + vn);
             all_skel.assign(sp,  sp + sn);
             double dt_body = ms(t0);
-            timers.body_model += dt_body;
+            add_time(timers.body_model, dt_body);
             printf("[FSB] body_model: %.1f ms\n", dt_body);
         }
         else if (!cfg.skip_body_model && lbs_data)
@@ -2297,6 +2466,7 @@ struct Pipeline::Impl
                 static const float zero_face[72] = {};
 #ifdef FSB_CUDA
                 if (lbs_cuda) {
+                    std::lock_guard<std::mutex> lk(lbs_cuda_mu);
                     mhr_lbs_cuda_compute(lbs_cuda, lbs_data, mp.data,
                                          raw_i + MhrOut::SHAPE,
                                          cfg.zero_face_params ? zero_face : raw_i + MhrOut::FACE,
@@ -2315,7 +2485,7 @@ struct Pipeline::Impl
                 if (g_diag.debug) printf("[FSB] LBS person %d done\n", i);
             }
             double dt_lbs = ms(t0);
-            timers.body_model += dt_lbs;
+            add_time(timers.body_model, dt_lbs);
             printf("[FSB] LBS:      %.1f ms, verts=%zu skel=%zu\n", dt_lbs, all_verts.size(), all_skel.size());
         }
     }
@@ -3351,9 +3521,12 @@ struct Pipeline::Impl
                     int lbs_ok;
 #ifdef FSB_CUDA
                     if (lbs_cuda)
+                    {
+                        std::lock_guard<std::mutex> lk(lbs_cuda_mu);
                         lbs_ok = mhr_lbs_cuda_compute(lbs_cuda, lbs_data, mp_final.data,
                                                       r.shape.data(), face_in,
                                                       fverts.data(), fjoints.data());
+                    }
                     else
 #endif
                         lbs_ok = mhr_lbs_compute(lbs_data, mp_final.data, r.shape.data(),
@@ -3512,6 +3685,8 @@ struct Pipeline::Impl
 
     void free_all()
     {
+        pipeline_stop();
+
         // CFFN weights are plain vectors – cleaned up automatically
         mhr_ffn = CFFN{};
         cam_ffn = CFFN{};
@@ -3617,6 +3792,19 @@ void Pipeline::print_info() const
 std::vector<MHRResult> Pipeline::process_bgr(const uint8_t* bgr, int w, int h)
 {
     return impl_->process_bgr(bgr, w, h);
+}
+std::vector<MHRResult> Pipeline::drain()
+{
+    if (!impl_ || !impl_->pipe_started) return {};
+    return impl_->pipeline_drain();
+}
+const uint8_t* Pipeline::last_result_bgr(int& w, int& h) const
+{
+    if (!impl_ || !impl_->pipe_started || impl_->pipe_last.frame.empty())
+        return nullptr;
+    w = impl_->pipe_last.frame.cols;
+    h = impl_->pipe_last.frame.rows;
+    return impl_->pipe_last.frame.data;
 }
 void Pipeline::print_timing_summary() const
 {

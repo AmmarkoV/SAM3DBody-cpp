@@ -163,6 +163,15 @@ struct PipelineConfig {
     // keypoint prompt and splices the hand crops in, which costs roughly as much
     // again.  Skipping it keeps pass 1's alignment at a fraction of the price.
     bool skip_pass2 = false;
+
+    // --pipeline N: process N frames concurrently on a worker pool.  1 (the
+    // default) keeps the pipeline exactly single-threaded and synchronous.  With
+    // N>1 process_bgr() buffers frames until it holds N, runs them in parallel,
+    // and then returns results for EARLIER frames — output lags submission by up
+    // to N frames, and the first N-1 calls return empty while the pool fills.
+    // Use Pipeline::drain() at end of stream to get the tail, and
+    // Pipeline::last_result_bgr() to find which frame a result belongs to.
+    int pipeline_depth = 1;
     std::string decoder_hand_name    = "decoder_hand.onnx";
     std::string decoder_prompted_name= "decoder_prompted.onnx";
 };
@@ -190,6 +199,17 @@ public:
     // Returns one MHRResult per detected person.
     std::vector<MHRResult> process_bgr(const uint8_t* bgr,
                                        int width, int height);
+
+    /// --pipeline N>1 only: pull one pending result set out of the pipeline at
+    /// end of stream.  Returns empty once nothing is left.  Call it in a loop
+    /// after the last process_bgr(); a no-op when pipeline_depth == 1.
+    std::vector<MHRResult> drain();
+
+    /// --pipeline N>1 only: the frame that the results from the most recent
+    /// process_bgr()/drain() actually belong to, since those lag submission.
+    /// Returns null when not pipelining (the caller already has the frame) or
+    /// while the pool is still filling.  Valid until the next call.
+    const uint8_t* last_result_bgr(int& w, int& h) const;
 
     // Convenience overload for OpenCV Mat (must be CV_8UC3 BGR).
     // Declared only if OpenCV is available; implemented in fast_sam_3dbody.cpp.
