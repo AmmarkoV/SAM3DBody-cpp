@@ -4,7 +4,7 @@
 //
 // Usage:
 //   fast_sam_3dbody_render --onnx-dir DIR --gguf pipeline.gguf
-//       --yolo yolo.onnx [--mesh body_mesh.tri] [--from 0|path]
+//       --yolo yolo.onnx [--mesh <onnx-dir>/body_mesh.tri] [--from 0|path]
 //       [--size W H] [--fps Z] [--mjpg] [--color R G B] [--export-mesh PREFIX] [--export-mesh-stride N]
 //
 // --mjpg requests motion-JPEG from the webcam so UVC cameras can sustain higher
@@ -615,7 +615,7 @@ int main(int argc, const char** argv) {
     std::string onnx_dir  = "./onnx";
     std::string gguf_path = "./onnx/pipeline.gguf";
     std::string yolo_path = "./onnx/yolo.onnx";
-    std::string mesh_path = "./body_mesh.tri";
+    std::string mesh_path = "";   // empty = <onnx-dir>/body_mesh.tri (resolved below)
     std::string vert_path = "src/render/default.vert";
     std::string frag_path = "src/render/default.frag";
     float       mesh_color[3] = {0.65f, 0.75f, 0.9f};  // same for everyone for now; --color R G B (0-255) overrides
@@ -944,6 +944,7 @@ int main(int argc, const char** argv) {
     GLint  tex_loc   = glGetUniformLocation(prog_quad, "uTex");
 
     // ── Load body mesh from .tri ──────────────────────────────────────────────
+    if (mesh_path.empty()) mesh_path = onnx_dir + "/body_mesh.tri";
     struct TRI_Model* tri_model = tri_allocateModel();
     if (!tri_loadModel(mesh_path.c_str(), tri_model)) {
         fprintf(stderr, "Cannot load mesh: %s\n", mesh_path.c_str()); return 1;

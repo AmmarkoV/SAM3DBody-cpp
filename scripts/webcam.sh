@@ -37,7 +37,7 @@ if [ "$NVIDIA_LAPTOP" = "1" ]; then
     export __GLX_VENDOR_LIBRARY_NAME=nvidia
 fi
 
-./build/fast_sam_3dbody_render --onnx-dir ./onnx --gguf ./onnx/pipeline.gguf --yolo ./onnx/yolo.onnx --mesh ./body_mesh.tri --lbs  onnx/body_model.lbs --from /dev/video0 "${ARGS[@]}"  > /tmp/render_raw.txt
+./build/fast_sam_3dbody_render --onnx-dir ./onnx --gguf ./onnx/pipeline.gguf --yolo ./onnx/yolo.onnx --mesh ./onnx/body_mesh.tri --lbs  onnx/body_model.lbs --from /dev/video0 "${ARGS[@]}"  > /tmp/render_raw.txt
 
 
 #./build/fast_sam_3dbody_run --onnx-dir ./onnx --gguf ./onnx/pipeline.gguf --yolo ./onnx/yolo.onnx --from /dev/video0 > /tmp/render_raw.txt $@ 

@@ -61,7 +61,7 @@ FIXED_FLAGS=(
     --onnx-dir ./onnx
     --gguf     ./onnx/pipeline.gguf
     --yolo     ./onnx/yolo.onnx
-    --mesh     ./body_mesh.tri
+    --mesh     ./onnx/body_mesh.tri
     --lbs      onnx/body_model.lbs
 )
 

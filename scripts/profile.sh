@@ -64,7 +64,7 @@ valgrind --tool=callgrind \
     --collect-systime=yes \
     ./build/fast_sam_3dbody_render \
         --onnx-dir ./onnx --gguf ./onnx/pipeline.gguf --yolo ./onnx/yolo.onnx \
-        --mesh ./body_mesh.tri --lbs onnx/body_model.lbs \
+        --mesh ./onnx/body_mesh.tri --lbs onnx/body_model.lbs \
         "${DEFAULTS[@]}" "${ARGS[@]}"
 RUN_EXIT=$?
 

@@ -248,7 +248,7 @@ def main():
                 "--onnx-dir", os.path.join(REPO, "onnx"),
                 "--gguf", os.path.join(REPO, "onnx", "pipeline.gguf"),
                 "--yolo", os.path.join(REPO, "onnx", "yolo.onnx"),
-                "--mesh", os.path.join(REPO, "body_mesh.tri"),
+                "--mesh", os.path.join(REPO, "onnx", "body_mesh.tri"),
                 "--lbs", os.path.join(REPO, "onnx", "body_model.lbs"),
                 "--boxes", boxes_file,
                 "--render-size", str(img_w), str(img_h),

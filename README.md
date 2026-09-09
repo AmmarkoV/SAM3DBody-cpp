@@ -183,7 +183,6 @@ BGR image
 ```
 SAM3DBody-cpp/
 ├── CMakeLists.txt
-├── body_mesh.tri                     SMPL-like body mesh for the GL renderer
 ├── fast_sam_3dbody_frontend.py       Python lightweight frontend (ctypes, no extra deps)
 ├── fast_sam_3dbody_frontend-3D.py    Python 3D frontend (ctypes + Python body model)
 ├── fast_sam_3dbody_dump_csv.py       Python CSV exporter – 70 MHR keypoints per frame
@@ -196,7 +195,8 @@ SAM3DBody-cpp/
 │   ├── yolo.onnx                     ~81 MB   YOLO11m-pose
 │   ├── body_model.lbs                ~27 MB   native C LBS data
 │   ├── correctives.bin               ~33 MB   pose corrective blend shapes
-│   └── keypoint_mapping.bin          ~8 KB    MHR-70 keypoint index map
+│   ├── keypoint_mapping.bin          ~8 KB    MHR-70 keypoint index map
+│   └── body_mesh.tri                 ~865 KB  SMPL-like body mesh for the GL renderer
 ├── scripts/
 │   └── build.sh / setup.sh / webcam.sh / video.sh / offline_video.sh
 └── src/                              All C/C++ sources live here
