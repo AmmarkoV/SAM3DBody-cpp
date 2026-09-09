@@ -1,0 +1,47 @@
+SAM3DBody-cpp
+  http://ammar.gr/
+  https://github.com/AmmarkoV/SAM3DBody-cpp
+
+[Developers]
+    Ammar Qammaz a.k.a. AmmarkoV <ammarkov@gmail.com>
+
+[License]
+    MIT License, Copyright (c) 2026 Ammar Qammaz -- see the LICENSE file.
+
+[Citation]
+If you use this software repository in your research or work, please cite:
+
+    @misc{qammaz2026sam3dbodycpp,
+      author       = {Qammaz, Ammar},
+      title        = {{SAM3DBody-cpp}: Standalone {C++} Inference Engine for {SAM-3D-Body}},
+      year         = {2026},
+      howpublished = {\url{https://github.com/AmmarkoV/SAM3DBody-cpp}},
+      note         = {Zero-dependency runtime: ONNX Runtime + ggml, with BVH export and Python ctypes frontends}
+    }
+
+as well as the Fast SAM 3D Body work which was the inspiration for creating the
+cpp version :
+
+    @article{yang2026fastsam3dbody,
+      title={Fast SAM 3D Body: Accelerating SAM 3D Body for Real-Time Full-Body Human Mesh Recovery},
+      author={Yang, Timing and He, Sicheng and Jing, Hongyi and Yang, Jiawei and Liu, Zhijian and Zou, Chuhang and Wang, Yue},
+      journal={arXiv preprint arXiv:2603.15603},
+      year={2026}
+    }
+
+and of course the Meta AI team behind the awesome paper that proposes the
+SAM 3D Body method :
+
+    @article{yang2026sam3dbody,
+      title={SAM 3D Body: Robust Full-Body Human Mesh Recovery},
+      author={Yang, Xitong and Kukreja, Devansh and Pinkus, Don and Sagar, Anushka and Fan, Taosha and Park, Jinhyung and Shin, Soyong and Cao, Jinkun and Liu, Jiawei and Ugrinovic, Nicolas and Feiszli, Matt and Malik, Jitendra and Dollar, Piotr and Kitani, Kris},
+      journal={arXiv preprint arXiv:2602.15989},
+      year={2026}
+    }
+
+[Upstream Projects]
+    SAM 3D Body       Meta Superintelligence Labs
+                      https://github.com/facebookresearch/sam-3d-body
+    Fast SAM 3D Body  https://github.com/AmmarkoV/Fast-SAM-3D-Body
+                      (developer tools : ONNX/GGUF export, LBS extraction,
+                       Python training environment)

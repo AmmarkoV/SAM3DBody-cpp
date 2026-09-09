@@ -1,0 +1,126 @@
+--------------- Library Dependencies ---------------
+scripts/setup.sh will apt-get the required packages for you..!
+
+The system packages needed are :
+
+  python3-pip python3-venv build-essential cmake git wget unzip
+  libjpeg-dev libpng-dev libzstd-dev liblz4-dev libpthread-stubs0-dev
+  libopencv-dev libgl1-mesa-dev libglew-dev
+
+ONNX Runtime 1.20.1 and ggml are NOT system packages, CMake downloads/fetches
+them automatically at configure time. Point CMake to an existing ONNX Runtime
+install with -DONNX_RUNTIME_DIR=/path/to/onnxruntime if you already have one.
+
+CUDA is optional but strongly recommended. The ORT 1.20.1 CUDA provider needs
+CUDA 12.x + cuDNN 9.x ; setup.sh can add the NVIDIA apt repo and install
+cuda-toolkit-12-6 + libcudnn9-cuda-12 for you. See knowledge/DEPENDENCIES.md if
+the build succeeds but loading libonnxruntime_providers_cuda.so fails at runtime,
+and knowledge/WSL.md for a WSL2 setup walkthrough.
+
+
+--------------- One-command setup ---------------
+setup.sh handles everything : system dependencies, model download from
+HuggingFace, cloning the required libraries, building the C++ binaries and
+creating the Python venv.
+
+git clone https://github.com/AmmarkoV/SAM3DBody-cpp
+cd SAM3DBody-cpp
+bash scripts/setup.sh
+
+On a machine without a CUDA GPU also pass --cpu-backbone, which fetches the
+CPU-runnable models (fp32 backbone + fp16 decoder) — the stock ones are BF16 and
+will not load on the CPU :
+
+bash scripts/setup.sh --cpu-only --cpu-backbone
+
+Useful flags :
+
+  --cuda-arch 89   set the CUDA architecture (RTX 4090/4070 = 89, RTX 3090 = 86)
+  --cpu-only       install CPU-only PyTorch in the venv
+  --cpu-backbone   also download the CPU-runnable models
+  --skip-models    skip the model download (models already in onnx/)
+  --skip-build     skip the C++ build (Python venv only)
+  --skip-venv      skip the Python venv (build only)
+  -j N             limit make to N parallel jobs
+
+
+--------------- Models ---------------
+The pre-built ONNX / GGUF / LBS model files are hosted on HuggingFace :
+
+https://huggingface.co/AmmarkoV/SAM3DBody-cpp-onnx-models
+
+setup.sh downloads them for you, and the binaries fetch them on first run if
+onnx/ is missing, so this is only needed for a manual install :
+
+bash tools/fetch_model.sh shared cuda    # ~5.2 GB
+
+Use "shared cpu" (~3.6 GB) for a CPU-only machine, "shared trt" (~1.9 GB) for
+TensorRT, "cuda refined" for the --refined-pose graphs (~607 MB) or "all" for
+every variant. Re-running only fetches what is absent and an interrupted
+download resumes. After extracting, onnx/ must sit at the root of the project.
+
+
+--------------- Compilation ---------------
+To compile the project by hand open a terminal, cd to the root of the project
+and run
+
+mkdir build
+cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc)
+
+Requirements : CMake >= 3.18, a C++17 compiler, OpenCV (core/imgproc/videoio/
+highgui/dnn) and optionally the CUDA toolkit. CUDA is auto-detected — set
+-DCMAKE_CUDA_ARCHITECTURES=86 (or 75, 89, ...) for your GPU ; the build falls
+back to CPU-only if no CUDA is found.
+
+scripts/build.sh does the same thing from the root of the project.
+
+The build produces in build/ :
+
+  fast_sam_3dbody_run          standalone CLI executable
+  fast_sam_3dbody_render       live OpenGL overlay viewer (Linux only)
+  offline_sam_3dbody_render    offline multi-pass BVH extractor
+  libfast_sam_3dbody.so        shared library for C++ linking or Python ctypes
+
+Windows is supported as a headless build only (MSVC + CMake, OpenCV via vcpkg).
+CMake fetches the win-x64 ONNX Runtime and configures fast_sam_3dbody_run and
+offline_sam_3dbody_render. The live overlay viewer depends on GLX/X11 and is not
+built there.
+
+
+--------------- Running ---------------
+The wrappers in scripts/ fill in all the model paths for you and forward any
+extra flags to the binary, so they are the easiest way in :
+
+./scripts/webcam.sh                                   # webcam, live overlay
+./scripts/video.sh --from clip.mp4                    # video file, live overlay
+./scripts/video.sh --from clip.mp4 --save out.mp4     # render to an .mp4
+./scripts/image.sh doc/screen.jpg                     # still image
+./scripts/offline_video.sh --from clip.mp4 --bvh ./p.bvh   # offline BVH export
+
+Add --cuda -1 to run on the CPU. See README.md for the full option list.
+
+
+--------------- Optional add-ons ---------------
+tools/setup_trt.sh          TensorRT execution provider
+tools/setup_gmr.sh          GMR humanoid robot retargeting (needs ./GMR cloned
+                            from https://github.com/YanjieZe/GMR)
+tools/setup_ammarserver.sh  AmmarServer, the web/network interface used by the
+                            client/server build (see knowledge/CLIENTSERVER.md)
+
+
+--------------- Installation of latest version ---------------
+The project is not installed system-wide, it runs from its own directory, so
+updating is just
+
+git pull
+bash scripts/build.sh
+
+Re-run bash scripts/setup.sh if the model files or the dependencies changed.
+
+
+--------------- Uninstallation ---------------
+Nothing is copied outside the project directory, so removing the cloned
+repository removes the software. Note that onnx/ holds several GB of downloaded
+model files and venv/ the Python environment, both of which live inside it.
