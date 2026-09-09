@@ -95,7 +95,7 @@ Once they are in `onnx/`, `--cuda -1` picks both up by itself — no extra flags
 > WSL2 users: if `nvidia-smi` works inside WSL, install the
 > [CUDA toolkit for WSL2](https://developer.nvidia.com/cuda-downloads)
 > (do **not** install the full Linux driver — only the WSL2 toolkit) and use
-> the standard `backbone.onnx` instead. See **[WSL.md](WSL.md)** for a full
+> the standard `backbone.onnx` instead. See **[WSL.md](knowledge/WSL.md)** for a full
 > step-by-step WSL2 setup guide.
 
 > **CMake will warn** at configure time if neither `onnx/` nor the zip is found.
@@ -172,7 +172,7 @@ BGR image
 | `kps_3d` | [210] | 70 joints × 3, metres (when native C LBS runs) |
 | `kps_2d` | [140] | 70 joints × 2 projected (when native C LBS runs) |
 
-> 📄 See **[OUTPUT.md](OUTPUT.md)** for the full reference on every 2D/3D point
+> 📄 See **[OUTPUT.md](knowledge/OUTPUT.md)** for the full reference on every 2D/3D point
 > set and its labels — the COCO-17, MHR-70 and MHR-127 keypoint name tables,
 > coordinate spaces, and the `.joints` / `.obj` / `.csv` / `.bvh` file formats.
 
@@ -282,7 +282,7 @@ CMake handles dependencies automatically:
 > **Builds fine but fails at runtime?** The ORT 1.20.1 CUDA provider needs
 > **CUDA 12.x + cuDNN 9.x**. If you see `Failed to load library
 > libonnxruntime_providers_cuda.so` or `Could not find an implementation for
-> Expand(13)`, see **[DEPENDENCIES.md](DEPENDENCIES.md)** for the cause and fix.
+> Expand(13)`, see **[DEPENDENCIES.md](knowledge/DEPENDENCIES.md)** for the cause and fix.
 
 #### Windows (headless build)
 
@@ -376,7 +376,7 @@ Full option list:
 ### Refined pose (`--refined-pose`)
 
 Opt-in extra inference passes that mirror the official `sam-3d-body` pipeline's
-multi-stage refinement (issue #15 / `PLAN.md` / `POSEREFINE.md`). Instead of the
+multi-stage refinement (issue #15 / `knowledge/PLAN.md` / `knowledge/POSEREFINE.md`). Instead of the
 single decoder forward pass, each person gets:
 
 1. an iterative **pass-1 body decode** that also regresses per-hand crop boxes,
@@ -391,7 +391,7 @@ This closes the largest known gaps vs the official Python output: wrist
 orientation, hand-box placement, and hand/finger articulation. Residual
 differences remain — the C++ decoders run fp32 ONNX exports of bf16-trained
 weights, so per-joint regression noise still compounds through the arm chains
-(see `POSEREFINE.md` for the measurement history).
+(see `knowledge/POSEREFINE.md` for the measurement history).
 
 The flag is accepted by `fast_sam_3dbody_render` (the binary used by
 `scripts/webcam.sh`, which forwards extra arguments):
@@ -954,7 +954,7 @@ scripts/video_gmr.sh zeimpekiko.mkv unitree_g1 --side-by-side
 ```
 
 Outputs land in `gmr_out/<videoname>/`. Needs an X display (wrap with `xvfb-run`
-if headless). See **[GMR.md](GMR.md)** for the design, tuning, and the calibration
+if headless). See **[GMR.md](knowledge/GMR.md)** for the design, tuning, and the calibration
 tools in `tools/gmr_*.py`.
 
 ### Live webcam → robot (`scripts/webcam_gmr.sh`)
@@ -1005,7 +1005,7 @@ the C++ binary** so it picks up the transport).
 
 **Prerequisites:** the C++ binary is built (`scripts/build.sh`), `tools/setup_gmr.sh`
 has been run, a CUDA GPU, and an X display for the MuJoCo viewer (wrap with
-`xvfb-run` if headless). See **[GMR.md](GMR.md)** → "Live webcam → robot (streaming)"
+`xvfb-run` if headless). See **[GMR.md](knowledge/GMR.md)** → "Live webcam → robot (streaming)"
 for the design and the causal despike/safety details.
 
 ---
@@ -1116,7 +1116,7 @@ puts the bundled TensorRT 10.4 libs on the loader path and adds `--trt`:
 tools/run_trt.sh --onnx-dir ./onnx --from your_video.mp4
 ```
 
-One-time setup of the TensorRT runtime libs (see [DEPENDENCIES.md](DEPENDENCIES.md)):
+One-time setup of the TensorRT runtime libs (see [DEPENDENCIES.md](knowledge/DEPENDENCIES.md)):
 
 ```bash
 python3 -m venv tools/.venv
