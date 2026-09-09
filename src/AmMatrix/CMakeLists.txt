@@ -1,5 +1,5 @@
 project( AmMatrix )
-cmake_minimum_required( VERSION 2.8.7 )
+cmake_minimum_required( VERSION 3.18 )
  
 #Make fast, lean and platform independent binaries..
 set(CMAKE_CXX_FLAGS "-s -O3 -fPIC -march=native -mtune=native")
@@ -31,8 +31,6 @@ add_library(
             solids.c
            )
 target_link_libraries(AmMatrix m rt )
-
-add_subdirectory(TestCPUOptimizedInstructionSet/) 
 
 set_target_properties(AmMatrix PROPERTIES
                        DEBUG_POSTFIX "D"
