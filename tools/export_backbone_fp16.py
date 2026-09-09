@@ -31,7 +31,7 @@ MEASURED RESULT (RTX 1000 Ada laptop, DINOv3-ViT-H, batch=1, 25-frame steady sta
 
 The big win is TensorRT: the heavy GEMMs are already fp16 in the graph, but ORT's
 CUDA EP schedules them far worse than a TRT fp16 engine does.  See tools/run_trt.sh
-and src/cli_common.h resolve_backbone_defaults for the --trt wiring.  Note the
+and src/SAM3DBODY-cpp/cli_common.h resolve_backbone_defaults for the --trt wiring.  Note the
 backbone's `If` (rope) subgraphs must additionally be folded for TRT to build it
 (backbone_fp16_trt.onnx); this tool does the bf16→fp16 remap only.
 

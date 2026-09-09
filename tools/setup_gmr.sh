@@ -82,7 +82,7 @@ TORCH_ARGS=()
 # automatically when this checkout exists — Linux only); gmr_stream.py dlopens
 # the .so we build here via ctypes.  Clone + build are best-effort: if either
 # fails the pipeline silently falls back to the stdout/tempfile path.
-SHM_DIR="$REPO/SharedMemoryVideoBuffers"
+SHM_DIR="$REPO/src/SharedMemoryVideoBuffers"
 SHM_REPO="${SHM_REPO:-https://github.com/AmmarkoV/SharedMemoryVideoBuffers}"
 if [ "$(uname -s)" = "Linux" ]; then
     if [ ! -f "$SHM_DIR/src/c/sharedMemoryVideoBuffers.c" ]; then

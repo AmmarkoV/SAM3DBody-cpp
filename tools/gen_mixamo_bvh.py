@@ -3,12 +3,12 @@
 gen_mixamo_bvh.py — generate a Mixamo ("mixamorig:") T-pose BVH template.
 
 This is the Mixamo analogue of tools/gen_mhr_bvh.py: it emits a skeleton-only
-BVH (one neutral rest frame) that src/bvh_writer.cpp can use as a --bvh-template
+BVH (one neutral rest frame) that src/SAM3DBODY-cpp/bvh_writer.cpp can use as a --bvh-template
 target.  The MHR network deltas are baked onto whatever rest pose this template
 defines, so the only things that must be exactly right here are:
 
   1. The joint NAMES  — must match the "mixamorig:*" entries in NAME_MAP
-                        (src/bvh_writer.cpp).
+                        (src/SAM3DBODY-cpp/bvh_writer.cpp).
   2. The rest DIRECTIONS — a clean T-pose (arms along ±X, spine +Y, legs -Y) so
                         the writer's q_bone_align rest-retarget is well-defined.
   3. The CHANNEL ORDER — the writer decomposes non-root joints in ZXY and the
@@ -99,7 +99,7 @@ SKELETON = J('mixamorig:Hips', [0, 0, 0], [
 ])
 
 # ── Emit ──────────────────────────────────────────────────────────────────────
-# Channel-order contract with src/bvh_writer.cpp (do not change):
+# Channel-order contract with src/SAM3DBODY-cpp/bvh_writer.cpp (do not change):
 ROOT_CH  = 'Xposition Yposition Zposition Zrotation Yrotation Xrotation'
 JOINT_CH = 'Zrotation Xrotation Yrotation'
 

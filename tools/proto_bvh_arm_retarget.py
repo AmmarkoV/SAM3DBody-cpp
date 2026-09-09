@@ -189,7 +189,7 @@ NAME_MAP = {
 
 def mhr_names():
     import re
-    txt = open('src/mhr_joint_table.h').read()
+    txt = open('src/SAM3DBODY-cpp/mhr_joint_table.h').read()
     block = txt.split('NAMES[N_JOINTS] = {',1)[1].split('};',1)[0]
     return [m for m in re.findall(r'"([^"]+)"', block)]
 

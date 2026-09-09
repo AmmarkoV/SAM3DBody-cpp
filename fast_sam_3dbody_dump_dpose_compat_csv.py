@@ -64,7 +64,7 @@ MHR70_NAMES = [
 MHR70_IDX = {n: i for i, n in enumerate(MHR70_NAMES)}
 
 # ──────────────────────────────────────────────────────────────────────────────
-# MHR 127-joint skeleton index → name  (from src/mhr_joint_table.h)
+# MHR 127-joint skeleton index → name  (from src/SAM3DBODY-cpp/mhr_joint_table.h)
 # Only the joints we actually read are listed here for clarity.
 # ──────────────────────────────────────────────────────────────────────────────
 

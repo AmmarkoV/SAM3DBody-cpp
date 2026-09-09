@@ -33,7 +33,7 @@ if not os.path.exists(SRC):                       # fall back to body.bvh pre-re
 LBS  = sys.argv[2] if len(sys.argv) > 2 else os.path.join(ROOT, 'onnx', 'body_model.lbs')
 OUT  = sys.argv[3] if len(sys.argv) > 3 else os.path.join(ROOT, 'bvh/body_mhr.bvh')
 
-# ── NAME_MAP (BVH name → MHR name), mirrors src/bvh_writer.cpp ─────────────────
+# ── NAME_MAP (BVH name → MHR name), mirrors src/SAM3DBODY-cpp/bvh_writer.cpp ─────────────────
 NAME_MAP = {
     'hip':'root','abdomen':'c_spine1','chest':'c_spine3','neck':'c_neck','head':'c_head',
     'jaw':'c_jaw',

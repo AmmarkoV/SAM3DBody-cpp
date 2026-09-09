@@ -34,7 +34,7 @@ OUTPUT_DIRECTORY       = doc
 HTML_OUTPUT            = html
 
 # Source tree
-INPUT                  = src AmMatrix render GraphicsEngine
+INPUT                  = src
 FILE_PATTERNS          = *.c *.cpp *.h *.hpp
 RECURSIVE              = YES
 EXCLUDE_PATTERNS       = */build/* */venv/*

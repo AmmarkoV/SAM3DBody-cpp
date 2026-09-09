@@ -35,7 +35,7 @@ SRC  = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, 'bvh/lafan.bvh')
 LBS  = sys.argv[2] if len(sys.argv) > 2 else os.path.join(ROOT, 'onnx', 'body_model.lbs')
 OUT  = sys.argv[3] if len(sys.argv) > 3 else os.path.join(ROOT, 'bvh/lafan_mhr.bvh')
 
-# ── NAME_MAP (LAFAN1 BVH name → MHR name), mirrors src/bvh_writer.cpp (lafan rows)
+# ── NAME_MAP (LAFAN1 BVH name → MHR name), mirrors src/SAM3DBODY-cpp/bvh_writer.cpp (lafan rows)
 NAME_MAP = {
     'Hips':'root',
     'Spine':'c_spine1','Spine1':'c_spine2','Spine2':'c_spine3',

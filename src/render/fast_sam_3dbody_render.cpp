@@ -36,18 +36,18 @@ extern "C" {
 #include "../GraphicsEngine/ModelLoader/model_loader_transform_joints.h"
 }
 
-#include "../src/fast_sam_3dbody.h"
-#include "../src/preprocess.hpp"   // for fsb::apply_hand_pose
-#include "../src/outputFiltering.h" // for QuatLPF + euler_zyx_to_quat helpers
-#include "../src/cli_common.h"      // shared --onnx-dir / --bvh / … parser
+#include "../SAM3DBODY-cpp/fast_sam_3dbody.h"
+#include "../SAM3DBODY-cpp/preprocess.hpp"   // for fsb::apply_hand_pose
+#include "../SAM3DBODY-cpp/outputFiltering.h" // for QuatLPF + euler_zyx_to_quat helpers
+#include "../SAM3DBODY-cpp/cli_common.h"      // shared --onnx-dir / --bvh / … parser
 #include "mhr_pose_driver.h"
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/videoio.hpp>
 
-#include "../src/bvh_writer.h"
-#include "../src/v4l2_capture.h"
+#include "../SAM3DBODY-cpp/bvh_writer.h"
+#include "../SAM3DBODY-cpp/v4l2_capture.h"
 
 #include <cstdio>
 #include <cstdlib>   // getenv (FSB_LBS_DUMP gate)
@@ -82,7 +82,7 @@ static const char* QUAD_FRAG = R"glsl(
     void main() { fragColor = vec4(texture(uTex, vUV).rgb, 1.0); }
 )glsl";
 
-// The body-mesh shaders live in render/default.vert and render/default.frag so
+// The body-mesh shaders live in src/render/default.vert and src/render/default.frag so
 // they can be edited without a rebuild; default.frag exposes a `uColor` uniform.
 
 // ── GL helpers ───────────────────────────────────────────────────────────────
@@ -616,8 +616,8 @@ int main(int argc, const char** argv) {
     std::string gguf_path = "./onnx/pipeline.gguf";
     std::string yolo_path = "./onnx/yolo.onnx";
     std::string mesh_path = "./body_mesh.tri";
-    std::string vert_path = "render/default.vert";
-    std::string frag_path = "render/default.frag";
+    std::string vert_path = "src/render/default.vert";
+    std::string frag_path = "src/render/default.frag";
     float       mesh_color[3] = {0.65f, 0.75f, 0.9f};  // same for everyone for now; --color R G B (0-255) overrides
     float       shininess     = 0.0f;   // 0 = matte; --shiny turns on the chrome look
     float       transparency  = 0.7f;   // mesh opacity (--transparency)

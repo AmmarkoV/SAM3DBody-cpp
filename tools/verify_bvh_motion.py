@@ -11,7 +11,7 @@ joints we report:
    • the median, p90, and max over the whole video.
 
 Usage:
-    python3 scripts/verify_bvh_motion.py /tmp/boom.bvh /tmp/boom_mhr.csv
+    python3 tools/verify_bvh_motion.py /tmp/boom.bvh /tmp/boom_mhr.csv
 """
 from __future__ import annotations
 import csv

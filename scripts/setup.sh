@@ -238,9 +238,9 @@ _make_symlink() {
     fi
 }
 
-_make_symlink "${REPO_ROOT}/GraphicsEngine" \
+_make_symlink "${REPO_ROOT}/src/GraphicsEngine" \
     "${_RGBDA_DIR}/opengl_acquisition_shared_library/opengl_depth_and_color_renderer/src/Library"
-_make_symlink "${REPO_ROOT}/AmMatrix" \
+_make_symlink "${REPO_ROOT}/src/AmMatrix" \
     "${_RGBDA_DIR}/tools/AmMatrix"
 
 

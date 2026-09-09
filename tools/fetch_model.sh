@@ -5,7 +5,7 @@
 # Replaces the "download one 5 GB zip and extract it" flow with per-file
 # fetches, so a run only pulls the models its execution provider actually
 # needs.  The profiles mirror the swaps resolve_backbone_defaults()
-# (src/cli_common.h) performs at startup:
+# (src/SAM3DBODY-cpp/cli_common.h) performs at startup:
 #
 #   shared   always needed                                      ~151 MB
 #   cuda     bf16 backbone + bf16 decoder (ORT CUDA EP)        ~5.1 GB

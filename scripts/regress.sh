@@ -2,7 +2,7 @@
 # ════════════════════════════════════════════════════════════════════════════
 #  regress.sh — refactor safety net for the refined-pose pipeline.
 #
-#  There are no unit tests for src/fast_sam_3dbody.cpp.  This is the harness
+#  There are no unit tests for src/SAM3DBODY-cpp/fast_sam_3dbody.cpp.  This is the harness
 #  that stands in for them: it checks that a change leaves the BVH output
 #  inside the pipeline's own run-to-run noise, and that it did not cost frame
 #  time.  Used for every step of the readability work (see the phase plan).

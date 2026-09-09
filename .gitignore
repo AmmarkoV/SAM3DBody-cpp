@@ -4,9 +4,9 @@ build/
 *.d
 
 # AmMatrix pre-built test binaries
-AmMatrix/OpenCL/matmul
-AmMatrix/TestCPUOptimizedInstructionSet/TestCPUOptimizedInstructionSet
-AmMatrix/TestCPUOptimizedInstructionSet/TestCPUOptimizedInstructionSetD
+src/AmMatrix/OpenCL/matmul
+src/AmMatrix/TestCPUOptimizedInstructionSet/TestCPUOptimizedInstructionSet
+src/AmMatrix/TestCPUOptimizedInstructionSet/TestCPUOptimizedInstructionSetD
 
 # Python
 __pycache__/
@@ -17,7 +17,7 @@ venv/
 .venv/
 
 # Fetched deps (cloned by tools/setup_gmr.sh, like GMR/)
-SharedMemoryVideoBuffers/
+src/SharedMemoryVideoBuffers/
 
 # Editor / IDE
 .vscode/

@@ -9,7 +9,7 @@ BVH_WRITER_DUMP=1 to produce it) and reports:
   • Per-BVH-joint nearest MHR partner under the *aligned* MHR positions.
 
 Usage:
-    python3 scripts/analyze_skeletons.py
+    python3 tools/analyze_skeletons.py
 """
 from __future__ import annotations
 import csv

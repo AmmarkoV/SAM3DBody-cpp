@@ -116,7 +116,7 @@ done
 # in --help).  Otherwise we transparently fall back to the pipe.  SHM=0 forces
 # the pipe; SHM=1 skips the auto-checks.
 SHM="${SHM:-auto}"
-SHM_LIB="$REPO/SharedMemoryVideoBuffers/libSharedMemoryVideoBuffers.so"
+SHM_LIB="$REPO/src/SharedMemoryVideoBuffers/libSharedMemoryVideoBuffers.so"
 SHM_ACTIVE=0
 SHM_DESC=""
 _shm_reason=""

@@ -20,13 +20,13 @@ else()
     set(RT_LIB   rt)
 endif()
 
-# RobustCapture (src/v4l2_capture.cpp) uses raw V4L2 (linux/videodev2.h) to
+# RobustCapture (src/SAM3DBODY-cpp/v4l2_capture.cpp) uses raw V4L2 (linux/videodev2.h) to
 # re-grab webcam frames the kernel flags as incomplete/corrupt, instead of
 # handing back the torn image cv::VideoCapture's V4L2 backend would return.
 # That header only exists on Linux, so probe for it explicitly rather than
 # just relying on the outer NOT WIN32 guard (BSD/macOS are NOT WIN32 either
 # but have no V4L2). When it's missing, FSB_HAVE_V4L2 is left undefined and
-# src/v4l2_capture.cpp compiles to a thin pass-through to cv::VideoCapture —
+# src/SAM3DBODY-cpp/v4l2_capture.cpp compiles to a thin pass-through to cv::VideoCapture —
 # same public API, old behavior.
 include(CheckIncludeFileCXX)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -246,7 +246,7 @@ endif()
 find_package(OpenCV REQUIRED COMPONENTS core imgproc videoio highgui dnn video)
 message(STATUS "OpenCV ${OpenCV_VERSION}")
 
-set(GRAPHICS_ENGINE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/GraphicsEngine)
+set(GRAPHICS_ENGINE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/GraphicsEngine)
 
 # ---------------------------------------------------------------------------
 # AmMatrix
@@ -258,22 +258,22 @@ set(GRAPHICS_ENGINE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/GraphicsEngine)
 # subdirectory; on Linux we keep the existing static-library build unchanged.
 if(WIN32)
     set(AMMATRIX_SOURCES
-        AmMatrix/quaternions.c
-        AmMatrix/matrix3x3Tools.c
-        AmMatrix/matrix4x4Tools.c
-        AmMatrix/matrixCalculations.c
-        AmMatrix/matrixMultiplicationOptimization.c
-        AmMatrix/matrixOpenGL.c
-        AmMatrix/simpleRenderer.c
-        AmMatrix/ocvStaging.c
-        AmMatrix/collisions.c
-        AmMatrix/solids.c
-        AmMatrix/solveHomography.c
-        AmMatrix/solveLinearSystemGJ.c
+        src/AmMatrix/quaternions.c
+        src/AmMatrix/matrix3x3Tools.c
+        src/AmMatrix/matrix4x4Tools.c
+        src/AmMatrix/matrixCalculations.c
+        src/AmMatrix/matrixMultiplicationOptimization.c
+        src/AmMatrix/matrixOpenGL.c
+        src/AmMatrix/simpleRenderer.c
+        src/AmMatrix/ocvStaging.c
+        src/AmMatrix/collisions.c
+        src/AmMatrix/solids.c
+        src/AmMatrix/solveHomography.c
+        src/AmMatrix/solveLinearSystemGJ.c
     )
     set(AMMATRIX_LIB "")
 else()
-    add_subdirectory(AmMatrix)
+    add_subdirectory(src/AmMatrix)
     set(AMMATRIX_SOURCES "")
     set(AMMATRIX_LIB AmMatrix)
 endif()
@@ -285,11 +285,11 @@ set(MOCAP_DIR ${GRAPHICS_ENGINE_DIR}/MotionCaptureLoader)
 set(TRAJ_DIR  ${GRAPHICS_ENGINE_DIR}/TrajectoryParser)
 
 add_library(fast_sam_3dbody SHARED
-    src/fast_sam_3dbody.cpp
-    src/fast_sam_3dbody_capi.cpp
-    src/bvh_writer.cpp
-    src/bvh_shm.cpp
-    src/offline_passes.cpp
+    src/SAM3DBODY-cpp/fast_sam_3dbody.cpp
+    src/SAM3DBODY-cpp/fast_sam_3dbody_capi.cpp
+    src/SAM3DBODY-cpp/bvh_writer.cpp
+    src/SAM3DBODY-cpp/bvh_shm.cpp
+    src/SAM3DBODY-cpp/offline_passes.cpp
     ${GRAPHICS_ENGINE_DIR}/ModelLoader/model_loader_tri.c
     ${GRAPHICS_ENGINE_DIR}/ModelLoader/model_loader_transform_joints.c
     # MotionCaptureLoader (BVH I/O) ------------------------------------------------
@@ -307,11 +307,11 @@ add_library(fast_sam_3dbody SHARED
 )
 
 target_include_directories(fast_sam_3dbody PUBLIC
-    src
+    src/SAM3DBODY-cpp
     ${GRAPHICS_ENGINE_DIR}
     ${MOCAP_DIR}
     ${TRAJ_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/AmMatrix
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/AmMatrix
     ${ggml_SOURCE_DIR}/include
     ${ORT_INCLUDE_DIRS}
     ${OpenCV_INCLUDE_DIRS}
@@ -331,7 +331,7 @@ if(WIN32)
 endif()
 
 if(WITH_CUDA)
-    target_sources(fast_sam_3dbody PRIVATE src/mhr_lbs_cuda.cu)
+    target_sources(fast_sam_3dbody PRIVATE src/SAM3DBODY-cpp/mhr_lbs_cuda.cu)
     target_compile_definitions(fast_sam_3dbody PUBLIC GGML_USE_CUDA FSB_CUDA)
     target_link_libraries(fast_sam_3dbody PUBLIC CUDA::cudart)
 endif()
@@ -355,7 +355,7 @@ endif()
 # library (POSIX shm/rt — Linux only) and define FSB_SHM so main.cpp's --bvh-shm
 # publisher is active.  Absent (setup_gmr.sh not run / non-Linux) → FSB_SHM off,
 # and the webcam pipeline transparently uses the stdout/tempfile path instead.
-set(_SHM_DIR ${CMAKE_CURRENT_SOURCE_DIR}/SharedMemoryVideoBuffers)
+set(_SHM_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/SharedMemoryVideoBuffers)
 set(_SHM_SRC ${_SHM_DIR}/src/c/sharedMemoryVideoBuffers.c)
 if(UNIX AND NOT APPLE AND EXISTS "${_SHM_SRC}")
     target_sources(fast_sam_3dbody PRIVATE ${_SHM_SRC})
@@ -376,7 +376,7 @@ target_compile_options(fast_sam_3dbody PRIVATE
 # ---------------------------------------------------------------------------
 # fast_sam_3dbody_run  executable
 # ---------------------------------------------------------------------------
-add_executable(fast_sam_3dbody_run src/main.cpp)
+add_executable(fast_sam_3dbody_run src/SAM3DBODY-cpp/main.cpp)
 
 target_link_libraries(fast_sam_3dbody_run PRIVATE fast_sam_3dbody)
 
@@ -397,8 +397,8 @@ if(NOT WIN32)
     find_package(GLEW   REQUIRED)
 
     add_executable(fast_sam_3dbody_render
-        render/fast_sam_3dbody_render.cpp
-        src/v4l2_capture.cpp
+        src/render/fast_sam_3dbody_render.cpp
+        src/SAM3DBODY-cpp/v4l2_capture.cpp
         ${GRAPHICS_ENGINE_DIR}/System/glx3.c
         ${GRAPHICS_ENGINE_DIR}/ModelLoader/model_loader_tri.c
         ${GRAPHICS_ENGINE_DIR}/ModelLoader/model_loader_transform_joints.c
@@ -410,7 +410,7 @@ if(NOT WIN32)
     endif()
 
     target_include_directories(fast_sam_3dbody_render PRIVATE
-        src
+        src/SAM3DBODY-cpp
         ${GRAPHICS_ENGINE_DIR}
         ${ORT_INCLUDE_DIRS}
         ${OpenCV_INCLUDE_DIRS}
@@ -463,11 +463,11 @@ endif()
 # Only the per-pass orchestration code is unique to this target.
 # ---------------------------------------------------------------------------
 add_executable(offline_sam_3dbody_render
-    render/offline_sam_3dbody_render.cpp
+    src/render/offline_sam_3dbody_render.cpp
 )
 
 target_include_directories(offline_sam_3dbody_render PRIVATE
-    src
+    src/SAM3DBODY-cpp
     ${GRAPHICS_ENGINE_DIR}
     ${ORT_INCLUDE_DIRS}
     ${OpenCV_INCLUDE_DIRS}
@@ -503,9 +503,9 @@ set(_AMM_CLI_LIB "${_AMM_DIR}/src/AmmClient/libAmmClient.so")
 
 if(NOT WIN32 AND EXISTS "${_AMM_SRV_HDR}" AND EXISTS "${_AMM_CLI_HDR}"
    AND EXISTS "${_AMM_SRV_LIB}" AND EXISTS "${_AMM_CLI_LIB}")
-    add_executable(sam_3dbody_net net/sam_3dbody_net.cpp)
+    add_executable(sam_3dbody_net src/net/sam_3dbody_net.cpp)
     target_include_directories(sam_3dbody_net PRIVATE
-        src
+        src/SAM3DBODY-cpp
         ${OpenCV_INCLUDE_DIRS}
         "${_AMM_DIR}/src/AmmServerlib"
         "${_AMM_DIR}/src/AmmClient"
@@ -534,13 +534,13 @@ endif()
 # ---------------------------------------------------------------------------
 # QR timecode synchronization tool (optional; needs X11/Xrandr/qrencode)
 # ---------------------------------------------------------------------------
-add_subdirectory(synchronization)
+add_subdirectory(src/synchronization)
 
 # ---------------------------------------------------------------------------
 # multi-view capture & fusion (MULTIVIEW_PLAN.md) — .calib loader so far
 # ---------------------------------------------------------------------------
 enable_testing()
-add_subdirectory(multiview)
+add_subdirectory(src/multiview)
 
 # ---------------------------------------------------------------------------
 # Summary

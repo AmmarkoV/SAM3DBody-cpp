@@ -21,7 +21,7 @@
 # image and passes it as --fx/--fy instead of letting the pipeline use its
 # default.  OFF by default on purpose: that default is the image diagonal,
 # which is the focal the decoder/FFN was trained against (see the comment at
-# src/fast_sam_3dbody.cpp:610), so a true camera focal changes condition_info
+# src/SAM3DBODY-cpp/fast_sam_3dbody.cpp:610), so a true camera focal changes condition_info
 # and can just as easily make the fit worse.  Treat it as an experiment.
 
 THISDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"

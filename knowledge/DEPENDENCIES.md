@@ -204,7 +204,7 @@ To compile the EP out entirely: `cmake -DSAM3D_TENSORRT=OFF ..`.
 
 The stock `backbone.onnx` / `decoder.onnx` are **not** TRT-buildable as exported,
 so `--trt` automatically swaps in TRT-friendly variants (see
-`resolve_backbone_defaults` in `src/cli_common.h`). You don't normally have to do
+`resolve_backbone_defaults` in `src/SAM3DBODY-cpp/cli_common.h`). You don't normally have to do
 anything: when `--trt` is requested and these variants are missing, the binaries
 invoke **`tools/setup_trt.sh --skip-venv`** to fetch them. That script **prompts
 before pulling the ~1.7 GB archive** (and refuses in a non-interactive shell unless

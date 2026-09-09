@@ -48,7 +48,7 @@ ap.add_argument("--bvh-shm", default="",
                      "empty = read @F lines from stdin")
 ap.add_argument("--shm-stream", default="bvh", help="feed name within --bvh-shm")
 ap.add_argument("--shm-lib", default="", help="path to libSharedMemoryVideoBuffers.so "
-                "(default: <repo>/SharedMemoryVideoBuffers/libSharedMemoryVideoBuffers.so)")
+                "(default: <repo>/src/SharedMemoryVideoBuffers/libSharedMemoryVideoBuffers.so)")
 ap.add_argument("--flip-depth", action="store_true",
                 help="reverse global front/back drift (MHR camera-space depth sign is opposite to "
                      "GMR's Y-up->Z-up convention). Rigid per-frame depth-axis shift about frame 0.")
@@ -291,7 +291,7 @@ def main():
 
     if a.bvh_shm:
         from shm_bvh_reader import ShmBvhReader
-        lib = a.shm_lib or str(REPO / "SharedMemoryVideoBuffers" / "libSharedMemoryVideoBuffers.so")
+        lib = a.shm_lib or str(REPO / "src" / "SharedMemoryVideoBuffers" / "libSharedMemoryVideoBuffers.so")
         reader = ShmBvhReader(lib, a.bvh_shm, a.shm_stream)
         print(f"[gmr_stream] reading frames from shm '{a.bvh_shm}:{a.shm_stream}'", file=sys.stderr)
         def source():

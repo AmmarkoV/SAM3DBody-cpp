@@ -3,7 +3,7 @@
 
 #ifdef FSB_SHM
 extern "C" {
-#include "sharedMemoryVideoBuffers.h"   // vendored: SharedMemoryVideoBuffers/src/c
+#include "sharedMemoryVideoBuffers.h"   // vendored: src/SharedMemoryVideoBuffers/src/c
 }
 #include <cstdio>
 

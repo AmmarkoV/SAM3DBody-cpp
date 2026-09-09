@@ -197,7 +197,7 @@ BODY_JOINTS = [
 ]
 
 # BVH joint name → MHR joint name, for centre-to-centre comparison against the
-# companion .joints dump (mirrors NAME_MAP in src/bvh_writer.cpp).
+# companion .joints dump (mirrors NAME_MAP in src/SAM3DBODY-cpp/bvh_writer.cpp).
 BVH_TO_MHR = {
     'hip':'root','abdomen':'c_spine1','chest':'c_spine3','neck':'c_neck','head':'c_head',
     'lCollar':'l_clavicle','lShldr':'l_uparm','lForeArm':'l_lowarm','lHand':'l_wrist',
