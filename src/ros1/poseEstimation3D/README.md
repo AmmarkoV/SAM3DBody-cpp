@@ -3,7 +3,7 @@
 A **minimal, drop-in ROS 1 (catkin) node** that gives an old robot a brand-new
 3D human-pose stack with **no GPU and no heavy dependencies on the robot**. It
 streams a camera image topic to a remote GPU server
-([`sam_3dbody_net`](../../CLIENTSERVER.md)) and republishes the result as a
+([`sam_3dbody_net`](../../../knowledge/CLIENTSERVER.md)) and republishes the result as a
 **TF tree** and a **`std_msgs/Float32MultiArray`**, the same way FORTH's
 `mocapnet_rosnode` did — but all the inference (YOLO + DINOv3 backbone + MHR +
 forward kinematics) runs on the server.

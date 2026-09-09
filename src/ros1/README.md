@@ -1,7 +1,7 @@
 # ros1/ — ROS 1 bridge for SAM3DBody-cpp
 
 This directory holds the **ROS 1 (catkin)** integration for the
-[`sam_3dbody_net`](../CLIENTSERVER.md) client/server stack. It exists so an old
+[`sam_3dbody_net`](../../knowledge/CLIENTSERVER.md) client/server stack. It exists so an old
 robot stuck on ROS 1 (e.g. a PAL robot) can get a modern 3D human-pose tree
 **without a GPU and without heavy dependencies on the robot** — all the
 inference runs on a remote GPU box.
@@ -79,7 +79,7 @@ catkin follows the symlink and builds the in-repo sources. This is safe because
 **`initialize.sh` copies AmmClient with `cp -L`** (dereferencing symlinks) into
 `dependencies/AmmClient/`, so even when the package — or this repo's top-level
 `AmmarServer` — is itself a symlink, the build inputs are concrete files. When
-sourcing from the SAM3DBody-cpp dev tree it reuses `../../AmmarServer`; otherwise
+sourcing from the SAM3DBody-cpp dev tree it reuses `../../../AmmarServer`; otherwise
 it shallow-clones AmmarServer once to grab the files.
 
 The vendored `dependencies/AmmClient/` (and any `dependencies/AmmarServer/`

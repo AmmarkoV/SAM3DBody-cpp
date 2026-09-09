@@ -5,7 +5,7 @@
 # catkin workspace on any machine, and it builds with no external paths.
 #
 # Source priority:
-#   1. the SAM3DBody-cpp dev tree     (../../AmmarServer, which may be a symlink)
+#   1. the SAM3DBody-cpp dev tree     (../../../AmmarServer, which may be a symlink)
 #   2. a previous clone               (dependencies/AmmarServer)
 #   3. a fresh shallow git clone of AmmarServer
 # The AmmClient .c sources are then compiled straight into the node by catkin
@@ -34,8 +34,8 @@ mkdir -p dependencies
 
 # --- locate a source for the AmmClient files ---------------------------------
 SRC=""
-if [ -f "$DIR/../../AmmarServer/src/AmmClient/AmmClient.c" ]; then
-  SRC="$DIR/../../AmmarServer/src/AmmClient"
+if [ -f "$DIR/../../../AmmarServer/src/AmmClient/AmmClient.c" ]; then
+  SRC="$DIR/../../../AmmarServer/src/AmmClient"
   echo "Using AmmClient from the SAM3DBody-cpp dev tree: $SRC"
 elif [ -f "$DIR/dependencies/AmmarServer/src/AmmClient/AmmClient.c" ]; then
   SRC="$DIR/dependencies/AmmarServer/src/AmmClient"
