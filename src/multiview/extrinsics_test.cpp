@@ -41,7 +41,7 @@ static double maxdiff(const Mat4& A, const Mat4& B)
 
 int main()
 {
-    const double D2R = M_PI/180.0;
+    const double D2R = std::acos(-1.0)/180.0;
     // Ground-truth camera world poses (T_world<-cam):
     Mat4 W0 = T_rotY(0,0,0,0);                 // reference
     Mat4 W1 = T_rotY( 20*D2R, 1.0, 0.0, 0.2);

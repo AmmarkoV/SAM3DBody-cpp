@@ -93,6 +93,8 @@ static void print_usage(const char* prog)
         "  --onnx-dir PATH            Directory with backbone / decoder / body_model ONNX files\n"
         "  --backbone NAME            Backbone filename in onnx-dir (default backbone.onnx;\n"
         "                             use backbone_int8.onnx after tools/quantize_backbone.py)\n"
+        "  --decoder NAME             Decoder filename in onnx-dir (default decoder.onnx;\n"
+        "                             use decoder_fp16.onnx for the FP16 export on CUDA EP)\n"
         "  --gguf     PATH            pipeline.gguf (MHR + camera heads)\n"
         "  --yolo     PATH            YOLO pose model (.onnx)\n"
         "  --from     VIDEO           Path to a video file.  Webcams / streams / still images NOT supported.\n"
@@ -109,7 +111,7 @@ static void print_usage(const char* prog)
         "                             the per-frame cost and fetches the 'refined' model profile on\n"
         "                             first run, and it is what fixes image alignment.\n"
         "  --ort-verbose              Print ORT's per-node EP assignment + a chrome-trace profile per\n"
-        "                             session to /tmp/ort_profile_<model>_*.json (open in chrome://tracing)\n"
+        "                             session to the system temp directory (ort_profile_<model>_*.json)\n"
         "  --detector-threshold F     Person confidence (default 0.50; 0.25 for libreyolo). Alias: --thresh\n"
         "  --nms      F               Detector NMS IoU (default 0.45)\n"
         "  --max-persons N            Cap to top-N most-confident people (0 = unlimited)\n"
@@ -258,6 +260,12 @@ static bool parse_args(int argc, char** argv, Config& c)
 
 int main(int argc, char** argv)
 {
+    for (int i = 1; i < argc; ++i) {
+        if (!std::strcmp(argv[i], "--help") || !std::strcmp(argv[i], "-h")) {
+            print_usage(argv[0]);
+            return 0;
+        }
+    }
     Config cfg;
     if (!parse_args(argc, argv, cfg)) return 1;
 

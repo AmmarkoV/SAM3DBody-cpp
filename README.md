@@ -292,24 +292,39 @@ CMake handles dependencies automatically:
 > libonnxruntime_providers_cuda.so` or `Could not find an implementation for
 > Expand(13)`, see **[DEPENDENCIES.md](knowledge/DEPENDENCIES.md)** for the cause and fix.
 
-#### Windows (headless build)
+#### Windows (native build and WGL viewer)
 
-Windows is supported as a **headless build only** (MSVC + CMake; OpenCV via
-vcpkg). CMake automatically fetches the `win-x64` ONNX Runtime and configures the
-CLI (`fast_sam_3dbody_run`) and offline BVH extractor (`offline_sam_3dbody_render`).
+Native Windows supports the CLI, offline BVH extractor, Python/C shared DLL,
+and an OpenGL 3.3 viewer using Win32/WGL. Use **Visual Studio 2022 x64**, **CMake
+3.21+**, the official **OpenCV 4.10.0** Windows package (`vc16` x64 libraries),
+and **GLEW 2.2.0** for the viewer. From the repository root in PowerShell:
 
-The live OpenGL overlay viewer (`fast_sam_3dbody_render`) is **not built on
-Windows** — it depends on GLX/X11, which has no in-tree Windows equivalent. CMake
-prints a notice to this effect at configure time. For visualization on Windows,
-use the offline BVH output or the Python frontends. Linux remains the platform
-for live rendering.
+```powershell
+.\scripts\build_windows.ps1 `
+  -OpenCVDir D:\deps\opencv\build `
+  -GLEWRoot D:\deps\glew-2.2.0 -Gpu
+.\tools\fetch_model.ps1 -Profile cuda -Yes
+```
 
-Outputs in `build/`:
+`-Gpu` uses GPU ONNX Runtime 1.20.1 without requiring nvcc; without a CUDA
+compiler, native ggml/LBS remains on the CPU. Running the CUDA provider still
+requires CUDA 12.x/cuDNN 9.x runtime DLLs on `PATH`. Use `-Headless` to omit the
+viewer, `-TestOpenGL` to opt into its desktop graphics test, or
+`-OnnxRuntimeDir` to supply an existing ORT package.
 
-| File | Description |
-|------|-------------|
-| `fast_sam_3dbody_run` | Standalone CLI executable |
-| `libfast_sam_3dbody.so` | Shared library for C++ linking or ctypes |
+| Default Release output | Description |
+|---|---|
+| `build/windows/Release/fast_sam_3dbody_run.exe` | Inference CLI |
+| `build/windows/Release/fast_sam_3dbody_render.exe` | WGL viewer, unless built with `-Headless` |
+| `build/windows/Release/offline_sam_3dbody_render.exe` | Offline BVH extractor |
+| `build/windows/Release/fast_sam_3dbody.dll` | C++/C/Python library with ABI-checked ctypes bindings |
+
+Keep running from the **repository root**: shaders, mesh assets and BVH
+templates retain repository-relative paths. The output folder alone is not a
+standalone distribution. See **[WINDOWS.md](knowledge/WINDOWS.md)** for CPU and
+FP16 model profiles, CUDA-provider commands that do not require TensorRT,
+Python `--lib-dir build/windows`, DLL setup and platform limitations.
+The WGL implementation credits [beemsoft's PR #13](https://github.com/AmmarkoV/SAM3DBody-cpp/pull/13).
 
 ---
 

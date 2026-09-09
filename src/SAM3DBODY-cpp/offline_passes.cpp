@@ -547,7 +547,7 @@ build_global_tracks(std::vector<FrameRecord>& frames, const Config& cfg)
 
         // Retire any track we haven't seen in too long.
         live.erase(std::remove_if(live.begin(), live.end(),
-            [F](const LiveTrack& t){ return (F - t.last_frame) > MAX_MISSING; }),
+            [F, MAX_MISSING](const LiveTrack& t){ return (F - t.last_frame) > MAX_MISSING; }),
             live.end());
     }
 
@@ -930,12 +930,12 @@ void interpolate_jitter_pass(std::vector<FrameRecord>& frames,
             // anchor.  These are joint Euler angles where naive linear
             // interpolation is unsafe (wrap / gimbal-lock).  Picking the
             // closer non-jittered frame is a conservative substitute.
-            const auto& near = (t < 0.5f) ? aF : bF;
-            if (cF.body_pose.size() == near.body_pose.size())
-                cF.body_pose = near.body_pose;
-            if (cF.hand_pose.size() == near.hand_pose.size())
-                cF.hand_pose = near.hand_pose;
-            cF.mhr_model_params = near.mhr_model_params;
+            const auto& nearest_anchor = (t < 0.5f) ? aF : bF;
+            if (cF.body_pose.size() == nearest_anchor.body_pose.size())
+                cF.body_pose = nearest_anchor.body_pose;
+            if (cF.hand_pose.size() == nearest_anchor.hand_pose.size())
+                cF.hand_pose = nearest_anchor.hand_pose;
+            cF.mhr_model_params = nearest_anchor.mhr_model_params;
 
             frames[seq[i].first].was_interpolated[seq[i].second] = 1;
             ++n_interpolated;

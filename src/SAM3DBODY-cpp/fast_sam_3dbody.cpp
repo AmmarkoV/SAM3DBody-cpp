@@ -358,10 +358,18 @@ struct OrtSession
                 // gated the same way, so use that instead: it dumps every op
                 // with its execution provider and per-call duration, which is
                 // strictly more actionable than a static assignment list.
-                std::string prefix = "/tmp/ort_profile_" +
-                    std::filesystem::path(path).stem().string() + "_";
-                opts.EnableProfiling(prefix.c_str());
-                profiling_enabled = true;
+                std::error_code temp_error;
+                const auto temp_dir = std::filesystem::temp_directory_path(temp_error);
+                if (!temp_error) {
+                    const auto prefix = temp_dir / std::filesystem::u8path(
+                        "ort_profile_" + std::filesystem::u8path(path).stem().u8string() + "_");
+                    // The native path character type also matches ORT on Windows.
+                    opts.EnableProfiling(prefix.c_str());
+                    profiling_enabled = true;
+                } else {
+                    std::fprintf(stderr, "[ORT] profiling disabled: no usable temporary directory (%s)\n",
+                                 temp_error.message().c_str());
+                }
             }
             try
             {
@@ -413,7 +421,9 @@ struct OrtSession
                 }
                 // EP_CPU: append nothing — the default CPU EP runs.
 
-                session = new Ort::Session(e, path.c_str(), opts);
+                // ORT uses wchar_t paths on Windows and char paths on Unix.
+                const auto model_path = std::filesystem::u8path(path);
+                session = new Ort::Session(e, model_path.c_str(), opts);
                 if (ep == EP_CPU && cuda)
                     fprintf(stderr, "[ORT] WARNING: '%s' running on CPU (GPU EPs unavailable)\n",
                             path.c_str());

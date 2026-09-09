@@ -8,13 +8,17 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # ---------------------------------------------------------------------------
 # Platform helpers
 # ---------------------------------------------------------------------------
-# Windows is a HEADLESS-ONLY target: the live OpenGL/X11 overlay renderer
-# (fast_sam_3dbody_render) is not built there. The CLI (fast_sam_3dbody_run)
-# and the offline BVH extractor (offline_sam_3dbody_render) are. See the
-# configure-time notice further down where the renderer would be defined.
 if(WIN32)
+    # TARGET_RUNTIME_DLLS is used to stage dependencies next to the binaries.
+    if(CMAKE_VERSION VERSION_LESS 3.21)
+        message(FATAL_ERROR "Windows builds require CMake 3.21 or newer")
+    endif()
     set(MATH_LIB "")   # libm is folded into the CRT on Windows
     set(RT_LIB   "")   # librt is POSIX-only
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _USE_MATH_DEFINES)
+    if(MSVC)
+        add_compile_options(/utf-8 /wd4996)
+    endif()
 else()
     set(MATH_LIB m)
     set(RT_LIB   rt)
@@ -52,14 +56,26 @@ option(SAM3D_FETCH_MODELS "Download the model files at configure time" OFF)
 if(NOT EXISTS "${_SENTINEL}")
     if(SAM3D_FETCH_MODELS)
         message(STATUS "SAM3D_FETCH_MODELS=ON — fetching models into ${_ONNX_DIR} …")
-        execute_process(
-            COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tools/fetch_model.sh"
-                    shared cuda --onnx-dir "${_ONNX_DIR}" --yes
-            RESULT_VARIABLE _FETCH_RC)
+        if(WIN32)
+            execute_process(
+                COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass -File
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/fetch_model.ps1"
+                    -Profile cuda -OnnxDir "${_ONNX_DIR}" -Yes
+                RESULT_VARIABLE _FETCH_RC)
+        else()
+            execute_process(
+                COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tools/fetch_model.sh"
+                        shared cuda --onnx-dir "${_ONNX_DIR}" --yes
+                RESULT_VARIABLE _FETCH_RC)
+        endif()
         if(NOT _FETCH_RC EQUAL 0)
             message(WARNING "Model fetch failed (exit ${_FETCH_RC}) — "
                             "run 'bash tools/fetch_model.sh' by hand.")
         endif()
+    elseif(WIN32)
+        message(STATUS "Models absent: build and model-free tests are available. Download with "
+            "powershell -File tools/fetch_model.ps1 -Profile cuda -Yes "
+            "(use -Profile cpu for CPU inference). See knowledge/WINDOWS.md.")
     else()
         message(WARNING
             "\n"
@@ -130,7 +146,9 @@ if(CUDAToolkit_FOUND AND NOT CMAKE_CUDA_COMPILER AND CUDAToolkit_NVCC_EXECUTABLE
 endif()
 check_language(CUDA)
 if(CUDAToolkit_FOUND AND CMAKE_CUDA_COMPILER)
-    set(CMAKE_CUDA_ARCHITECTURES "86" CACHE STRING "CUDA architectures" FORCE)
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES "86" CACHE STRING "CUDA architectures")
+    endif()
     enable_language(CUDA)
     set(GGML_CUDA     ON  CACHE BOOL "" FORCE)
     set(GGML_CUDA_F16 ON  CACHE BOOL "" FORCE)
@@ -146,6 +164,30 @@ else()
         message(STATUS "CUDA not found – CPU-only build")
     endif()
 endif()
+
+# Invoke in the directory that creates the target (including multiview).
+function(sam3d_stage_runtime target)
+    if(WIN32)
+        file(GLOB _extra_dlls
+            "${ONNX_RUNTIME_DIR}/lib/onnxruntime_providers*.dll"
+            "${ONNX_RUNTIME_DIR}/bin/onnxruntime_providers*.dll"
+            "${OpenCV_CONFIG_PATH}/../bin/opencv_videoio_ffmpeg*.dll"
+            "${OpenCV_INSTALL_PATH}/bin/opencv_videoio_ffmpeg*.dll")
+        if(SAM3D_GLEW_DLL AND target MATCHES "^(fast_sam_3dbody_render|test_wgl_context)$")
+            list(APPEND _extra_dlls "${SAM3D_GLEW_DLL}")
+        endif()
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND}
+                "-DSAM3D_RUNTIME_DLLS=$<TARGET_RUNTIME_DLLS:${target}>;${_extra_dlls}"
+                "-DSAM3D_DESTINATION=$<TARGET_FILE_DIR:${target}>"
+                -P "${PROJECT_SOURCE_DIR}/cmake/StageRuntime.cmake"
+            VERBATIM)
+    endif()
+endfunction()
+
+# ORT's prebuilt CUDA provider does not need nvcc at build time. This lets
+# Windows users run GPU inference while compiling ggml and LBS on the CPU.
+option(SAM3D_ONNX_CUDA "Use the GPU ONNX Runtime package (CUDA runtime required when running)" ${WITH_CUDA})
 
 # ---------------------------------------------------------------------------
 # ggml  (provides GGUF loading + small FFN inference for MHR/camera heads)
@@ -192,7 +234,7 @@ if(NOT DEFINED ONNX_RUNTIME_DIR OR ONNX_RUNTIME_DIR STREQUAL "")
         if(ONNX_RUNTIME_DIR STREQUAL "" OR NOT DEFINED ONNX_RUNTIME_DIR)
             # Download the pre-built package matching this platform/accelerator.
             set(_ORT_VERSION "1.20.1")
-            if(WITH_CUDA)
+            if(SAM3D_ONNX_CUDA)
                 set(_ORT_SUFFIX "-gpu")
             else()
                 set(_ORT_SUFFIX "")
@@ -207,21 +249,29 @@ if(NOT DEFINED ONNX_RUNTIME_DIR OR ONNX_RUNTIME_DIR STREQUAL "")
             set(_ORT_DIRNAME "onnxruntime-${_ORT_OS}${_ORT_SUFFIX}-${_ORT_VERSION}")
             set(_ORT_ARCHIVE "${_ORT_DIRNAME}.${_ORT_EXT}")
             set(_ORT_URL "https://github.com/microsoft/onnxruntime/releases/download/v${_ORT_VERSION}/${_ORT_ARCHIVE}")
-            set(_ORT_DOWNLOAD_DIR "${CMAKE_BINARY_DIR}/onnxruntime_dl")
-            # After extraction + rename, contents live directly in _ORT_DOWNLOAD_DIR
+            # Keep CPU/GPU (and version/platform) packages separate so changing
+            # SAM3D_ONNX_CUDA in an existing build never reuses the wrong runtime.
+            set(_ORT_DOWNLOAD_ROOT "${CMAKE_BINARY_DIR}/onnxruntime_dl")
+            set(_ORT_DOWNLOAD_DIR "${_ORT_DOWNLOAD_ROOT}/${_ORT_DIRNAME}")
             set(ONNX_RUNTIME_DIR "${_ORT_DOWNLOAD_DIR}")
 
-            if(NOT EXISTS "${_ORT_DOWNLOAD_DIR}")
+            if(NOT EXISTS "${_ORT_DOWNLOAD_DIR}/include/onnxruntime_cxx_api.h")
                 message(STATUS "Downloading ONNX Runtime ${_ORT_VERSION} (${_ORT_OS}${_ORT_SUFFIX}) …")
-                file(DOWNLOAD "${_ORT_URL}" "${CMAKE_BINARY_DIR}/${_ORT_ARCHIVE}" SHOW_PROGRESS)
+                file(DOWNLOAD "${_ORT_URL}" "${CMAKE_BINARY_DIR}/${_ORT_ARCHIVE}"
+                     SHOW_PROGRESS STATUS _ORT_DOWNLOAD_STATUS TLS_VERIFY ON)
+                list(GET _ORT_DOWNLOAD_STATUS 0 _ORT_DOWNLOAD_RC)
+                if(NOT _ORT_DOWNLOAD_RC EQUAL 0)
+                    message(FATAL_ERROR "ONNX Runtime download failed: ${_ORT_DOWNLOAD_STATUS}. Set ONNX_RUNTIME_DIR to an extracted package.")
+                endif()
+                file(MAKE_DIRECTORY "${_ORT_DOWNLOAD_ROOT}")
                 execute_process(
                     COMMAND ${CMAKE_COMMAND} -E tar xf "${CMAKE_BINARY_DIR}/${_ORT_ARCHIVE}"
-                    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+                    WORKING_DIRECTORY "${_ORT_DOWNLOAD_ROOT}"
+                    RESULT_VARIABLE _ORT_EXTRACT_RC
                 )
-                file(RENAME
-                    "${CMAKE_BINARY_DIR}/${_ORT_DIRNAME}"
-                    "${_ORT_DOWNLOAD_DIR}"
-                )
+                if(NOT _ORT_EXTRACT_RC EQUAL 0)
+                    message(FATAL_ERROR "Failed to extract ${_ORT_ARCHIVE}")
+                endif()
             endif()
         endif()
     endif()
@@ -230,12 +280,24 @@ endif()
 if(NOT TARGET onnxruntime::onnxruntime)
     set(ORT_INCLUDE_DIRS "${ONNX_RUNTIME_DIR}/include")
     set(ORT_LIB_DIR      "${ONNX_RUNTIME_DIR}/lib")
+    # These are derived from ONNX_RUNTIME_DIR, not independent user settings.
+    # CMake caches find_* results across configures; discard them before looking
+    # in a newly selected CPU/GPU package or an explicit replacement directory.
+    unset(ORT_LIB CACHE)
+    unset(ORT_LIB)
+    unset(ORT_DLL CACHE)
+    unset(ORT_DLL)
     find_library(ORT_LIB onnxruntime PATHS "${ORT_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
     add_library(onnxruntime::onnxruntime SHARED IMPORTED)
     set_target_properties(onnxruntime::onnxruntime PROPERTIES
-        IMPORTED_LOCATION "${ORT_LIB}"
-        INTERFACE_INCLUDE_DIRECTORIES "${ORT_INCLUDE_DIRS}"
-    )
+        INTERFACE_INCLUDE_DIRECTORIES "${ORT_INCLUDE_DIRS}")
+    if(WIN32)
+        find_file(ORT_DLL onnxruntime.dll PATHS "${ORT_LIB_DIR}" "${ONNX_RUNTIME_DIR}/bin" NO_DEFAULT_PATH REQUIRED)
+        set_target_properties(onnxruntime::onnxruntime PROPERTIES
+            IMPORTED_IMPLIB "${ORT_LIB}" IMPORTED_LOCATION "${ORT_DLL}")
+    else()
+        set_target_properties(onnxruntime::onnxruntime PROPERTIES IMPORTED_LOCATION "${ORT_LIB}")
+    endif()
     set(ORT_LIBS onnxruntime::onnxruntime)
     message(STATUS "ONNX Runtime at ${ONNX_RUNTIME_DIR}")
 endif()
@@ -328,6 +390,8 @@ target_link_libraries(fast_sam_3dbody PUBLIC
 if(WIN32)
     # M_PI and friends are not defined by default in the MSVC <cmath>.
     target_compile_definitions(fast_sam_3dbody PUBLIC _USE_MATH_DEFINES)
+    target_compile_definitions(fast_sam_3dbody PRIVATE FSB_BUILD_DLL)
+    set_target_properties(fast_sam_3dbody PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 endif()
 
 if(WITH_CUDA)
@@ -342,7 +406,7 @@ endif()
 
 # TensorRT EP: only meaningful for CUDA builds (it dlopens the NVIDIA TRT runtime
 # at session-create time and degrades to the CUDA EP if it's not present).
-if(SAM3D_TENSORRT AND WITH_CUDA)
+if(SAM3D_TENSORRT AND SAM3D_ONNX_CUDA)
     target_compile_definitions(fast_sam_3dbody PRIVATE USE_TENSORRT_EP)
     message(STATUS "SAM3D_TENSORRT=ON — TensorRT EP compiled in (enable at runtime with --trt)")
 endif()
@@ -370,7 +434,7 @@ endif()
 
 target_compile_options(fast_sam_3dbody PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -O3 -march=native>
-    $<$<CXX_COMPILER_ID:MSVC>:/O2>
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<NOT:$<CONFIG:Debug>>>:/O2>
 )
 
 # ---------------------------------------------------------------------------
@@ -382,24 +446,46 @@ target_link_libraries(fast_sam_3dbody_run PRIVATE fast_sam_3dbody)
 
 target_compile_options(fast_sam_3dbody_run PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -O3 -march=native>
-    $<$<CXX_COMPILER_ID:MSVC>:/O2>
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<NOT:$<CONFIG:Debug>>>:/O2>
 )
 
 # ---------------------------------------------------------------------------
 # fast_sam_3dbody_render  executable  (OpenGL overlay renderer)
 #
-# Linux-only: it is built on a GLX/X11 OpenGL context (glx3.c) with no Windows
-# (WGL) equivalent in-tree. Windows builds are headless — the renderer is
-# skipped and a notice is printed instead.
+# Linux uses GLX; Windows uses the matching WGL context implementation.
 # ---------------------------------------------------------------------------
-if(NOT WIN32)
+option(SAM3D_BUILD_RENDERER "Build the live OpenGL viewer (GLX on Linux, WGL on Windows)" ON)
+if(SAM3D_BUILD_RENDERER)
     find_package(OpenGL REQUIRED)
     find_package(GLEW   REQUIRED)
+
+    # FindGLEW's module-mode target is UNKNOWN IMPORTED on Windows and its
+    # IMPORTED_LOCATION is the .lib, so TARGET_RUNTIME_DLLS cannot see the DLL.
+    if(WIN32)
+        if(GLEW_USE_STATIC_LIBS)
+            set_property(TARGET GLEW::GLEW APPEND PROPERTY INTERFACE_COMPILE_DEFINITIONS GLEW_STATIC)
+        else()
+            get_target_property(_glew_type GLEW::GLEW TYPE)
+            if(_glew_type STREQUAL "UNKNOWN_LIBRARY")
+                find_file(SAM3D_GLEW_DLL NAMES glew32.dll GLEW.dll
+                    HINTS "${GLEW_ROOT}" "$ENV{GLEW_ROOT}" "${GLEW_INCLUDE_DIR}/.."
+                    PATH_SUFFIXES bin/Release/x64 bin REQUIRED)
+            endif()
+        endif()
+    endif()
+
+    if(WIN32)
+        set(SAM3D_GL_CONTEXT ${GRAPHICS_ENGINE_DIR}/System/wgl3.c)
+        set(SAM3D_WINDOW_LIBS user32 gdi32)
+    else()
+        set(SAM3D_GL_CONTEXT ${GRAPHICS_ENGINE_DIR}/System/glx3.c)
+        set(SAM3D_WINDOW_LIBS X11)
+    endif()
 
     add_executable(fast_sam_3dbody_render
         src/render/fast_sam_3dbody_render.cpp
         src/SAM3DBODY-cpp/v4l2_capture.cpp
-        ${GRAPHICS_ENGINE_DIR}/System/glx3.c
+        ${SAM3D_GL_CONTEXT}
         ${GRAPHICS_ENGINE_DIR}/ModelLoader/model_loader_tri.c
         ${GRAPHICS_ENGINE_DIR}/ModelLoader/model_loader_transform_joints.c
     )
@@ -422,13 +508,15 @@ if(NOT WIN32)
         OpenGL::GL
         GLEW::GLEW
         ${OpenCV_LIBS}
-        X11
+        ${SAM3D_WINDOW_LIBS}
         ${RT_LIB}
         ${MATH_LIB}
-        AmMatrix
+        ${AMMATRIX_LIB}
     )
 
-    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    if(MSVC)
+        target_compile_options(fast_sam_3dbody_render PRIVATE $<$<NOT:$<CONFIG:Debug>>:/O2>)
+    elseif(CMAKE_BUILD_TYPE STREQUAL "Debug")
         target_compile_options(fast_sam_3dbody_render PRIVATE
             $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -g -O0>
             $<$<COMPILE_LANGUAGE:C>:-Wall -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -g -O0>
@@ -440,19 +528,7 @@ if(NOT WIN32)
         )
     endif()
 else()
-    message(STATUS "")
-    message(STATUS "  ┌─────────────────────────────────────────────────────────────────┐")
-    message(STATUS "  │  Windows build: HEADLESS ONLY                                   │")
-    message(STATUS "  │                                                                 │")
-    message(STATUS "  │  Live visualization is NOT supported on Windows. The OpenGL     │")
-    message(STATUS "  │  overlay renderer (fast_sam_3dbody_render) needs GLX/X11 and    │")
-    message(STATUS "  │  will not be built.                                             │")
-    message(STATUS "  │                                                                 │")
-    message(STATUS "  │  Use these instead:                                             │")
-    message(STATUS "  │    fast_sam_3dbody_run        – CLI pose/keypoint output        │")
-    message(STATUS "  │    offline_sam_3dbody_render  – offline BVH extraction          │")
-    message(STATUS "  └─────────────────────────────────────────────────────────────────┘")
-    message(STATUS "")
+    message(STATUS "Live OpenGL viewer disabled (SAM3D_BUILD_RENDERER=OFF)")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -481,7 +557,7 @@ target_link_libraries(offline_sam_3dbody_render PRIVATE
 
 target_compile_options(offline_sam_3dbody_render PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -O3 -march=native>
-    $<$<CXX_COMPILER_ID:MSVC>:/O2>
+    $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<NOT:$<CONFIG:Debug>>>:/O2>
 )
 
 # ---------------------------------------------------------------------------
@@ -534,7 +610,9 @@ endif()
 # ---------------------------------------------------------------------------
 # QR timecode synchronization tool (optional; needs X11/Xrandr/qrencode)
 # ---------------------------------------------------------------------------
-add_subdirectory(src/synchronization)
+if(NOT WIN32)
+    add_subdirectory(src/synchronization)
+endif()
 
 # ---------------------------------------------------------------------------
 # multi-view capture & fusion (MULTIVIEW_PLAN.md) — .calib loader so far
@@ -542,21 +620,74 @@ add_subdirectory(src/synchronization)
 enable_testing()
 add_subdirectory(src/multiview)
 
+foreach(_target fast_sam_3dbody_run offline_sam_3dbody_render fast_sam_3dbody_render)
+    if(TARGET ${_target})
+        add_test(NAME ${_target}_help COMMAND ${_target}
+            --onnx-dir definitely-missing-models --from 999 --help)
+        set_tests_properties(${_target}_help PROPERTIES TIMEOUT 15
+            ENVIRONMENT "SAM3D_AUTO_FETCH=0"
+            PASS_REGULAR_EXPRESSION "Usage:"
+            FAIL_REGULAR_EXPRESSION "Loading backbone|models missing|Failed to load pipeline")
+    endif()
+endforeach()
+
+# These regression tests need no model files or network access.
+add_executable(test_python_abi_layout tests/test_python_abi_layout.c)
+target_include_directories(test_python_abi_layout PRIVATE src/SAM3DBODY-cpp)
+find_package(Python3 QUIET COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME python_abi COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_python_abi.py"
+        --probe $<TARGET_FILE:test_python_abi_layout>
+        --lib-dir $<TARGET_FILE_DIR:fast_sam_3dbody>)
+endif()
+add_executable(test_portable_getline tests/test_portable_getline.c)
+add_test(NAME portable_getline COMMAND test_portable_getline)
+if(WIN32)
+    # CTest launched by PowerShell 7 otherwise passes its incompatible module
+    # search path to Windows PowerShell 5.1. Let that child derive its own path.
+    add_test(NAME powershell_model_manifest COMMAND ${CMAKE_COMMAND} -E env
+        --unset=PSModulePath powershell.exe -NoProfile
+        -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_fetch_model.ps1")
+    set_tests_properties(powershell_model_manifest PROPERTIES TIMEOUT 30)
+    add_executable(windows_worker_pool_test src/SAM3DBODY-cpp/windows_worker_pool_test.cpp)
+    add_test(NAME windows_worker_pool COMMAND windows_worker_pool_test)
+    if(SAM3D_BUILD_RENDERER)
+        add_executable(test_wgl_context tests/test_wgl_context.c ${SAM3D_GL_CONTEXT})
+        target_link_libraries(test_wgl_context PRIVATE OpenGL::GL GLEW::GLEW user32 gdi32)
+        option(SAM3D_TEST_OPENGL "Run the WGL test (requires an interactive desktop and OpenGL 3.3 driver)" OFF)
+        if(SAM3D_TEST_OPENGL)
+            add_test(NAME wgl_context COMMAND test_wgl_context)
+            set_tests_properties(wgl_context PROPERTIES TIMEOUT 30)
+        endif()
+    endif()
+
+    # ORT providers and OpenCV's FFmpeg backend are loaded dynamically, so
+    # TARGET_RUNTIME_DLLS alone cannot discover them.
+    foreach(_target fast_sam_3dbody fast_sam_3dbody_run offline_sam_3dbody_render
+            fast_sam_3dbody_render test_wgl_context)
+        if(TARGET ${_target})
+            sam3d_stage_runtime(${_target})
+        endif()
+    endforeach()
+endif()
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
-if(WIN32)
-    set(_VIS_STATUS "DISABLED (headless build — Windows not supported)")
-    set(_TARGETS_STATUS "fast_sam_3dbody (lib)  fast_sam_3dbody_run (exe)  offline_sam_3dbody_render (exe)")
-else()
+if(SAM3D_BUILD_RENDERER)
     set(_VIS_STATUS "enabled (fast_sam_3dbody_render)")
     set(_TARGETS_STATUS "fast_sam_3dbody (lib)  fast_sam_3dbody_run (exe)  fast_sam_3dbody_render (exe)  offline_sam_3dbody_render (exe)")
+else()
+    set(_VIS_STATUS "disabled")
+    set(_TARGETS_STATUS "fast_sam_3dbody (lib)  fast_sam_3dbody_run (exe)  offline_sam_3dbody_render (exe)")
 endif()
 
 message(STATUS "")
 message(STATUS "=== fast_sam_3dbody build ===")
 message(STATUS "  Platform      : ${CMAKE_SYSTEM_NAME}")
 message(STATUS "  CUDA support  : ${WITH_CUDA}")
+message(STATUS "  ORT GPU pkg   : ${SAM3D_ONNX_CUDA}")
 message(STATUS "  ggml CUDA     : ${GGML_CUDA}")
 message(STATUS "  OpenCV        : ${OpenCV_VERSION}")
 message(STATUS "  ORT include   : ${ORT_INCLUDE_DIRS}")

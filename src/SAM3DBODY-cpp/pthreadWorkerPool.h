@@ -9,6 +9,10 @@
 #ifndef PTHREADWORKERPOOL_H_INCLUDED
 #define PTHREADWORKERPOOL_H_INCLUDED
 
+#if defined(_WIN32) && defined(__cplusplus)
+#include "windowsWorkerPool.h"
+#else
+
 //The star of the show
 #include <pthread.h>
 #include <stdio.h>
@@ -693,6 +697,7 @@ static int threadpoolDestroy(struct workerPool *pool)
 }
 #endif
 
+#endif // Windows C++ / POSIX implementation
 #endif // PTHREADWORKERPOOL_H_INCLUDED
 
 

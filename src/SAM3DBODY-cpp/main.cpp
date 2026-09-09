@@ -85,6 +85,8 @@ static void print_usage(const char* prog)
     printf("  --backbone NAME   Backbone filename in onnx-dir (default backbone.onnx; on CUDA,\n");
     printf("                    backbone_fp16.onnx is auto-preferred when present — see\n");
     printf("                    tools/export_backbone_fp16.py; or backbone_int8.onnx via quantize_backbone.py)\n");
+    printf("  --decoder NAME    Decoder filename in onnx-dir (default decoder.onnx;\n");
+    printf("                    use decoder_fp16.onnx for the FP16 export on CUDA EP)\n");
     printf("  --gguf PATH       pipeline.gguf (MHR + camera heads)\n");
     printf("  --yolo PATH       YOLO pose model (.onnx or .engine)\n");
     printf("  --from SRC        Webcam index (0,1,..) or path to image/video\n");
@@ -94,7 +96,7 @@ static void print_usage(const char* prog)
     printf("  --trt             Enable ONNX Runtime TensorRT EP\n");
     printf("  --no-fp16         Disable FP16 for ONNX EP\n");
     printf("  --ort-verbose     Print ORT's per-node EP assignment + a chrome-trace profile per\n");
-    printf("                    session to /tmp/ort_profile_<model>_*.json (open in chrome://tracing)\n");
+    printf("                    session to the system temp directory (ort_profile_<model>_*.json)\n");
     printf("  --skip-body       Skip body model (no vertices / keypoints)\n");
     printf("  --dev-face        Enable face expression params (disabled by default)\n");
     printf("  --detector-threshold F  Person confidence (default 0.50; 0.25 for libreyolo). Alias: --thresh\n");

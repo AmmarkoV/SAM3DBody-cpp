@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "bvh_to_tri_pose.h"
+#include "../../System/portable_getline.h"
 
 #include "../../TrajectoryParser/InputParser_C.h"
 
@@ -187,7 +188,7 @@ int bvh_loadBVHToTRIAssociationFile(
    InputParser_SetDelimeter(ipc,6,13);
 
 
-    ssize_t read;
+    ptrdiff_t read;
     char * line = NULL;
     size_t len = 0;
 
@@ -196,7 +197,7 @@ int bvh_loadBVHToTRIAssociationFile(
     bvhtri->numberOfJointAssociations=0;
     unsigned int jID=0;
 
-    while  ((read = getline(&line, &len, fp)) != -1)
+    while  ((read = fsb_getline(&line, &len, fp)) != -1)
     {
        int num = InputParser_SeperateWords(ipc,line,1);
 
