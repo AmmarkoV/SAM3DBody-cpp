@@ -5,8 +5,8 @@
 # 2. Download ONNX/GGUF/LBS models from HuggingFace (into onnx/).
 # 3. Build the C++ shared library and CLI (cmake + make).
 # 4. Create a Python venv with the packages required by both Python frontends:
-#      fast_sam_3dbody_frontend.py      – needs only opencv-python + numpy
-#      fast_sam_3dbody_frontend-3D.py   – also needs torch, pyrender, roma, etc.
+#      python/fast_sam_3dbody_frontend.py      – needs only opencv-python + numpy
+#      python/fast_sam_3dbody_frontend-3D.py   – also needs torch, pyrender, roma, etc.
 #
 # Usage (from repo root):
 #   bash scripts/setup.sh
@@ -364,7 +364,7 @@ echo "  # Activate the venv for Python frontends:"
 echo "  source ${VENV_DIR}/bin/activate"
 echo ""
 echo "  # Lightweight frontend (2D skeleton only):"
-echo "  python fast_sam_3dbody_frontend.py --from assets/teaser.png"
+echo "  python python/fast_sam_3dbody_frontend.py --from assets/teaser.png"
 echo ""
 echo "  # 3D frontend (full mesh rendering):"
-echo "  python fast_sam_3dbody_frontend-3D.py --from assets/teaser.png"
+echo "  python python/fast_sam_3dbody_frontend-3D.py --from assets/teaser.png"

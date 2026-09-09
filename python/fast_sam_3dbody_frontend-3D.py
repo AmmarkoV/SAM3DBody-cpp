@@ -5,9 +5,9 @@ Heavy frontend: C engine for detection + backbone + decoder + MHR FFN heads,
 Python MHR body model for full 3D mesh, rendered like demo_webcam.py.
 
 Usage:
-  python fast_sam_3dbody_cpp/fast_sam_3dbody_frontend-3D.py --from assets/teaser.png
-  python fast_sam_3dbody_cpp/fast_sam_3dbody_frontend-3D.py --from 0 --max-skeletons 3
-  python fast_sam_3dbody_cpp/fast_sam_3dbody_frontend-3D.py --from video.mp4 --headless --out out.mp4
+  python fast_sam_3dbody_cpp/python/fast_sam_3dbody_frontend-3D.py --from assets/teaser.png
+  python fast_sam_3dbody_cpp/python/fast_sam_3dbody_frontend-3D.py --from 0 --max-skeletons 3
+  python fast_sam_3dbody_cpp/python/fast_sam_3dbody_frontend-3D.py --from video.mp4 --headless --out out.mp4
 """
 
 import argparse
@@ -21,7 +21,7 @@ import numpy as np
 import torch
 
 # Add repo root so sam_3d_body package is importable
-_repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, _repo_root)
 
 from sam_3d_body.build_models import load_sam_3d_body
@@ -234,7 +234,7 @@ def fsb_result_to_output(model, result: FsbResult, frame_h: int, frame_w: int,
 
 def parse_args():
     p = argparse.ArgumentParser(description="SAM-3D-Body 3D frontend")
-    cpp_dir = os.path.dirname(os.path.abspath(__file__))
+    cpp_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     onnx    = os.path.join(cpp_dir, "onnx")
     build   = os.path.join(cpp_dir, "build")
     ckpt_default = os.path.join(_repo_root, "checkpoints", "sam-3d-body-dinov3")

@@ -7,10 +7,10 @@ Loads libfast_sam_3dbody.so via ctypes, runs inference,
 and draws COCO skeleton + MHR pose info on the frame.
 
 Usage:
-  python fast_sam_3dbody_cpp/fast_sam_3dbody_frontend.py --from 0
-  python fast_sam_3dbody_cpp/fast_sam_3dbody_frontend.py --from /path/to/video.mp4
-  python fast_sam_3dbody_cpp/fast_sam_3dbody_frontend.py --from /path/to/image.jpg
-  python fast_sam_3dbody_cpp/fast_sam_3dbody_frontend.py --from 0 --max-skeletons 3
+  python fast_sam_3dbody_cpp/python/fast_sam_3dbody_frontend.py --from 0
+  python fast_sam_3dbody_cpp/python/fast_sam_3dbody_frontend.py --from /path/to/video.mp4
+  python fast_sam_3dbody_cpp/python/fast_sam_3dbody_frontend.py --from /path/to/image.jpg
+  python fast_sam_3dbody_cpp/python/fast_sam_3dbody_frontend.py --from 0 --max-skeletons 3
 """
 
 import argparse
@@ -429,8 +429,8 @@ _PERSON_COLORS = [
 
 def parse_args():
     p = argparse.ArgumentParser(description="SAM-3D-Body Python frontend")
-    onnx = os.path.join(os.path.dirname(os.path.abspath(__file__)), "onnx")
-    build = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build")
+    onnx = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "onnx")
+    build = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "build")
 
     p.add_argument("--lib-dir",     default=build,
                    help="Directory containing libfast_sam_3dbody.so")
@@ -461,7 +461,7 @@ def parse_args():
     # ── Second-pass options ───────────────────────────────────────────────────
     # --two-passes activates the Python second decoder pass (better accuracy).
     # The C++ first pass still runs; --checkpoint/--mhr-model point to the
-    # Python model assets.  See fast_sam_3dbody_cpp/two_pass.py for details.
+    # Python model assets.  See fast_sam_3dbody_cpp/python/two_pass.py for details.
     p.add_argument("--two-passes",  action="store_true",
                    help="Run Python second decoder pass for better accuracy")
     p.add_argument("--checkpoint",  default="",

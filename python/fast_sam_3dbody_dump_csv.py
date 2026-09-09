@@ -15,9 +15,9 @@ CSV format (one file per person):
   rows:    one frame per row, float values (0,0,0 when joint absent)
 
 Usage:
-  python fast_sam_3dbody_cpp/fast_sam_3dbody_dump_csv.py --from 0
-  python fast_sam_3dbody_cpp/fast_sam_3dbody_dump_csv.py --from video.mp4 --csv-out pose.csv
-  python fast_sam_3dbody_cpp/fast_sam_3dbody_dump_csv.py --from 0 --headless --csv-out pose.csv
+  python fast_sam_3dbody_cpp/python/fast_sam_3dbody_dump_csv.py --from 0
+  python fast_sam_3dbody_cpp/python/fast_sam_3dbody_dump_csv.py --from video.mp4 --csv-out pose.csv
+  python fast_sam_3dbody_cpp/python/fast_sam_3dbody_dump_csv.py --from 0 --headless --csv-out pose.csv
 """
 
 import argparse
@@ -230,7 +230,7 @@ def save_csv(filename: str, history: list) -> None:
 
 def parse_args():
     p = argparse.ArgumentParser(description="SAM-3D-Body CSV keypoint dumper")
-    cpp_dir = os.path.dirname(os.path.abspath(__file__))
+    cpp_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     onnx    = os.path.join(cpp_dir, "onnx")
     build   = os.path.join(cpp_dir, "build")
 

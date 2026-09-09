@@ -801,7 +801,7 @@ int main(int argc, const char** argv) {
         // --boxes: plain text, one "x1 y1 x2 y2" per line, original image pixels.
         // Blank lines and '#' comments are skipped.  Deliberately not JSON —
         // there is no JSON dependency in the C++ tree and this is written by a
-        // single producer (scripts/sam3_solve.py).
+        // single producer (python/sam3_solve.py).
         if (!boxes_path.empty()) {
             FILE* bf = fopen(boxes_path.c_str(), "r");
             if (!bf) { fprintf(stderr, "Cannot open --boxes file: %s\n", boxes_path.c_str()); return 1; }

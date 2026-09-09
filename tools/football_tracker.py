@@ -45,9 +45,9 @@ import cv2
 import numpy as np
 
 # ── Reuse the existing C++ ctypes bindings + drawing helpers ──────────────────
-# fast_sam_3dbody_frontend.py lives at the repo root (one level up from tools/).
+# fast_sam_3dbody_frontend.py lives in python/ (a sibling of tools/).
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, _REPO_ROOT)
+sys.path.insert(0, os.path.join(_REPO_ROOT, "python"))
 from fast_sam_3dbody_frontend import (  # noqa: E402
     FsbConfig, FsbResult, load_library, _correct_kps2d,
     MHR70_EDGES, _mhr_color, _MHR_HEAD_JOINTS,

@@ -15,10 +15,10 @@ Requires the gradio_client venv used by the SAM3 client:
     /home/ammar/Documents/3dParty/sam3/venv/bin/python
 
 Usage:
-    sam3_solve.py DSC_2856.JPG
-    sam3_solve.py DSC_2856.JPG --server ammar.gr:7860
-    sam3_solve.py DSC_2856.JPG --min-box-px 24 --batch 48
-    sam3_solve.py DSC_2856.JPG --keep-boxes boxes.txt
+    python/sam3_solve.py DSC_2856.JPG
+    python/sam3_solve.py DSC_2856.JPG --server ammar.gr:7860
+    python/sam3_solve.py DSC_2856.JPG --min-box-px 24 --batch 48
+    python/sam3_solve.py DSC_2856.JPG --keep-boxes boxes.txt
 """
 
 import argparse
@@ -32,7 +32,7 @@ import cv2
 import numpy as np
 from gradio_client import Client, handle_file
 
-REPO = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def segment(image_path, server, prompt, max_side):

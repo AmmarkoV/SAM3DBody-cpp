@@ -5,8 +5,8 @@ This document is a reference for every set of **points** (2D and 3D) and their
 definitions together from:
 
 - `src/SAM3DBODY-cpp/fast_sam_3dbody.h` / `fast_sam_3dbody_capi.h` — the `MHRResult` / `FsbResult` struct
-- `fast_sam_3dbody_dump_csv.py` — the canonical **MHR-70** keypoint name list
-- `fast_sam_3dbody_frontend.py` — the **COCO-17** keypoint name list
+- `python/fast_sam_3dbody_dump_csv.py` — the canonical **MHR-70** keypoint name list
+- `python/fast_sam_3dbody_frontend.py` — the **COCO-17** keypoint name list
 - `src/SAM3DBODY-cpp/mhr_joint_table.h` — the **127** MHR LBS skeleton joint names + parents
 - `src/render/fast_sam_3dbody_render.cpp` — the `.obj` / `.joints` export formats
 
@@ -51,7 +51,7 @@ There are therefore **three** independent point sets per person:
 
 70 joints. `kps_3d` is `70 × [x, y, z]` in metres (camera space); `kps_2d` is the
 same 70 joints projected to `70 × [x, y]` image pixels. Order matches
-`MHR70_NAMES` in `fast_sam_3dbody_dump_csv.py` (from
+`MHR70_NAMES` in `python/fast_sam_3dbody_dump_csv.py` (from
 `sam_3d_body/metadata/mhr70.py original_keypoint_info`).
 
 **Layout:** `0–20` body/foot · `21–41` right hand · `42–62` left hand · `63–69` extra.
@@ -85,13 +85,13 @@ same 70 joints projected to `70 × [x, y]` image pixels. Order matches
 
 > Note: MHR-70 **wrists** are at indices **62 (left)** and **41 (right)** — at the
 > end of each hand block, not in the body block. Index 9/10 are **hips**, not wrists.
-> The CSV exporter (`fast_sam_3dbody_dump_csv.py`) writes these 70 names ×
+> The CSV exporter (`python/fast_sam_3dbody_dump_csv.py`) writes these 70 names ×
 > `_3DX,_3DY,_3DZ` columns, one frame per row, `0,0,0` when a joint is absent.
 
 ### COCO-17 → MHR-70 index map
 
 The lightweight frontend reconciles the two sets with
-(`_COCO_TO_MHR70` in `fast_sam_3dbody_frontend.py`):
+(`_COCO_TO_MHR70` in `python/fast_sam_3dbody_frontend.py`):
 
 ```
 COCO idx:   0  1  2  3  4  5  6  7  8   9  10  11 12 13 14 15 16
@@ -105,7 +105,7 @@ MHR70 idx:  0  1  2  3  4  5  6  7  8  62  41   9 10 11 12 13 14
 ## 3. COCO-17 keypoints (`yolo_kps`)
 
 51 floats = 17 joints × `[x, y, confidence]`, in original-image pixels. Standard
-COCO person keypoint order (labels/colours from `fast_sam_3dbody_frontend.py`):
+COCO person keypoint order (labels/colours from `python/fast_sam_3dbody_frontend.py`):
 
 | Idx | Label | Idx | Label |
 |----:|-------|----:|-------|
@@ -239,7 +239,7 @@ z = -(joint.z - pelvis.z) * scale + cam_t.z*scale
 Standard Wavefront OBJ — 18439 `v x y z` vertex lines + faces, same world space
 and scale as the `.joints` file above.
 
-### `.csv` (`-o`/`--out`, or `fast_sam_3dbody_dump_csv.py`)
+### `.csv` (`-o`/`--out`, or `python/fast_sam_3dbody_dump_csv.py`)
 Header is the 70 MHR-70 names each expanded to three columns
 (`<name>_3DX,<name>_3DY,<name>_3DZ`); one row per frame; `0,0,0` when a joint is
 absent. Values are `kps_3d` in metres.

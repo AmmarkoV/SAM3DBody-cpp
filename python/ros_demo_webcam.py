@@ -20,9 +20,9 @@ Requirements:
     - skeleton_msgs ROS2 package
 
 Usage:
-    python3 fast_sam_3dbody_cpp/ros_demo_webcam.py
-    python3 fast_sam_3dbody_cpp/ros_demo_webcam.py --from 0 --display
-    python3 fast_sam_3dbody_cpp/ros_demo_webcam.py --from video.mp4 --headless
+    python3 fast_sam_3dbody_cpp/python/ros_demo_webcam.py
+    python3 fast_sam_3dbody_cpp/python/ros_demo_webcam.py --from 0 --display
+    python3 fast_sam_3dbody_cpp/python/ros_demo_webcam.py --from video.mp4 --headless
 """
 
 import argparse
@@ -275,7 +275,7 @@ class PoseEstimationNode(Node):
 
     def _initialize_pipeline(self):
         """Load libfast_sam_3dbody.so and initialise the inference pipeline."""
-        cpp_dir = os.path.dirname(os.path.abspath(__file__))
+        cpp_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         lib_dir = self.args.lib_dir or os.path.join(cpp_dir, 'build')
         onnx    = self.args.onnx_dir or os.path.join(cpp_dir, 'onnx')
         gguf    = self.args.gguf    or os.path.join(onnx, 'pipeline.gguf')
@@ -540,7 +540,7 @@ def _make_joint3d(xyz: np.ndarray) -> Joint3D:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def parse_arguments():
-    cpp_dir = os.path.dirname(os.path.abspath(__file__))
+    cpp_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     p = argparse.ArgumentParser(
         description='Fast-SAM-3D-Body ROS2 node — real-time MHR70 pose to ROS topics',

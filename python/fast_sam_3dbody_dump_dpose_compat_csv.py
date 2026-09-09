@@ -21,9 +21,9 @@ CSV format mirrors D-PoSE write_skeleton_rows_to_csv:
   rows:    one row per (frame, skeleton); joint columns sorted for stability.
 
 Usage (kept close to D-PoSE demo_webcam_csv.py):
-  python fast_sam_3dbody_dump_dpose_compat_csv.py --input /dev/video0 --save
-  python fast_sam_3dbody_dump_dpose_compat_csv.py --input video.mp4 --output_folder out
-  python fast_sam_3dbody_dump_dpose_compat_csv.py --input image.jpg --display
+  python python/fast_sam_3dbody_dump_dpose_compat_csv.py --input /dev/video0 --save
+  python python/fast_sam_3dbody_dump_dpose_compat_csv.py --input video.mp4 --output_folder out
+  python python/fast_sam_3dbody_dump_dpose_compat_csv.py --input image.jpg --display
 """
 
 import argparse
@@ -481,7 +481,7 @@ def open_capture(src: str):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def parse_args():
-    cpp_dir = os.path.dirname(os.path.abspath(__file__))
+    cpp_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     onnx    = os.path.join(cpp_dir, "onnx")
     build   = os.path.join(cpp_dir, "build")
 

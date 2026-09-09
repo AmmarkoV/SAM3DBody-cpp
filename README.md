@@ -16,7 +16,7 @@ output drops straight into Blender / BVHTester / any DCC. A bundled
 MakeHuman-rigged character from the result. See **[BVH export](#bvh-export---bvh)** for details.
 
 ```bash
-./fast_sam_3dbody_run --from clip.mp4 --bvh ./p.bvh --headless
+./scripts/video.sh --from clip.mp4 --bvh ./p.bvh --headless
 # → p_0.bvh, p_1.bvh, …
 ```
 
@@ -80,10 +80,7 @@ Download these four files and place them alongside the rest of the models in `on
 Once they are in `onnx/`, `--cuda -1` picks both up by itself — no extra flags:
 
 ```bash
-./build/fast_sam_3dbody_run \
-    --onnx-dir ./onnx \
-    --cuda     -1 \
-    --from     your_video.mp4
+./scripts/video.sh --from your_video.mp4 --cuda -1
 ```
 
 > **Performance expectations for CPU inference:**
@@ -183,11 +180,14 @@ BGR image
 ```
 SAM3DBody-cpp/
 ├── CMakeLists.txt
-├── fast_sam_3dbody_frontend.py       Python lightweight frontend (ctypes, no extra deps)
-├── fast_sam_3dbody_frontend-3D.py    Python 3D frontend (ctypes + Python body model)
-├── fast_sam_3dbody_dump_csv.py       Python CSV exporter – 70 MHR keypoints per frame
-├── two_pass.py                       Second-pass temporal smoother
-├── ros_demo_webcam.py                ROS demo
+├── python/                           Python frontends & tools (ctypes bindings to the .so)
+│   ├── fast_sam_3dbody_frontend.py       Lightweight frontend (ctypes, no extra deps)
+│   ├── fast_sam_3dbody_frontend-3D.py    3D frontend (ctypes + Python body model)
+│   ├── fast_sam_3dbody_dump_csv.py       CSV exporter – 70 MHR keypoints per frame
+│   ├── fast_sam_3dbody_dump_dpose_compat_csv.py  D-PoSE-compatible SMPL-X CSV dumper
+│   ├── two_pass.py                       Second-pass temporal smoother
+│   ├── sam3_solve.py                     SAM3 segmentation driver
+│   └── ros_demo_webcam.py                ROS demo
 ├── onnx/                             Runtime model files – download from HuggingFace (see above)
 │   ├── backbone.onnx + .data         ~4.8 GB  DINOv3-ViT-H/14+ encoder
 │   ├── decoder.onnx                  ~93 MB   6-layer PromptableDecoder
@@ -315,33 +315,64 @@ Outputs in `build/`:
 
 ## Running
 
-### CLI executable
+### Helper scripts (recommended)
+
+Every example below is run **from the repository root**. The wrappers in
+`scripts/` `cd` to the repo root themselves, so they also work from anywhere,
+and they fill in the model paths (`--onnx-dir ./onnx`, `--gguf`, `--yolo`,
+`--mesh`, `--lbs`) for you. Any extra flags are forwarded verbatim to the
+renderer, so anything in the option list below can be appended.
 
 ```bash
-cd fast_sam_3dbody_cpp/build
+# Webcam (device 0) — live OpenGL overlay
+./scripts/webcam.sh
 
+# Video file — live overlay
+./scripts/video.sh --from clip.mp4
+
+# Video file — render to an .mp4 instead of a window (audio is copied over)
+./scripts/video.sh --from clip.mp4 --save out.mp4
+
+# Still images — writes <stem>_v next to the input (doc/screen_v.jpg here)
+./scripts/image.sh doc/screen.jpg
+
+# Offline multi-pass BVH extraction (best BVH quality, no window)
+./scripts/offline_video.sh --from clip.mp4 --bvh ./p.bvh
+```
+
+These all drive `fast_sam_3dbody_render`. Because extra flags are forwarded,
+`./scripts/webcam.sh --refined-pose` and `./scripts/video.sh --from clip.mp4 --cuda -1`
+work as expected.
+
+### CLI executable
+
+`fast_sam_3dbody_run` is the windowless CLI. Use it directly when you want the
+pose parameters on stdout, CSV keypoints (`--out`), or `--skip-body` — none of
+which the renderer wrappers above expose. Run it from the repository root:
+
+```bash
 # Single image – prints pose params to stdout
-./fast_sam_3dbody_run \
-    --onnx-dir ../onnx \
-    --gguf     ../onnx/pipeline.gguf \
-    --yolo     ../onnx/yolo.onnx \
-    --from     ../../assets/teaser.png
+./build/fast_sam_3dbody_run \
+    --onnx-dir ./onnx \
+    --gguf     ./onnx/pipeline.gguf \
+    --yolo     ./onnx/yolo.onnx \
+    --from     ./doc/screen.jpg
 
 # Webcam (device 0)
-./fast_sam_3dbody_run \
-    --onnx-dir ../onnx --gguf ../onnx/pipeline.gguf --yolo ../onnx/yolo.onnx \
+./build/fast_sam_3dbody_run \
+    --onnx-dir ./onnx --gguf ./onnx/pipeline.gguf --yolo ./onnx/yolo.onnx \
     --from 0
 
 # Video file
-./fast_sam_3dbody_run \
-    --onnx-dir ../onnx --gguf ../onnx/pipeline.gguf --yolo ../onnx/yolo.onnx \
+./build/fast_sam_3dbody_run \
+    --onnx-dir ./onnx --gguf ./onnx/pipeline.gguf --yolo ./onnx/yolo.onnx \
     --from /path/to/video.mp4
 
 # Fastest mode – skip LBS body model (no vertices, just pose params)
-./fast_sam_3dbody_run ... --skip-body
+./build/fast_sam_3dbody_run ... --skip-body
 
 # CPU-only
-./fast_sam_3dbody_run ... --cuda -1
+./build/fast_sam_3dbody_run ... --cuda -1
 ```
 
 Full option list:
@@ -466,16 +497,16 @@ Draws COCO 2D skeletons and a pose-bar panel. Requires only `opencv-python` and 
 
 ```bash
 # From the repo root:
-python fast_sam_3dbody_cpp/fast_sam_3dbody_frontend.py --from assets/teaser.png
+python fast_sam_3dbody_cpp/python/fast_sam_3dbody_frontend.py --from assets/teaser.png
 
 # Webcam, cap at 3 persons
-python fast_sam_3dbody_cpp/fast_sam_3dbody_frontend.py --from 0 --max-skeletons 3
+python fast_sam_3dbody_cpp/python/fast_sam_3dbody_frontend.py --from 0 --max-skeletons 3
 
 # Save output image / video
-python fast_sam_3dbody_cpp/fast_sam_3dbody_frontend.py \
+python fast_sam_3dbody_cpp/python/fast_sam_3dbody_frontend.py \
     --from assets/teaser.png --out out.jpg
 
-python fast_sam_3dbody_cpp/fast_sam_3dbody_frontend.py \
+python fast_sam_3dbody_cpp/python/fast_sam_3dbody_frontend.py \
     --from video.mp4 --headless --out out.mp4
 ```
 
@@ -497,19 +528,19 @@ then calls the Python MHR body model (`mhr_model.pt`) for LBS skinning to produc
 mesh vertices. Requires the full Python environment (PyTorch, sam_3d_body package, pyrender).
 
 ```bash
-python fast_sam_3dbody_cpp/fast_sam_3dbody_frontend-3D.py --from assets/teaser.png
+python fast_sam_3dbody_cpp/python/fast_sam_3dbody_frontend-3D.py --from assets/teaser.png
 
 # Webcam
-python fast_sam_3dbody_cpp/fast_sam_3dbody_frontend-3D.py --from 0 --max-skeletons 3
+python fast_sam_3dbody_cpp/python/fast_sam_3dbody_frontend-3D.py --from 0 --max-skeletons 3
 
 # Custom checkpoint paths
-python fast_sam_3dbody_cpp/fast_sam_3dbody_frontend-3D.py \
+python fast_sam_3dbody_cpp/python/fast_sam_3dbody_frontend-3D.py \
     --from assets/teaser.png \
     --checkpoint ./checkpoints/sam-3d-body-dinov3/model.ckpt \
     --mhr-model  ./checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt
 
 # Save result
-python fast_sam_3dbody_cpp/fast_sam_3dbody_frontend-3D.py \
+python fast_sam_3dbody_cpp/python/fast_sam_3dbody_frontend-3D.py \
     --from assets/teaser.png --out result_3d.jpg
 ```
 
@@ -534,13 +565,13 @@ passband.
 
 ```bash
 # Enable with the default 6 Hz cutoff
-./fast_sam_3dbody_run --from video.mp4 --butterworth
+./scripts/video.sh --from video.mp4 --butterworth
 
 # Lower cutoff for smoother (more lag) output
-./fast_sam_3dbody_run --from video.mp4 --butterworth --bw-cutoff 3.0
+./scripts/video.sh --from video.mp4 --butterworth --bw-cutoff 3.0
 
 # Higher cutoff to preserve faster motion
-./fast_sam_3dbody_run --from video.mp4 --butterworth --bw-cutoff 10.0
+./scripts/video.sh --from video.mp4 --butterworth --bw-cutoff 10.0
 ```
 
 The filter is applied in-place to each detected person's result immediately after inference,
@@ -655,7 +686,7 @@ Three templates ship:
 
 ```bash
 # Single image / video / webcam → one or more <name>_<id>.bvh files
-./fast_sam_3dbody_run --from boom.mp4 --bvh ./p.bvh --headless
+./scripts/video.sh --from boom.mp4 --bvh ./p.bvh --headless
 # produces ./p_0.bvh, ./p_1.bvh, … (one per tracked person)
 ```
 
@@ -719,7 +750,8 @@ Each file is fully independent — drop into Blender / BVHTester / any DCC.
 ```bash
 # Render a 3D-keypoints CSV at the same time, then compare hip-relative
 # joint positions between the BVH and MHR's own 3D keypoints.
-./fast_sam_3dbody_run --from boom.mp4 \
+./build/fast_sam_3dbody_run --from boom.mp4 \
+    --onnx-dir ./onnx --gguf ./onnx/pipeline.gguf --yolo ./onnx/yolo.onnx \
     --bvh ./p.bvh --out /tmp/boom_mhr.csv --headless
 
 source venv/bin/activate
@@ -774,7 +806,7 @@ End-to-end workflow:
 
 ```bash
 # 1) Generate one BVH per detected person
-./fast_sam_3dbody_run --from clip.mp4 --bvh ./p.bvh --headless
+./scripts/video.sh --from clip.mp4 --bvh ./p.bvh --headless
 # → p_0.bvh, p_1.bvh, …
 
 # 2) (One-time) install a known-good Blender + open the plugin
