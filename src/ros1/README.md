@@ -50,7 +50,7 @@ still build.
 
 ```bash
 # 1. copy (or symlink — see below) the package into your catkin workspace src/
-cp -r ros1/poseEstimation3D ~/catkin_ws/src/
+cp -r src/ros1/poseEstimation3D ~/catkin_ws/src/
 
 # 2. vendor AmmClient into the package (real copies, no external paths)
 cd ~/catkin_ws/src/poseEstimation3D && ./initialize.sh
@@ -70,7 +70,7 @@ you want catkin to build the live tree in this repo so edits land here and can
 be committed immediately. **Symlink the package into your workspace `src/`**:
 
 ```bash
-ln -s /abs/path/to/SAM3DBody-cpp/ros1/poseEstimation3D ~/catkin_ws/src/poseEstimation3D
+ln -s /abs/path/to/SAM3DBody-cpp/src/ros1/poseEstimation3D ~/catkin_ws/src/poseEstimation3D
 cd ~/catkin_ws/src/poseEstimation3D && ./initialize.sh   # vendors AmmClient locally
 cd ~/catkin_ws && catkin_make
 ```

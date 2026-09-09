@@ -6,6 +6,7 @@
 //   fast_sam_3dbody_render --onnx-dir DIR --gguf pipeline.gguf
 //       --yolo yolo.onnx [--mesh <onnx-dir>/body_mesh.tri] [--from 0|path]
 //       [--size W H] [--fps Z] [--mjpg] [--color R G B] [--export-mesh PREFIX] [--export-mesh-stride N]
+//       [--render-size W H | --render-scale S]
 //
 // --mjpg requests motion-JPEG from the webcam so UVC cameras can sustain higher
 //   fps at high resolution (uncompressed YUYV is USB-bandwidth limited); it also
@@ -669,6 +670,8 @@ int main(int argc, const char** argv) {
     float  focal_y    = 0.f; // --fy: camera focal y in pixels (0 = pipeline default)
     int    render_w   = 0;   // GL window width  (0 = match input)
     int    render_h   = 0;   // GL window height (0 = match input)
+    float  render_scale = 0.f; // --render-scale: GL window = this multiple of the
+                               // input frame (0 = unused; --render-size wins)
     int    cap_w      = 0;   // capture width  (0 = driver default)
     int    cap_h      = 0;   // capture height (0 = driver default)
     double cap_fps    = 0.0; // capture fps    (0 = driver default)
@@ -724,6 +727,8 @@ int main(int argc, const char** argv) {
         }
         if (!strcmp(argv[i], "--render-size") && i+2 < argc)
             { render_w = std::stoi(argv[++i]); render_h = std::stoi(argv[++i]); continue; }
+        if (!strcmp(argv[i], "--render-scale") && i+1 < argc)
+            { render_scale = std::stof(argv[++i]); continue; }
         if (!strcmp(argv[i], "--size") && i+2 < argc)
             { cap_w = std::stoi(argv[++i]); cap_h = std::stoi(argv[++i]); continue; }
         if (!strcmp(argv[i], "--fps") && i+1 < argc)
@@ -905,6 +910,14 @@ int main(int argc, const char** argv) {
     int frame_h = probe.rows;
     int W = (render_w > 0) ? render_w : frame_w;
     int H = (render_h > 0) ? render_h : frame_h;
+    // --render-scale: size the window off the frame the source actually gave us
+    // (webcams may negotiate something other than the requested --size), so the
+    // input aspect ratio is preserved by construction.
+    if (render_scale > 0.f && render_w <= 0 && render_h <= 0) {
+        W = (int)(frame_w * render_scale + 0.5f);
+        H = (int)(frame_h * render_scale + 0.5f);
+        printf("[render] --render-scale %g: %dx%d -> %dx%d\n", render_scale, frame_w, frame_h, W, H);
+    }
 
     // ── GLX surface ───────────────────────────────────────────────────────────
     // viewWindow=1 → normal visible X11 window

@@ -398,6 +398,7 @@ Full option list:
 --fx / --fy F      Camera focal length x/y in pixels (0 = image width)
 --cx / --cy F      Principal point (0 = image centre)
 --render-size W H  Override display window size
+--render-scale S   Display window = S x the input frame size, same aspect ratio (e.g. 2.0)
 --size W H         Webcam capture resolution
 --fps Z            Webcam capture framerate
 --butterworth      Apply Butterworth low-pass filter to MHR output vectors
