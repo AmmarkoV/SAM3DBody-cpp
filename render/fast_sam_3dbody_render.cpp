@@ -993,7 +993,7 @@ int main(int argc, const char** argv) {
     // ── BVH writer ────────────────────────────────────────────────────────────
     BVHWriter bvh_writer;
     if (!bvh_path.empty()) {
-        if (bvh_template.empty()) bvh_template = "./body_mhr.bvh";
+        if (bvh_template.empty()) bvh_template = "./bvh/body_mhr.bvh";
         if (!bvh_writer.open(bvh_template, bvh_path, 1.f / video_fps, lbs_path,
                              bvh_body_shape_change, bvh_hand_shape_change,
                              bvh_compensate_finger_endsites,

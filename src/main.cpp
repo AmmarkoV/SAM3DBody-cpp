@@ -109,7 +109,7 @@ static void print_usage(const char* prog)
     printf("  --render-size W H GL window width and height in pixels (default: match input)\n");
     printf("  -o / --out PATH   Write 3D keypoints to CSV (frame,skeleton_id,joint_x,y,z...)\n");
     printf("  --bvh PATH        Write BVH motion capture output to PATH (one file per tracked person)\n");
-    printf("  --bvh-template P  BVH skeleton template (default ./body_mhr.bvh; ./mocapnet.bvh for MakeHuman; ./mixamo.bvh for Mixamo; ./lafan.bvh for LAFAN1/GMR)\n");
+    printf("  --bvh-template P  BVH skeleton template (default ./bvh/body_mhr.bvh; ./bvh/mocapnet.bvh for MakeHuman; ./bvh/mixamo.bvh for Mixamo; ./bvh/lafan.bvh for LAFAN1/GMR)\n");
     printf("  --no-bvh-body-shape-change  Keep the template's authored body bone lengths (no median rewrite)\n");
     printf("  --no-bvh-hand-shape-change  Keep the template's authored hand/finger bone lengths\n");
     printf("  --bvh-raw-fingers           Do NOT rescale finger End-Site OFFSETs to MHR fingertip lengths\n");
@@ -118,7 +118,7 @@ static void print_usage(const char* prog)
     printf("  --bvh-static-root           Zero the root position and rotation each frame (in-place motion)\n");
     printf("  --bvh-stream PATH           Live-stream one BVH MOTION line per frame to PATH ('-' = stdout,\n");
     printf("                              prefixed '@F ') for the webcam->robot pipeline (scripts/webcam_gmr.sh).\n");
-    printf("                              Use with --bvh-template lafan_mhr.bvh --max-persons 1.\n");
+    printf("                              Use with --bvh-template bvh/lafan_mhr.bvh --max-persons 1.\n");
     printf("  --bvh-shm NAME              Publish per-frame BVH channels into POSIX shared memory object NAME\n");
     printf("                              (SharedMemoryVideoBuffers) instead of the '@F' ASCII pipe — Linux\n");
     printf("                              builds with FSB_SHM only; no-op otherwise. scripts/webcam_gmr.sh\n");

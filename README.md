@@ -345,9 +345,9 @@ Full option list:
 --from     SRC     Webcam index (0,1,..) or path to image/video
 -o / --out PATH    Write 70-joint 3D keypoints to CSV per frame
 --bvh      PATH    Write BVH motion capture file(s) to PATH (see "BVH export" below)
---bvh-template P   BVH skeleton template (default: ./body_mhr.bvh, MHR-rest aligned;
-                   ./mocapnet.bvh for the MakeHuman/MocapNET copy-rotation retarget;
-                   ./mixamo.bvh for a Mixamo "mixamorig:" rig)
+--bvh-template P   BVH skeleton template (default: ./bvh/body_mhr.bvh, MHR-rest aligned;
+                   ./bvh/mocapnet.bvh for the MakeHuman/MocapNET copy-rotation retarget;
+                   ./bvh/mixamo.bvh for a Mixamo "mixamorig:" rig)
 --no-bvh-body-shape-change   Keep template body bone lengths (skip per-person rewrite)
 --no-bvh-hand-shape-change   Keep template hand/finger bone lengths (skip per-person rewrite)
 --bvh-raw-fingers            Do NOT rescale finger End-Site OFFSETs (keeps body.bvh's authored fingertips)
@@ -627,18 +627,18 @@ Exports the per-frame MHR pose as one or more standard BVH motion-capture files.
 The hierarchy is taken from a BVH template; the motion comes from the MHR pipeline.
 Three templates ship:
 
-- **`body_mhr.bvh`** (default) — MakeHuman joint *names* but its rest pose is
+- **`bvh/body_mhr.bvh`** (default) — MakeHuman joint *names* but its rest pose is
   generated from the MHR rest skeleton (`tools/gen_mhr_bvh.py`).  Because the
   template rest matches MHR, the retarget is near-identity and the exported
   skeleton overlays the deformed mesh within ~2–3 cm per joint (verify with
   `tools/check_mesh_bvh_overlay.py`).  Use this for animation / mesh-accurate work.
-- **`mocapnet.bvh`** — the original [MocapNET](https://github.com/FORTH-ModelBasedTracker/MocapNET)/[MakeHuman](https://static.makehumancommunity.org/)
+- **`bvh/mocapnet.bvh`** — the original [MocapNET](https://github.com/FORTH-ModelBasedTracker/MocapNET)/[MakeHuman](https://static.makehumancommunity.org/)
   T-pose skeleton, kept for the Blender MakeHuman/MPFB copy-rotation retarget
-  (`blender/blender_bvh_plugin.py`).  Select with `--bvh-template ./mocapnet.bvh`.
-- **`mixamo.bvh`** — a [Mixamo](https://www.mixamo.com/) `mixamorig:` T-pose rig
+  (`blender/blender_bvh_plugin.py`).  Select with `--bvh-template ./bvh/mocapnet.bvh`.
+- **`bvh/mixamo.bvh`** — a [Mixamo](https://www.mixamo.com/) `mixamorig:` T-pose rig
   (generate with `tools/gen_mixamo_bvh.py`), so the export drops onto Mixamo
   characters / Animation Retargeting without a manual bone-mapping pass. Select
-  with `--bvh-template ./mixamo.bvh`. **Caveats:** the shipped template uses
+  with `--bvh-template ./bvh/mixamo.bvh`. **Caveats:** the shipped template uses
   *canonical* Mixamo proportions, not a specific character — for a pixel-exact
   rest pose, export your own character's T-pose to BVH from Blender **with ZXY
   rotation order** (root `ZYXrotation`) and pass that instead; the `mixamorig:`
@@ -942,7 +942,7 @@ Drive a humanoid robot (Unitree G1, …) from a video via
 [GMR](https://github.com/YanjieZe/GMR). GMR must be present at `./GMR` ( git clone https://github.com/YanjieZe/GMR ).
 
 ```bash
-# One-time: create the GMR venv (CUDA torch, no smplx) + generate lafan_mhr.bvh
+# One-time: create the GMR venv (CUDA torch, no smplx) + generate bvh/lafan_mhr.bvh
 tools/setup_gmr.sh
 
 # Video → LAFAN BVH → robot motion (.pkl) + rendered .mp4, per detected person

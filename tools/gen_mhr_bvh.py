@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-gen_mhr_bvh.py — generate body_mhr.bvh from the MHR rest skeleton.
+gen_mhr_bvh.py — generate bvh/body_mhr.bvh from the MHR rest skeleton.
 
-Takes the MocapNET-derived mocapnet.bvh (MakeHuman joint names + hierarchy +
+Takes the MocapNET-derived bvh/mocapnet.bvh (MakeHuman joint names + hierarchy +
 channels) and rewrites every mapped joint's OFFSET so its rest position equals
 its corresponding MHR joint's rest position (from onnx/body_model.lbs).  The
 result keeps the MakeHuman names (so NAME_MAP / the Blender associations still
@@ -15,7 +15,7 @@ construction — so the arm/collar no longer drift from the mesh.  See
 bvh-arm-rest-pose-mismatch memory + tools/check_mesh_bvh_overlay.py.
 
 Usage:
-    python3 tools/gen_mhr_bvh.py [mocapnet.bvh] [onnx/body_model.lbs] [out=body_mhr.bvh]
+    python3 tools/gen_mhr_bvh.py [bvh/mocapnet.bvh] [onnx/body_model.lbs] [out=bvh/body_mhr.bvh]
 
 Mapped joints land exactly at MHR rest positions; unmapped cosmetic joints
 (e.g. neck1, finger nulls) and End Sites keep their template offsets and are
@@ -26,12 +26,12 @@ import sys, os, struct, re, math
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.join(HERE, '..')
-SRC  = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, 'mocapnet.bvh')
+SRC  = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, 'bvh/mocapnet.bvh')
 if not os.path.exists(SRC):                       # fall back to body.bvh pre-rename
     alt = os.path.join(ROOT, 'body.bvh')
     if os.path.exists(alt): SRC = alt
 LBS  = sys.argv[2] if len(sys.argv) > 2 else os.path.join(ROOT, 'onnx', 'body_model.lbs')
-OUT  = sys.argv[3] if len(sys.argv) > 3 else os.path.join(ROOT, 'body_mhr.bvh')
+OUT  = sys.argv[3] if len(sys.argv) > 3 else os.path.join(ROOT, 'bvh/body_mhr.bvh')
 
 # ── NAME_MAP (BVH name → MHR name), mirrors src/bvh_writer.cpp ─────────────────
 NAME_MAP = {

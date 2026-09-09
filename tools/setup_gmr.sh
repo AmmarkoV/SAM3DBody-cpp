@@ -126,17 +126,17 @@ else
 fi
 
 # ── generate the LAFAN template with the MHR rest pose ───────────────────────
-# video_gmr.sh retargets onto lafan_mhr.bvh — a LAFAN1-named template whose REST
+# video_gmr.sh retargets onto bvh/lafan_mhr.bvh — a LAFAN1-named template whose REST
 # pose equals the MHR rest skeleton (so the BVH writer's q_bone_align is identity
 # and joint world positions are faithful).  Needs onnx/body_model.lbs.  See
 # tools/gen_lafan_bvh.py and GMR.md.
 if [ -f "$REPO/onnx/body_model.lbs" ]; then
-    echo "[setup_gmr] generating lafan_mhr.bvh (MHR rest pose)"
+    echo "[setup_gmr] generating bvh/lafan_mhr.bvh (MHR rest pose)"
     # non-fatal: a generation hiccup must not abort the whole env setup
     "$PY" "$THISDIR/gen_lafan_bvh.py" || \
         echo "[setup_gmr] WARN: gen_lafan_bvh.py failed — run it manually before video_gmr.sh" >&2
 else
-    echo "[setup_gmr] WARN: onnx/body_model.lbs missing — skipping lafan_mhr.bvh;" >&2
+    echo "[setup_gmr] WARN: onnx/body_model.lbs missing — skipping bvh/lafan_mhr.bvh;" >&2
     echo "           run 'python3 tools/gen_lafan_bvh.py' once the model is present." >&2
 fi
 

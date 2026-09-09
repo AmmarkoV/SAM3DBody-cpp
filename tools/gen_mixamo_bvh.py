@@ -25,14 +25,14 @@ proportions, export any Mixamo character (T-pose) to BVH from Blender with
 rotation order ZXY and use that file directly — the NAME_MAP will pick it up.
 
 Usage:
-    python3 tools/gen_mixamo_bvh.py [out=mixamo.bvh]
+    python3 tools/gen_mixamo_bvh.py [out=bvh/mixamo.bvh]
 """
 
 import os, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.join(HERE, '..')
-OUT  = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, 'mixamo.bvh')
+OUT  = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, 'bvh/mixamo.bvh')
 
 # ── Skeleton definition ───────────────────────────────────────────────────────
 # Each node: (name, offset, children, end_offset_or_None)

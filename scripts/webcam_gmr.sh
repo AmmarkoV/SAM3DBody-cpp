@@ -38,7 +38,7 @@
 #
 #  Prerequisites:
 #    - the C++ binary is built (build/fast_sam_3dbody_run)
-#    - tools/setup_gmr.sh has been run (GMR/venv + lafan_mhr.bvh)
+#    - tools/setup_gmr.sh has been run (GMR/venv + bvh/lafan_mhr.bvh)
 #    - a working inference backend (CUDA GPU; the BF16 backbone/decoder need one)
 #    - an X display for the MuJoCo viewer (wrap with xvfb-run if headless)
 # ════════════════════════════════════════════════════════════════════════════
@@ -70,7 +70,7 @@ source "$REPO/tools/trt_env.sh"     2>/dev/null || true
 
 BIN="$REPO/build/fast_sam_3dbody_run"
 GMR_PY="$REPO/GMR/venv/bin/python"
-TEMPLATE="$REPO/lafan_mhr.bvh"
+TEMPLATE="$REPO/bvh/lafan_mhr.bvh"
 POS_CONFIG="$REPO/scripts/gmr_configs/bvh_lafan1pos_to_g1.json"
 
 # ── TensorRT fast path (auto-detected, graceful fallback) ─────────────────────

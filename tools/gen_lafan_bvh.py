@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-gen_lafan_bvh.py — generate lafan_mhr.bvh from the MHR rest skeleton.
+gen_lafan_bvh.py — generate bvh/lafan_mhr.bvh from the MHR rest skeleton.
 
 Sibling of gen_mhr_bvh.py, but for the LAFAN1 / GMR template.  Takes the
-hand-authored lafan.bvh (LAFAN1 joint names + hierarchy + uniform ZXY channels)
+hand-authored bvh/lafan.bvh (LAFAN1 joint names + hierarchy + uniform ZXY channels)
 and rewrites every mapped joint's OFFSET so its rest position equals its
 corresponding MHR joint's rest position (from onnx/body_model.lbs).  The result
 keeps the LAFAN1 names (so GMR's bvh_lafan1 reader + our NAME_MAP still work)
 and the ZXY channel order, but its REST POSE matches MHR exactly.
 
-Why: the original lafan.bvh is an *anatomical* T-pose whose rest bone directions
+Why: the original bvh/lafan.bvh is an *anatomical* T-pose whose rest bone directions
 differ from MHR by large angles (thigh ~62°, forearm ~48°, hand ~45°).  The BVH
 writer's rest retarget (q_bone_align) only corrects bone *swing*, not twist, and
 shares one alignment across *branch* joints — so those big rest-pose mismatches
@@ -17,10 +17,10 @@ come out as the twisted torso / splayed legs / wrong arm bends we saw after GMR.
 When the template rest pose == the MHR rest pose, q_bone_align becomes identity,
 the writer faithfully reproduces MHR world joint positions, and GMR's
 position-based config then retargets clean targets.  (Same trick gen_mhr_bvh.py
-uses for body_mhr.bvh — that's exactly why body_mhr works and lafan didn't.)
+uses for bvh/body_mhr.bvh — that's exactly why body_mhr works and lafan didn't.)
 
 Usage:
-    python3 tools/gen_lafan_bvh.py [lafan.bvh] [onnx/body_model.lbs] [out=lafan_mhr.bvh]
+    python3 tools/gen_lafan_bvh.py [bvh/lafan.bvh] [onnx/body_model.lbs] [out=bvh/lafan_mhr.bvh]
 
 Mapped joints land exactly at MHR rest positions; unmapped joints (LeftToe /
 RightToe — left flat by design) and End Sites keep their template offsets and are
@@ -31,9 +31,9 @@ import sys, os, struct, re, math
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.join(HERE, '..')
-SRC  = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, 'lafan.bvh')
+SRC  = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, 'bvh/lafan.bvh')
 LBS  = sys.argv[2] if len(sys.argv) > 2 else os.path.join(ROOT, 'onnx', 'body_model.lbs')
-OUT  = sys.argv[3] if len(sys.argv) > 3 else os.path.join(ROOT, 'lafan_mhr.bvh')
+OUT  = sys.argv[3] if len(sys.argv) > 3 else os.path.join(ROOT, 'bvh/lafan_mhr.bvh')
 
 # ── NAME_MAP (LAFAN1 BVH name → MHR name), mirrors src/bvh_writer.cpp (lafan rows)
 NAME_MAP = {

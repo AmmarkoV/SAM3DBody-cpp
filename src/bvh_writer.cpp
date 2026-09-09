@@ -158,10 +158,10 @@ void bvhw_report_unreadable_path(const char* option,
 
     fprintf(stderr,
 "\n  Templates that ship with this project (run from the repo root):\n"
-"      ./body_mhr.bvh   default — native MHR skeleton\n"
-"      ./mocapnet.bvh   MakeHuman / MocapNET naming\n"
-"      ./mixamo.bvh     Mixamo  ('mixamorig:' joint names)\n"
-"      ./lafan.bvh      LAFAN1 / GMR humanoid-robot retargeting\n\n");
+"      ./bvh/body_mhr.bvh   default — native MHR skeleton\n"
+"      ./bvh/mocapnet.bvh   MakeHuman / MocapNET naming\n"
+"      ./bvh/mixamo.bvh     Mixamo  ('mixamorig:' joint names)\n"
+"      ./bvh/lafan.bvh      LAFAN1 / GMR humanoid-robot retargeting\n\n");
 }
 
 
@@ -400,7 +400,7 @@ constexpr NameMap NAME_MAP[] =
 
     // ── Mixamo ("mixamorig:") retarget target ─────────────────────────────────
     // Auto-selected when --bvh-template points at a Mixamo skeleton (e.g.
-    // ./mixamo.bvh).  The mixamorig: names never collide with the MakeHuman
+    // ./bvh/mixamo.bvh).  The mixamorig: names never collide with the MakeHuman
     // names above, so build_slots() simply maps whichever set is present in the
     // loaded template — no separate flag or table-switch is required.
     //
@@ -436,7 +436,7 @@ constexpr NameMap NAME_MAP[] =
     { "mixamorig:RightHandPinky1","r_pinky1",HAND },  { "mixamorig:RightHandPinky2","r_pinky2",HAND },  { "mixamorig:RightHandPinky3","r_pinky3",HAND },
 
     // ── LAFAN1 retarget target (for GMR / General Motion Retargeting) ──────────
-    // Auto-selected when --bvh-template points at ./lafan.bvh.  LAFAN1 is the
+    // Auto-selected when --bvh-template points at ./bvh/lafan.bvh.  LAFAN1 is the
     // Mixamo/Ubisoft hierarchy with bare joint names (no "mixamorig:" prefix) —
     // GMR's BVH reader (utils/lafan1.py) parses names with the regex (\w+), which
     // rejects the colon in "mixamorig:", so a de-prefixed template is required.
@@ -775,10 +775,10 @@ bool BVHWriter::build_slots()
 
         fprintf(stderr,
 "\n  This exporter recognises these skeleton naming families:\n"
-"      • MHR     — root, c_spine1, l_uparm, ...        (./body_mhr.bvh)\n"
-"      • MakeHuman/MocapNET — hip, abdomen, lShldr ... (./mocapnet.bvh)\n"
-"      • Mixamo  — mixamorig:Hips, mixamorig:Spine, ... (./mixamo.bvh)\n"
-"      • LAFAN1/GMR — Hips, Spine, LeftArm, ...         (./lafan.bvh)\n"
+"      • MHR     — root, c_spine1, l_uparm, ...        (./bvh/body_mhr.bvh)\n"
+"      • MakeHuman/MocapNET — hip, abdomen, lShldr ... (./bvh/mocapnet.bvh)\n"
+"      • Mixamo  — mixamorig:Hips, mixamorig:Spine, ... (./bvh/mixamo.bvh)\n"
+"      • LAFAN1/GMR — Hips, Spine, LeftArm, ...         (./bvh/lafan.bvh)\n"
 "\n"
 "  If your template is one of these but still didn't match, its joint\n"
 "  names were probably renamed. Otherwise, pass one of the bundled\n"
@@ -1388,7 +1388,7 @@ void BVHWriter::fill_motion_row(float* row, const fsb::MHRResult& r,
 // Reuses compute_per_frame_mhr_state + fill_motion_row (the exact write_frame
 // decomposition).  No buffering, no OFFSET rewrite, no foot-contact pass — those
 // are whole-clip operations the live path deliberately skips (see GMR.md §5:
-// lafan_mhr.bvh OFFSETs already equal the MHR rest skeleton, and GMR height-
+// bvh/lafan_mhr.bvh OFFSETs already equal the MHR rest skeleton, and GMR height-
 // auto-scales).  stream_prev_row_ carries the previous row so sticky-hand mode
 // still works frame-to-frame.
 bool BVHWriter::stream_frame_line(const fsb::MHRResult& r, std::string& out)

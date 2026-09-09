@@ -3,7 +3,7 @@
 #
 # fast_sam_3dbody_run --bvh-stream emits ONE BVH MOTION line per frame (prefixed
 # "@F ") for a single tracked person.  This driver reads those lines on stdin,
-# reassembles a 1-frame BVH by prepending the lafan_mhr.bvh HIERARCHY header, and
+# reassembles a 1-frame BVH by prepending the bvh/lafan_mhr.bvh HIERARCHY header, and
 # runs GMR's OWN load_bvh_file on it -- so BOTH the C++ bvh_writer rotation math
 # and GMR's exact LAFAN forward-kinematics / Y-up->Z-up / cm->m transform are
 # reused verbatim (no reimplementation).  Each frame is then retargeted, causally
@@ -23,7 +23,7 @@
 # goal, one-frame history).
 #
 # Usage (normally via scripts/webcam_gmr.sh):
-#   fast_sam_3dbody_run ... --bvh-template lafan_mhr.bvh --bvh-stream - \
+#   fast_sam_3dbody_run ... --bvh-template bvh/lafan_mhr.bvh --bvh-stream - \
 #     | gmr_stream.py --robot unitree_g1 --config <pos_config.json> --flip-depth
 import argparse, copy, os, select, sys, time
 import numpy as np
@@ -34,7 +34,7 @@ REPO = Path(__file__).resolve().parent.parent
 ap = argparse.ArgumentParser()
 ap.add_argument("--robot", default="unitree_g1")
 ap.add_argument("--config", required=True, help="custom GMR ik_config json (position-based)")
-ap.add_argument("--template", default=str(REPO / "lafan_mhr.bvh"),
+ap.add_argument("--template", default=str(REPO / "bvh/lafan_mhr.bvh"),
                 help="BVH template whose HIERARCHY header the streamed lines are appended to")
 ap.add_argument("--sink", choices=["viewer", "dds"], default="viewer",
                 help="viewer = live MuJoCo RobotMotionViewer; dds = Unitree DDS (unitree_mujoco / real G1) [stub]")

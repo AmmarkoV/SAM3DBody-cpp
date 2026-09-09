@@ -75,7 +75,7 @@ struct NetConfig {
 
     // Server BVH (empty = don't write one)
     std::string bvh_path;
-    std::string bvh_template = "./body_mhr.bvh";
+    std::string bvh_template = "./bvh/body_mhr.bvh";
     double      bvh_fps = 30.0;        // nominal frame time stamped into the BVH
     int         idle_finalize_s = 5;   // finalize the BVH after this idle gap
 
@@ -731,7 +731,7 @@ static void usage(const char* argv0)
 "  --max-persons N     cap persons per frame (0 = unlimited)\n"
 "  --thresh T          YOLO person confidence (default 0.50)\n"
 "  --bvh PATH          also write a server-side BVH (PATH_<id>.bvh)\n"
-"  --bvh-template P    BVH template (default ./body_mhr.bvh)\n"
+"  --bvh-template P    BVH template (default ./bvh/body_mhr.bvh)\n"
 "  --bvh-fps Z         nominal BVH frame time (default 30)\n"
 "  --idle-finalize S   finalize the BVH after S idle seconds (default 5)\n"
 "  --jlocal            add per-joint TF transforms (JLOCAL lines) to responses\n"
