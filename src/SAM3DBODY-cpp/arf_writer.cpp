@@ -93,9 +93,38 @@ inline void put_bytes(Bytes& b, const void* data, size_t n)
     const uint8_t* p = reinterpret_cast<const uint8_t*>(data);
     b.insert(b.end(), p, p + n);
 }
-inline void put_str(Bytes& b, const std::string& s)
+// ─── big-endian primitives, for the AAU animation stream only ──────────────
+// Every other binary payload here (dense/sparse tensors, GLB) stays little-
+// endian, this project's own convention — but the spec's AAU bitstream tables
+// use "uimsbf" (unsigned integer, most significant bit first), the same
+// MPEG-systems convention ISOBMFF/MPEG-2 Systems use, where it means
+// big-endian. See ARF.md "Avatar Animation Units".
+inline void put_u16be(Bytes& b, uint16_t v)
 {
-    put<uint32_t>(b, (uint32_t)s.size());
+    b.push_back((uint8_t)(v >> 8));
+    b.push_back((uint8_t)(v & 0xFF));
+}
+inline void put_u32be(Bytes& b, uint32_t v)
+{
+    b.push_back((uint8_t)(v >> 24));
+    b.push_back((uint8_t)(v >> 16));
+    b.push_back((uint8_t)(v >> 8));
+    b.push_back((uint8_t)(v & 0xFF));
+}
+inline void put_f32be(Bytes& b, float v)
+{
+    uint32_t bits; std::memcpy(&bits, &v, 4);
+    put_u32be(b, bits);
+}
+inline void put_floats_be(Bytes& b, const float* v, size_t n)
+{
+    for (size_t i = 0; i < n; ++i) put_f32be(b, v[i]);
+}
+// 8-bit length prefix — the AAU_CONFIG profile string's own encoding, distinct
+// from this format's other (32-bit-length-prefixed) strings; no NUL.
+inline void put_str8(Bytes& b, const std::string& s)
+{
+    put<uint8_t>(b, (uint8_t)s.size());
     put_bytes(b, s.data(), s.size());
 }
 
@@ -135,55 +164,155 @@ Bytes build_sparse_tensor(const std::vector<int32_t>& dims,
     return b;
 }
 
+// ─── minimal GLB (binary glTF) encoder — for BlendshapeSet.shapes[i] ───────
+// Per spec each blendshape target is its own GLB: one mesh, one primitive, a
+// POSITION accessor (float32 VEC3) and an indices accessor (uint32 SCALAR),
+// no materials/textures. GLB is little-endian throughout (unlike the AAU
+// stream above) — see ARF.md "Container" and the BlendshapeSet.shapes note.
+namespace glb
+{
+constexpr uint32_t MAGIC      = 0x46546C67u;  // "glTF"
+constexpr uint32_t VERSION    = 2u;
+constexpr uint32_t CHUNK_JSON = 0x4E4F534Au;  // "JSON"
+constexpr uint32_t CHUNK_BIN  = 0x004E4942u;  // "BIN\0"
+constexpr int32_t  TARGET_ARRAY = 34962;      // ARRAY_BUFFER
+constexpr int32_t  TARGET_INDEX = 34963;      // ELEMENT_ARRAY_BUFFER
+
+inline void text(std::string& s, const char* t) { s += t; }
+inline void num(std::string& s, unsigned long long v) { s += std::to_string(v); }
+inline void flt(std::string& s, float v)
+{
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.9g", (double)v);
+    s += buf;
+}
+} // namespace glb
+
+// One GLB per blendshape target: `positions` holds that shape's *absolute*
+// deformed vertex positions (base mesh + delta — see the BlendshapeSet.shapes
+// note in ARF.md), `indices` is the same topology as the base mesh.
+Bytes build_glb_mesh(const std::vector<float>& positions, uint32_t n_verts,
+                     const std::vector<uint32_t>& indices, uint32_t n_tris)
+{
+    using namespace glb;
+    const size_t positions_bytes = (size_t)n_verts * 3 * sizeof(float);
+    const size_t indices_bytes   = (size_t)n_tris * 3 * sizeof(uint32_t);
+
+    float mn[3] = {  1e30f,  1e30f,  1e30f };
+    float mx[3] = { -1e30f, -1e30f, -1e30f };
+    for (uint32_t v = 0; v < n_verts; ++v)
+        for (int c = 0; c < 3; ++c)
+        {
+            float val = positions[(size_t)v*3 + c];
+            mn[c] = std::min(mn[c], val);
+            mx[c] = std::max(mx[c], val);
+        }
+
+    std::string json;
+    text(json, "{\"asset\":{\"version\":\"2.0\"},");
+    text(json, "\"buffers\":[{\"byteLength\":");
+    num(json, (unsigned long long)(positions_bytes + indices_bytes));
+    text(json, "}],");
+    text(json, "\"bufferViews\":[");
+    text(json, "{\"buffer\":0,\"byteOffset\":0,\"byteLength\":");
+    num(json, (unsigned long long)positions_bytes);
+    text(json, ",\"target\":"); num(json, TARGET_ARRAY); text(json, "},");
+    text(json, "{\"buffer\":0,\"byteOffset\":");
+    num(json, (unsigned long long)positions_bytes);
+    text(json, ",\"byteLength\":");
+    num(json, (unsigned long long)indices_bytes);
+    text(json, ",\"target\":"); num(json, TARGET_INDEX); text(json, "}],");
+    text(json, "\"accessors\":[");
+    text(json, "{\"bufferView\":0,\"componentType\":"); num(json, GLTF_FLOAT);
+    text(json, ",\"count\":"); num(json, n_verts);
+    text(json, ",\"type\":\"VEC3\",\"min\":[");
+    for (int c = 0; c < 3; ++c) { if (c) text(json, ","); flt(json, mn[c]); }
+    text(json, "],\"max\":[");
+    for (int c = 0; c < 3; ++c) { if (c) text(json, ","); flt(json, mx[c]); }
+    text(json, "]},");
+    text(json, "{\"bufferView\":1,\"componentType\":"); num(json, GLTF_UNSIGNED_INT);
+    text(json, ",\"count\":"); num(json, (unsigned long long)n_tris * 3);
+    text(json, ",\"type\":\"SCALAR\"}],");
+    text(json, "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0},\"indices\":1,\"mode\":4}]}]}");
+
+    while (json.size() % 4 != 0) json.push_back(' ');   // pad JSON chunk to 4 bytes
+
+    Bytes bin;
+    bin.reserve(positions_bytes + indices_bytes);
+    put_bytes(bin, positions.data(), positions_bytes);
+    put_bytes(bin, indices.data(), indices_bytes);
+    // No padding needed: both source arrays are already multiples of 4 bytes.
+
+    const uint32_t total_length = (uint32_t)(12 + 8 + json.size() + 8 + bin.size());
+
+    Bytes out;
+    put<uint32_t>(out, glb::MAGIC);
+    put<uint32_t>(out, glb::VERSION);
+    put<uint32_t>(out, total_length);
+    put<uint32_t>(out, (uint32_t)json.size());
+    put<uint32_t>(out, glb::CHUNK_JSON);
+    put_bytes(out, json.data(), json.size());
+    put<uint32_t>(out, (uint32_t)bin.size());
+    put<uint32_t>(out, glb::CHUNK_BIN);
+    put_bytes(out, bin.data(), bin.size());
+    return out;
+}
+
 // ─── Avatar Animation Unit (AAU) framing ───────────────────────────────────
-// header{unit_type, unit_length} + payload{timestamp, type-specific data} —
-// see ARF.md "Animation stream" for how this differs from the spec's 7-bit-
-// packed unit_type field (we use a full byte; simpler, not bit-exact).
+// header{(unit_type<<1)|reserved, unit_length BE} + payload{timestamp BE,
+// type-specific fields, all big-endian} — see ARF.md "Avatar Animation Units".
 constexpr uint8_t AAU_CONFIG     = 0;
 constexpr uint8_t AAU_BLENDSHAPE = 1;
 constexpr uint8_t AAU_JOINT      = 2;
 
 void append_aau(Bytes& stream, uint8_t type, const Bytes& payload)
 {
-    put<uint8_t>(stream, type);
-    put<uint32_t>(stream, (uint32_t)payload.size());
+    put<uint8_t>(stream, (uint8_t)(type << 1));   // reserved bit = 0
+    put_u32be(stream, (uint32_t)payload.size());
     stream.insert(stream.end(), payload.begin(), payload.end());
 }
 
 Bytes build_config_payload(const std::string& profile, float timescale)
 {
     Bytes p;
-    put<uint32_t>(p, 0u);            // timestamp: n/a for the config unit
-    put_str(p, profile);
-    put<float>(p, timescale);
+    put_u32be(p, 0u);            // timestamp: always 0 for the config unit
+    put_str8(p, profile);
+    put_f32be(p, timescale);
     return p;
 }
 
-Bytes build_joint_payload(uint32_t timestamp_ticks, const float* mats, int n_joints)
+// joint_set_id is the declared id of components.skeletons[0] (always 0, this
+// writer's own convention — see the id-assignment note in dump_one_person).
+Bytes build_joint_payload(uint32_t timestamp_ticks, uint16_t joint_set_id,
+                          const float* mats, int n_joints)
 {
     Bytes p;
-    put<uint32_t>(p, timestamp_ticks);
-    put<uint32_t>(p, (uint32_t)n_joints);
+    put_u32be(p, timestamp_ticks);
+    put_u16be(p, joint_set_id);
+    put<uint8_t>(p, 0);                       // velocity_present=0, reserved=0
+    put_u16be(p, (uint16_t)(n_joints - 1));   // joint_count_minus1
     for (int j = 0; j < n_joints; ++j)
     {
-        put<uint32_t>(p, (uint32_t)j);
-        put_bytes(p, mats + (size_t)j * 16, 16 * sizeof(float));
+        put_u16be(p, (uint16_t)j);
+        put_floats_be(p, mats + (size_t)j * 16, 16);
     }
     return p;
 }
 
-Bytes build_blendshape_payload(uint32_t timestamp_ticks, const std::string& target_id,
+// blendshape_set_id is the declared id of components.blendshapeSets[0]
+// (always 0, this writer's own convention).
+Bytes build_blendshape_payload(uint32_t timestamp_ticks, uint16_t blendshape_set_id,
                                const float* weights, int n)
 {
     Bytes p;
-    put<uint32_t>(p, timestamp_ticks);
-    put_str(p, target_id);
-    put<uint8_t>(p, 0);              // has_confidence = false
-    put<uint32_t>(p, (uint32_t)n);
+    put_u32be(p, timestamp_ticks);
+    put_u16be(p, blendshape_set_id);
+    put<uint8_t>(p, 0);                       // confidence_present=0, reserved=0
+    put_u16be(p, (uint16_t)(n - 1));          // blendshape_count_minus1
     for (int k = 0; k < n; ++k)
     {
-        put<uint32_t>(p, (uint32_t)k);
-        put<float>(p, weights[k]);
+        put_u16be(p, (uint16_t)k);
+        put_f32be(p, weights[k]);
     }
     return p;
 }
@@ -519,21 +648,24 @@ bool ARFWriter::dump_one_person(const PerPerson& p)
     }
 
     // ── Binary data items ───────────────────────────────────────────────────
-    struct DataItem { std::string id, path, mime; Bytes bytes; };
+    // data[].id is a running count assigned in this fixed order: mesh_positions=0,
+    // mesh_indices=1, skin_weights=2, inverse_bind=3, then one id per blendshape
+    // shape (if export_face_) — mirrors ARFPlayer's arfPlanDataIds() convention
+    // (see doc/CONFORMANCE_GAPS.md "For SAM3DBody-cpp").
+    struct DataItem { int id; std::string name, path, mime; Bytes bytes; };
     std::vector<DataItem> items;
 
-    items.push_back({ "mesh_positions",
+    items.push_back({ 0, "mesh_positions",
         "data/mesh_positions.bin", "application/mpeg.arf.dense",
         build_dense_tensor({ (int32_t)nv, 3 }, GLTF_FLOAT, verts.data(), verts.size()*sizeof(float)) });
 
-    {
-        const unsigned int ni = mesh_->header.numberOfIndices;
-        std::vector<uint32_t> idx(mesh_->indices, mesh_->indices + ni);
-        items.push_back({ "mesh_indices",
-            "data/mesh_indices.bin", "application/mpeg.arf.dense",
-            build_dense_tensor({ (int32_t)(ni/3), 3 }, GLTF_UNSIGNED_INT,
-                               idx.data(), idx.size()*sizeof(uint32_t)) });
-    }
+    const unsigned int ni = mesh_->header.numberOfIndices;
+    std::vector<uint32_t> idx(mesh_->indices, mesh_->indices + ni);
+    const uint32_t n_tris = ni / 3;
+    items.push_back({ 1, "mesh_indices",
+        "data/mesh_indices.bin", "application/mpeg.arf.dense",
+        build_dense_tensor({ (int32_t)n_tris, 3 }, GLTF_UNSIGNED_INT,
+                           idx.data(), idx.size()*sizeof(uint32_t)) });
 
     {
         std::vector<uint32_t> flat_idx(lbs_->n_skin);
@@ -541,7 +673,7 @@ bool ARFWriter::dump_one_person(const PerPerson& p)
         for (int i = 0; i < lbs_->n_skin; ++i)
             flat_idx[i] = (uint32_t)lbs_->skin_vert_idx[i] * (uint32_t)nj
                         + (uint32_t)lbs_->skin_joint_idx[i];
-        items.push_back({ "skin_weights",
+        items.push_back({ 2, "skin_weights",
             "data/skin_weights.bin", "application/mpeg.arf.sparse",
             build_sparse_tensor({ (int32_t)nv, (int32_t)nj }, flat_idx, weights) });
     }
@@ -553,27 +685,40 @@ bool ARFWriter::dump_one_person(const PerPerson& p)
             const float* ib = lbs_->inv_bind_pose + (size_t)j * 8;  // tx,ty,tz,qx,qy,qz,qw,scale
             compose_trs_mat4(ib, ib + 3, ib[7], &ibm[(size_t)j*16]);
         }
-        items.push_back({ "inverse_bind_matrices",
+        items.push_back({ 3, "inverse_bind_matrices",
             "data/inv_bind_pose.bin", "application/mpeg.arf.dense",
             build_dense_tensor({ (int32_t)nj, 16 }, GLTF_FLOAT, ibm.data(), ibm.size()*sizeof(float)) });
     }
 
-    if (export_face_)
+    // BlendshapeSet.shapes: one minimal GLB per face PCA basis vector, storing
+    // its ABSOLUTE deformed positions (base mesh + delta), per spec — see the
+    // BlendshapeSet.shapes note in ARF.md. Each GLB's topology (indices) is
+    // byte-identical to the base mesh.
+    const int n_face_shapes = export_face_ ? lbs_->n_face_pc : 0;
+    for (int s = 0; s < n_face_shapes; ++s)
     {
-        const size_t n = (size_t)lbs_->n_face_pc * nv * 3;
-        items.push_back({ "face_blendshape_deltas",
-            "data/face_blendshapes.bin", "application/mpeg.arf.dense",
-            build_dense_tensor({ (int32_t)lbs_->n_face_pc, (int32_t)nv, 3 },
-                               GLTF_FLOAT, lbs_->face_vectors, n*sizeof(float)) });
+        std::vector<float> shape_pos((size_t)nv * 3);
+        const float* delta = lbs_->face_vectors + (size_t)s * nv * 3;
+        for (size_t i = 0; i < shape_pos.size(); ++i)
+            shape_pos[i] = verts[i] + delta[i];
+
+        char name[48], path[48];
+        std::snprintf(name, sizeof(name), "face_blendshape_%d", s);
+        std::snprintf(path, sizeof(path), "data/face_blendshape_%d.glb", s);
+        items.push_back({ 4 + s, name, path, "model/gltf-binary",
+            build_glb_mesh(shape_pos, (uint32_t)nv, idx, n_tris) });
     }
 
     // ── Animation streams ───────────────────────────────────────────────────
+    // joint_set_id/blendshape_set_id are the declared ids of skeletons[0]/
+    // blendshapeSets[0] — always 0, this writer's own convention (see
+    // components below).
     const float timescale = 1.0f / frame_time_;   // ticks/sec == fps (1 tick = 1 frame)
     Bytes joint_stream;
     append_aau(joint_stream, AAU_CONFIG, build_config_payload("arf-body-v1", timescale));
     for (int f = 0; f < p.frame_count; ++f)
         append_aau(joint_stream, AAU_JOINT,
-                  build_joint_payload((uint32_t)f, &p.joint_mats[(size_t)f*nj*16], nj));
+                  build_joint_payload((uint32_t)f, 0, &p.joint_mats[(size_t)f*nj*16], nj));
 
     Bytes face_stream;
     if (export_face_)
@@ -582,7 +727,7 @@ bool ARFWriter::dump_one_person(const PerPerson& p)
         append_aau(face_stream, AAU_CONFIG, build_config_payload("arf-face-v1", timescale));
         for (int f = 0; f < p.frame_count; ++f)
             append_aau(face_stream, AAU_BLENDSHAPE,
-                      build_blendshape_payload((uint32_t)f, "face_expression",
+                      build_blendshape_payload((uint32_t)f, 0,
                                                &p.face_weights[(size_t)f*nfp], nfp));
     }
 
@@ -595,34 +740,44 @@ bool ARFWriter::dump_one_person(const PerPerson& p)
     {
         const char* name = (j < mhr_joint_table::N_JOINTS) ? mhr_joint_table::NAMES[j] : "?";
         Value node = Value::object();
-        node.set("id", name);
+        node.set("id", j);
+        node.set("name", name);
+        // mapping is a mandatory semantic scene-graph path in the spec (see
+        // its companion scene-description part, 23090-14); this project has
+        // no verified taxonomy for it, so the node's own name stands in as an
+        // honest single-segment placeholder — see ARF.md.
+        node.set("mapping", name);
         if (lbs_->joint_parents[j] >= 0)
-            node.set("parent", mhr_joint_table::NAMES[lbs_->joint_parents[j]]);
+            node.set("parent", lbs_->joint_parents[j]);
         node.set("translation", Value::array()
                     .push_back(rest_offset[j][0]).push_back(rest_offset[j][1]).push_back(rest_offset[j][2]));
         const float* q = lbs_->joint_prerotations + j*4;
         node.set("rotation", Value::array()
                     .push_back(q[0]).push_back(q[1]).push_back(q[2]).push_back(q[3]));
         nodes.push_back(node);
-        joints_arr.push_back(name);
+        joints_arr.push_back(j);
     }
 
     Value skeleton = Value::object();
-    skeleton.set("id", "skeleton0");
-    skeleton.set("root", mhr_joint_table::NAMES[0]);
+    skeleton.set("id", 0);
+    skeleton.set("name", "skeleton0");
+    skeleton.set("root", 0);   // node id 0 == mhr_joint_table::NAMES[0] == "body_world"
     skeleton.set("joints", joints_arr);
-    skeleton.set("inverseBindMatrices", "inverse_bind_matrices");
+    skeleton.set("inverseBindMatrix", 3);   // data[] id
 
     Value skin = Value::object();
-    skin.set("id", "skin0");
-    skin.set("skeleton", "skeleton0");
-    skin.set("weights", "skin_weights");
+    skin.set("id", 0);
+    skin.set("name", "skin0");
+    skin.set("mapping", "skin0");
+    skin.set("skeleton", 0);
+    skin.set("mesh", 0);
+    skin.set("weights", 2);   // data[] id
 
     Value mesh = Value::object();
-    mesh.set("id", "mesh0");
-    mesh.set("positions", "mesh_positions");
-    mesh.set("indices", "mesh_indices");
-    mesh.set("skin", "skin0");
+    mesh.set("id", 0);
+    mesh.set("name", "mesh0");
+    mesh.set("path", "mesh0");
+    mesh.set("data", Value::array().push_back(0).push_back(1));   // [positions id, indices id]
 
     Value components = Value::object();
     components.set("nodes", nodes);
@@ -632,11 +787,14 @@ bool ARFWriter::dump_one_person(const PerPerson& p)
 
     if (export_face_)
     {
+        Value shapes = Value::array();
+        for (int s = 0; s < n_face_shapes; ++s) shapes.push_back(4 + s);
+
         Value bs = Value::object();
-        bs.set("id", "face_expression");
-        bs.set("baseMesh", "mesh0");
-        bs.set("count", lbs_->n_face_pc);
-        bs.set("deltas", "face_blendshape_deltas");
+        bs.set("id", 0);
+        bs.set("name", "face_expression");
+        bs.set("baseMesh", 0);
+        bs.set("shapes", shapes);
         components.set("blendshapeSets", Value::array().push_back(bs));
     }
 
@@ -651,29 +809,47 @@ bool ARFWriter::dump_one_person(const PerPerson& p)
     metadata.set("name", "SAM3DBody avatar");
     metadata.set("id", std::string("person_") + std::to_string(p.id));
 
+    Value lod = Value::object();
+    lod.set("name", "lod0");
+    lod.set("skins", Value::array().push_back(0));
+    lod.set("meshes", Value::array().push_back(0));
+    lod.set("skeletons", Value::array().push_back(0));
+    if (export_face_) lod.set("blendshapeSets", Value::array().push_back(0));
+
+    Value asset = Value::object();
+    asset.set("name", "body");
+    asset.set("isMain", true);
+    asset.set("lods", Value::array().push_back(lod));
+
     Value data = Value::array();
     for (const auto& it : items)
         data.push_back(Value::object()
-            .set("id", it.id).set("uri", it.path).set("mimeType", it.mime)
-            .set("byteLength", (int)it.bytes.size()));
-
-    Value animation_streams = Value::array();
-    animation_streams.push_back(Value::object()
-        .set("id", "body_joints").set("uri", "animations/joints.bin")
-        .set("frameworks", "arf-body-v1"));
-    if (export_face_)
-        animation_streams.push_back(Value::object()
-            .set("id", "face_expression").set("uri", "animations/face.bin")
-            .set("frameworks", "arf-face-v1"));
+            .set("id", it.id).set("name", it.name).set("uri", it.path)
+            .set("type", it.mime).set("byteLength", (int)it.bytes.size()));
 
     Value doc = Value::object();
     doc.set("preamble", preamble);
     doc.set("metadata", metadata);
-    doc.set("structure", Value::object().set("animationStreams", animation_streams));
+    // No field names the animation streams' location: animations/joints.bin
+    // and animations/face.bin are found by fixed path per the Zip-container
+    // clause — see ARF.md "Avatar Animation Units".
+    doc.set("structure", Value::object().set("assets", Value::array().push_back(asset)));
     doc.set("components", components);
     doc.set("data", data);
 
     const std::string json_text = doc.dump(2);
+
+    // ── id_map.txt (non-normative debug sidecar; see ARF.md) ───────────────
+    std::string id_map;
+    for (int j = 0; j < nj; ++j)
+    {
+        const char* name = (j < mhr_joint_table::N_JOINTS) ? mhr_joint_table::NAMES[j] : "?";
+        id_map += "node\t" + std::to_string(j) + "\t" + name + "\n";
+    }
+    id_map += "mesh\t0\tmesh0\n";
+    id_map += "skin\t0\tskin0\n";
+    id_map += "skeleton\t0\tskeleton0\n";
+    if (export_face_) id_map += "blendshapeSet\t0\tface_expression\n";
 
     // ── Assemble the .arfz ZIP container ────────────────────────────────────
     const std::string out_file = per_person_path(out_path_, id_prefix_, p.id);
@@ -687,6 +863,8 @@ bool ARFWriter::dump_one_person(const PerPerson& p)
 
     bool ok = mz_zip_writer_add_mem(&zip, "arf.json", json_text.data(), json_text.size(),
                                     MZ_BEST_SPEED);
+    ok = ok && mz_zip_writer_add_mem(&zip, "id_map.txt", id_map.data(), id_map.size(),
+                                     MZ_BEST_SPEED);
     for (const auto& it : items)
         ok = ok && mz_zip_writer_add_mem(&zip, it.path.c_str(), it.bytes.data(), it.bytes.size(),
                                          MZ_BEST_SPEED);

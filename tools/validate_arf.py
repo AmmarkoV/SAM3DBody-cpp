@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
 """Sanity-check / smoke-test a .arfz container written by ARFWriter (arf_writer.cpp).
 
-There is no ARF viewer available to this project, so this script is the
-practical way to catch a malformed writer: it unzips the container, checks
-the mandatory arf.json top-level keys, cross-checks the skeleton's joint
-count/hierarchy, decodes the AAU_JOINT animation stream, and reports the
-root joint's per-frame translation range — compare that against the
-corresponding --bvh run's printed "root path X=[...] Y=[...] Z=[...]" line
-as an independent cross-check (both should match to within float noise; see
-knowledge/ARF.md "Root translation is the camera-translation head").
+Matches the conformant-rewrite shape adopted 2026-09-11 (numeric component
+ids, structure.assets[].lods[], data[].type, big-endian AAU stream,
+BlendshapeSet.shapes as GLB) — see knowledge/ARF.md. For a real independent
+check, prefer AmmarkoV/ARFPlayer's own tools (arfinfo_cpp, `arfplay --info`),
+which read the exact same shape this writer produces and have been checked
+against the ISO/IEC 23090-39 FDIS-stage text; this script is a lighter,
+dependency-free smoke test that lives in this repo.
+
+It unzips the container, checks the mandatory arf.json top-level keys,
+cross-checks the skeleton's joint count/hierarchy, decodes the AAU_JOINT
+animation stream, and reports the root joint's per-frame translation range —
+compare that against the corresponding --bvh run's printed "root path
+X=[...] Y=[...] Z=[...]" line as an independent cross-check (both should
+match to within float noise; see knowledge/ARF.md "Root translation is the
+camera-translation head").
 
 This reads exactly the binary layout arf_writer.cpp writes (documented in
-knowledge/ARF.md) — it is not a general ARF/ISO-23090-39 parser.
+knowledge/ARF.md) — it is not a general ARF/ISO-23090-39 parser, and it does
+not decode the face blendshapes' GLB geometry (only counts AAU_BLENDSHAPE
+frames).
 
 Usage:
     python3 tools/validate_arf.py path/to/person_0.arfz [--verbose]
@@ -40,11 +49,12 @@ class AAU:
 
 
 def read_aau_stream(data: bytes):
+    """Big-endian AAU framing: (unit_type<<1)|reserved byte, uint32BE length."""
     off = 0
     while off < len(data):
-        unit_type = data[off]
+        unit_type = data[off] >> 1
         off += 1
-        (unit_len,) = struct.unpack_from("<I", data, off)
+        (unit_len,) = struct.unpack_from(">I", data, off)
         off += 4
         payload = data[off:off + unit_len]
         off += unit_len
@@ -52,25 +62,31 @@ def read_aau_stream(data: bytes):
 
 
 def parse_config_payload(payload: bytes):
-    (_ts,) = struct.unpack_from("<I", payload, 0)
-    (plen,) = struct.unpack_from("<I", payload, 4)
-    profile = payload[8:8 + plen].decode("utf-8")
-    (timescale,) = struct.unpack_from("<f", payload, 8 + plen)
+    (_ts,) = struct.unpack_from(">I", payload, 0)
+    plen = payload[4]
+    profile = payload[5:5 + plen].decode("utf-8")
+    (timescale,) = struct.unpack_from(">f", payload, 5 + plen)
     return profile, timescale
 
 
 def parse_joint_payload(payload: bytes):
-    (ts,) = struct.unpack_from("<I", payload, 0)
-    (n_joints,) = struct.unpack_from("<I", payload, 4)
-    p = 8
+    (ts,) = struct.unpack_from(">I", payload, 0)
+    (joint_set_id,) = struct.unpack_from(">H", payload, 4)
+    flags = payload[6]
+    (count_minus1,) = struct.unpack_from(">H", payload, 7)
+    n_joints = count_minus1 + 1
+    velocity_present = bool(flags & 0x80)
+    p = 9
     mats = {}
     for _ in range(n_joints):
-        (jidx,) = struct.unpack_from("<I", payload, p)
-        p += 4
-        mat = struct.unpack_from("<16f", payload, p)
+        (jidx,) = struct.unpack_from(">H", payload, p)
+        p += 2
+        mat = struct.unpack_from(">16f", payload, p)
         p += 64
+        if velocity_present:
+            p += 64
         mats[jidx] = mat
-    return ts, mats
+    return ts, joint_set_id, mats
 
 
 def parse_dense_tensor(data: bytes):
@@ -117,22 +133,34 @@ def main() -> None:
         print(f"OK  arf.json: {list(doc.keys())}")
         print(f"    preamble: {doc['preamble']}")
 
+        assets = doc["structure"].get("assets", [])
+        if not assets:
+            fail("structure.assets is empty")
+        lod = assets[0]["lods"][0]
+        print(f"OK  structure: asset={assets[0].get('name')!r} lod={lod.get('name')!r} {lod}")
+
         comp = doc["components"]
         nodes = comp.get("nodes", [])
         skeleton = comp.get("skeletons", [{}])[0]
-        n_skel_joints = len(skeleton.get("joints", []))
-        print(f"OK  skeleton: {len(nodes)} nodes, {n_skel_joints} skeleton joints, "
+        skel_joint_ids = skeleton.get("joints", [])
+        print(f"OK  skeleton: {len(nodes)} nodes, {len(skel_joint_ids)} skeleton joints, "
               f"root={skeleton.get('root')!r}")
-        if len(nodes) != n_skel_joints:
-            fail(f"node count ({len(nodes)}) != skeleton joint count ({n_skel_joints})")
+        if len(nodes) != len(skel_joint_ids):
+            fail(f"node count ({len(nodes)}) != skeleton joint count ({len(skel_joint_ids)})")
 
-        # Parent references must resolve to another node id (or be absent = root).
-        node_ids = {n["id"] for n in nodes}
+        # Every reference resolves by matching declared numeric `id`, never by
+        # array position — see knowledge/ARF.md / the spec's General
+        # Conventions clause.
+        nodes_by_id = {n["id"]: n for n in nodes}
+        if skel_joint_ids != sorted(skel_joint_ids):
+            fail("skeletons[0].joints is not sorted — this writer always assigns id==index")
         for n in nodes:
             parent = n.get("parent")
-            if parent is not None and parent not in node_ids:
+            if parent is not None and parent not in nodes_by_id:
                 fail(f"node {n['id']!r} has unresolved parent {parent!r}")
-        print("OK  all node parent references resolve")
+        if skeleton.get("root") not in nodes_by_id:
+            fail(f"skeletons[0].root {skeleton.get('root')!r} does not resolve to a node id")
+        print("OK  all node parent / skeleton root references resolve")
 
         data_items = {d["id"]: d for d in doc.get("data", [])}
         for item_id, item in data_items.items():
@@ -145,24 +173,28 @@ def main() -> None:
                      f"!= actual file size {actual}")
         print(f"OK  {len(data_items)} data item(s), all present with matching byteLength")
 
-        if "mesh_positions" in data_items:
-            dims, dtype, blob = parse_dense_tensor(zf.read(data_items["mesh_positions"]["uri"]))
+        mesh = comp.get("meshes", [{}])[0]
+        positions_id, indices_id = mesh.get("data", [None, None])
+        if positions_id in data_items:
+            dims, dtype, blob = parse_dense_tensor(zf.read(data_items[positions_id]["uri"]))
             n = dims[0] * dims[1]
             verts = struct.unpack_from(f"<{n}f", blob, 0)
             xs, ys, zs = verts[0::3], verts[1::3], verts[2::3]
-            print(f"OK  mesh_positions: dims={dims} dtype={dtype} "
+            print(f"OK  mesh positions (data id {positions_id}): dims={dims} dtype={dtype} "
                   f"bbox X=[{min(xs):.2f},{max(xs):.2f}] Y=[{min(ys):.2f},{max(ys):.2f}] "
                   f"Z=[{min(zs):.2f},{max(zs):.2f}]")
 
-        if "skin_weights" in data_items:
-            dims, value_count, idx, vals = parse_sparse_tensor(zf.read(data_items["skin_weights"]["uri"]))
+        skin = comp.get("skins", [{}])[0]
+        weights_id = skin.get("weights")
+        if weights_id in data_items:
+            dims, value_count, idx, vals = parse_sparse_tensor(zf.read(data_items[weights_id]["uri"]))
             n_joints = dims[1]
             sums: dict[int, float] = {}
             for flat, w in zip(idx, vals):
                 v = flat // n_joints
                 sums[v] = sums.get(v, 0.0) + w
             bad = [v for v, s in sums.items() if not (0.99 <= s <= 1.01)]
-            print(f"OK  skin_weights: dims={dims} valueCount={value_count} "
+            print(f"OK  skin_weights (data id {weights_id}): dims={dims} valueCount={value_count} "
                   f"{len(sums)} verts weighted, {len(bad)} with sum outside [0.99,1.01]")
             if bad and args.verbose:
                 print(f"    bad vertex ids (first 10): {bad[:10]}")
@@ -178,25 +210,39 @@ def main() -> None:
         joint_frames = [parse_joint_payload(a.payload) for a in stream[1:] if a.unit_type == AAU_JOINT]
         print(f"OK  {len(joint_frames)} AAU_JOINT frame(s), "
               f"~{len(joint_frames)/timescale:.2f} s duration")
+        if joint_frames and joint_frames[0][1] != skeleton.get("id"):
+            fail(f"AAU_JOINT joint_set_id {joint_frames[0][1]!r} != "
+                 f"skeletons[0].id {skeleton.get('id')!r}")
 
         if joint_frames:
-            root_id = skeleton.get("root")
-            root_idx = next((i for i, n in enumerate(nodes) if n["id"] == root_id), None)
-            if root_idx is not None:
-                txs = [f[1][root_idx][3] for f in joint_frames if root_idx in f[1]]
-                tys = [f[1][root_idx][7] for f in joint_frames if root_idx in f[1]]
-                tzs = [f[1][root_idx][11] for f in joint_frames if root_idx in f[1]]
-                if txs:
-                    print(f"OK  root ({root_id!r}) translation range: "
-                          f"X=[{min(txs):.1f},{max(txs):.1f}] "
-                          f"Y=[{min(tys):.1f},{max(tys):.1f}] "
-                          f"Z=[{min(tzs):.1f},{max(tzs):.1f}]  "
-                          f"(compare against the matching --bvh run's printed root path)")
+            root_idx = skeleton.get("root")
+            txs = [f[2][root_idx][3] for f in joint_frames if root_idx in f[2]]
+            tys = [f[2][root_idx][7] for f in joint_frames if root_idx in f[2]]
+            tzs = [f[2][root_idx][11] for f in joint_frames if root_idx in f[2]]
+            if txs:
+                print(f"OK  root (node id {root_idx}) translation range: "
+                      f"X=[{min(txs):.1f},{max(txs):.1f}] "
+                      f"Y=[{min(tys):.1f},{max(tys):.1f}] "
+                      f"Z=[{min(tzs):.1f},{max(tzs):.1f}]  "
+                      f"(compare against the matching --bvh run's printed root path)")
+
+        blendshape_sets = comp.get("blendshapeSets", [])
+        if blendshape_sets:
+            bs = blendshape_sets[0]
+            shape_ids = bs.get("shapes", [])
+            missing_shapes = [sid for sid in shape_ids if sid not in data_items]
+            if missing_shapes:
+                fail(f"blendshapeSets[0].shapes references missing data id(s): {missing_shapes}")
+            print(f"OK  blendshapeSet {bs.get('name')!r}: {len(shape_ids)} shape GLB(s) present")
 
         if "animations/face.bin" in names:
             face_stream = list(read_aau_stream(zf.read("animations/face.bin")))
             n_bs = sum(1 for a in face_stream if a.unit_type == AAU_BLENDSHAPE)
             print(f"OK  face.bin present: {n_bs} AAU_BLENDSHAPE frame(s)")
+
+        if "id_map.txt" in names:
+            n_lines = zf.read("id_map.txt").count(b"\n")
+            print(f"OK  id_map.txt present: {n_lines} line(s)")
 
     print("\nAll checks passed.")
 
