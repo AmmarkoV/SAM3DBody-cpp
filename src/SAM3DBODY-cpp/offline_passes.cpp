@@ -960,10 +960,12 @@ void interpolate_jitter_pass(std::vector<FrameRecord>& frames,
 //  Applied per-track:
 //    * pred_cam_t[3]      — Butterworth forward+backward
 //    * keypoints_3d[70×3] — Butterworth (where present)
-//    * body_pose[133]     — Butterworth (per Euler channel; same caveats as
-//                            online — but most channels are 1-DOF here)
-//    * hand_pose[108]     — Butterworth
-//    * mhr_model_params[204] — Butterworth (drives the LBS at BVH-write time)
+//    * body_pose[133]     — Butterworth, wrap-aware per Euler channel
+//    * hand_pose[108]     — Butterworth, wrap-aware per Euler channel
+//    * mhr_model_params[204] — Butterworth, wrap-aware (drives the LBS at
+//                            BVH/ARF-write time; [3:6] is the global rotation
+//                            the MHR FK hangs the whole body off, so a wrap
+//                            blended here folds the pelvis over)
 //    * global_rot[3]      — QuatLPF forward+backward
 //
 //  Forward-only smoothing is also provided for parity with the live binaries
@@ -971,21 +973,31 @@ void interpolate_jitter_pass(std::vector<FrameRecord>& frames,
 // ════════════════════════════════════════════════════════════════════════════
 
 // One-pass scalar filter over a sequence of values.
-static void filter_forward_scalar(std::vector<float>& xs, float fs, float fc)
+// `wrap`: the channel is an angle in radians — integrate ±π-wrapped deltas into
+// an unwrapped accumulator before filtering (ButterWorthWrap, the same shim the
+// live render binary applies to mhr_model_params).  Without it a linear filter
+// blends straight through a wrap: a +179°→−179° step (2° of real motion) reads
+// as a 358° step and the filter then ramps the channel a full turn over the next
+// few frames.  With wrap=false this is the plain ButterWorth path unchanged.
+static void filter_forward_scalar(std::vector<float>& xs, float fs, float fc, bool wrap)
 {
     if (xs.empty() || fc <= 0.f || fc >= fs * 0.5f) return;  // pass-through above Nyquist
-    ButterWorth f{};
-    initButterWorth(&f, fs, fc);
-    for (auto& v : xs) v = filter(&f, v);
+    ButterWorthWrap f{};
+    init_butterworth_wrap(&f, fs, fc, wrap ? 1 : 0);
+    for (auto& v : xs) v = filter_wrap(&f, v);
 }
 
 // filtfilt — zero-phase forward+backward.
-static void filtfilt_scalar(std::vector<float>& xs, float fs, float fc)
+static void filtfilt_scalar(std::vector<float>& xs, float fs, float fc, bool wrap)
 {
     if (xs.empty() || fc <= 0.f || fc >= fs * 0.5f) return;
-    filter_forward_scalar(xs, fs, fc);
+    // The forward pass leaves an unwrapped (possibly beyond ±π) but continuous
+    // series, so the reverse pass runs plain: there are no wraps left to absorb,
+    // and re-integrating deltas on already-smoothed data could only misread a
+    // genuine large step as a wrap.
+    filter_forward_scalar(xs, fs, fc, wrap);
     std::reverse(xs.begin(), xs.end());
-    filter_forward_scalar(xs, fs, fc);
+    filter_forward_scalar(xs, fs, fc, false);
     std::reverse(xs.begin(), xs.end());
 }
 
@@ -994,7 +1006,7 @@ static void filtfilt_scalar(std::vector<float>& xs, float fs, float fc)
 // vector, filter, write back.  K must be the channel count per frame.
 static void filter_channels(std::vector<std::vector<float>>& per_frame,
                             int K, float fs, float fc,
-                            Config::Smoothing mode)
+                            Config::Smoothing mode, bool wrap)
 {
     if (mode == Config::Smoothing::Off) return;
     const size_t F = per_frame.size();
@@ -1008,8 +1020,8 @@ static void filter_channels(std::vector<std::vector<float>>& per_frame,
         for (size_t f = 0; f < F; ++f)
             tmp[f] = (k < (int)per_frame[f].size()) ? per_frame[f][k] : 0.f;
 
-        if (mode == Config::Smoothing::ZeroPhase) filtfilt_scalar      (tmp, fs, fc);
-        else                                       filter_forward_scalar(tmp, fs, fc);
+        if (mode == Config::Smoothing::ZeroPhase) filtfilt_scalar      (tmp, fs, fc, wrap);
+        else                                       filter_forward_scalar(tmp, fs, fc, wrap);
 
         for (size_t f = 0; f < F; ++f)
             if (k < (int)per_frame[f].size())
@@ -1074,11 +1086,22 @@ static void smooth_segment(const std::vector<int>& frame_keys,
         grot[i] = { q[0], q[1], q[2], q[3] };
     }
 
-    filter_channels(cam_t, 3,    fs, cfg.bw_cutoff, cfg.smoothing);
-    filter_channels(kp3d,  70*3, fs, cfg.bw_cutoff, cfg.smoothing);
-    filter_channels(bpose, 133,  fs, cfg.bw_cutoff, cfg.smoothing);
-    filter_channels(hpose, 108,  fs, cfg.bw_cutoff, cfg.smoothing);
-    filter_channels(mhrp,  204,  fs, cfg.bw_cutoff, cfg.smoothing);
+    // wrap=true only where a channel really is an angle in radians:
+    //   * pred_cam_t / keypoints_3d — metric, no ±π discontinuity exists.
+    //   * body_pose[133]            — Euler angles (rot6d_to_euler output).
+    //   * hand_pose[108]            — NOT angles: 2×54 PCA coefficients in the
+    //     compact-continuous space apply_hand_pose() decodes.  Unbounded reals
+    //     with no 2π period, so unwrapping would corrupt any genuine jump > π.
+    //   * mhr_model_params[204]     — mixed bank ([0:3] translation, [3:6]
+    //     global rotation, [6:136] body pose incl. the decoded hand slots,
+    //     [136:204] log2 scales).  The unwrap is a no-op on the non-angle
+    //     sub-ranges, whose per-frame deltas are << π — the same reasoning the
+    //     live binary uses when it wraps the whole 204-channel bank.
+    filter_channels(cam_t, 3,    fs, cfg.bw_cutoff, cfg.smoothing, false);
+    filter_channels(kp3d,  70*3, fs, cfg.bw_cutoff, cfg.smoothing, false);
+    filter_channels(bpose, 133,  fs, cfg.bw_cutoff, cfg.smoothing, true);
+    filter_channels(hpose, 108,  fs, cfg.bw_cutoff, cfg.smoothing, false);
+    filter_channels(mhrp,  204,  fs, cfg.bw_cutoff, cfg.smoothing, true);
     filtfilt_quat  (grot,        fs, cfg.bw_cutoff, cfg.smoothing);
 
     for (size_t i = 0; i < F; ++i) {
