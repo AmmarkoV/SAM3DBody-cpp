@@ -16,6 +16,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "mhr_fk.h"
+
 struct MHR_LBS_Data;
 struct BVH_MotionCapture;
 namespace fsb { struct MHRResult; }
@@ -79,14 +81,9 @@ public:
     // body's global orientation, translation = pred_cam_t.  Frame is the native
     // MHR camera-optical convention (x-right, y-down, z-forward); the consumer
     // remaps to its target (e.g. ROS REP-103) — see mocapnet_rosnode.  Reuses
-    // the same FK as the BVH path (compute_per_frame_mhr_state); requires the
-    // writer to be open() with a valid lbs_path.  Returns false otherwise.
-    struct JointLocal {
-        const char* name;    // MHR joint name (points into static joint table)
-        const char* parent;  // parent joint name, or "" for the root
-        float       q[4];    // xyzw, parent-relative rotation
-        float       t[3];    // metres, parent-relative translation
-    };
+    // the shared mhr_fk::State FK core (mhr_fk.h); requires the writer to be
+    // open() with a valid lbs_path.  Returns false otherwise.
+    using JointLocal = mhr_fk::JointLocal;
     bool compute_joint_locals(const fsb::MHRResult& r,
                               std::vector<JointLocal>& out);
 
@@ -211,13 +208,9 @@ private:
     int                                      next_track_id_ = 0;
     std::unordered_map<int, PerPerson>       people_;
 
-    // Reusable per-frame scratch (MHR side).
-    std::vector<float> joint_params_;
-    std::vector<float> q_local_;
-    std::vector<float> q_global_mhr_;
-    std::vector<float> t_global_mhr_;
-    std::vector<float> s_global_mhr_;   // per-joint accumulated scale (matches mhr_lbs_compute)
-    std::vector<float> q_global_mhr_rest_;
+    // Shared MHR FK core (mhr_fk.h) — quaternion FK over the 127-joint MHR
+    // skeleton, reused by write_frame/compute_joint_locals/write_frame_fused.
+    mhr_fk::State fk_;
 
     // Live streaming scratch (stream_frame_line): current + previous motion row.
     std::vector<float> stream_row_;
@@ -225,12 +218,12 @@ private:
 
     // Helpers
     bool  build_slots();
-    void  compute_per_frame_mhr_state(const fsb::MHRResult& r);
     void  append_frame_for(PerPerson& p, const fsb::MHRResult& r);
-    // Append a row using the CURRENT q_global_mhr_ (assumes it is already
-    // populated); only r.pred_cam_t is read.  append_frame_for = compute + this.
+    // Append a row using the CURRENT fk_ state (assumes fk_.compute() has
+    // already been run); only r.pred_cam_t is read.  append_frame_for =
+    // fk_.compute() + this.
     void  append_row_from_state(PerPerson& p, const fsb::MHRResult& r);
-    // Fill one motion row (total_channels_ floats) from the CURRENT q_global_mhr_
+    // Fill one motion row (total_channels_ floats) from the CURRENT fk_
     // state into `row`.  prev_row is the previous frame (for sticky-hand mode;
     // nullptr = none).  bone_samples, when non-null, receives per-slot live bone
     // vectors for the close-time OFFSET rewrite (null for the streaming path,

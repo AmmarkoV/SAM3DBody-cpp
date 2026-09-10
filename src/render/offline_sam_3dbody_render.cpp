@@ -130,6 +130,11 @@ static void print_usage(const char* prog)
         "  --min-track-frames  N      Drop tracks with fewer than N detections (default 8;\n"
         "                             typically YOLO false positives — single-frame extras, etc.)\n"
         "\n"
+        "ARF EXPORT (--arf PATH, see ARF.md — --arf itself is a common flag, listed above)\n"
+        "  --dev-face                 Enable face expression params, feeding the ARF face\n"
+        "                             BlendshapeSet + AAU_BLENDSHAPE stream (disabled by default;\n"
+        "                             also affects --bvh's face joints, which are otherwise inert)\n"
+        "\n"
         "SCENE-CHANGE DETECTION (on by default — gates jitter interpolation + smoothing)\n"
         "  --no-scene-detection       Disable; treat the clip as a single continuous shot.\n"
         "  --static-scene             Alias for --no-scene-detection — assert a single-shot input.\n"
@@ -211,14 +216,15 @@ static bool parse_args(int argc, char** argv, Config& c)
         // per-frame OpenCV scene-detector work and prevents any false-
         // positive cuts from interrupting the smoothing.
         if (!strcmp(argv[i], "--static-scene"))           { c.scene_detection = false; continue; }
+        if (!strcmp(argv[i], "--dev-face"))               { c.zero_face = false; continue; }
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { print_usage(argv[0]); return false; }
         fprintf(stderr, "unknown argument: %s\n", argv[i]);
         return false;
     }
 
-    if (c.from.empty() || c.bvh_path.empty())
+    if (c.from.empty() || (c.bvh_path.empty() && c.arf_path.empty()))
     {
-        fprintf(stderr, "--from and --bvh are required\n\n");
+        fprintf(stderr, "--from and at least one of --bvh / --arf are required\n\n");
         print_usage(argv[0]);
         return false;
     }
@@ -273,6 +279,7 @@ int main(int argc, char** argv)
         apply_common_to_pipeline_cfg(cfg, pcfg);
         pcfg.skip_body_model = false;  // we need keypoints_3d for jitter detection
         pcfg.refined_pose    = cfg.refined_pose;
+        pcfg.zero_face_params = cfg.zero_face;
         if (!pipeline.load(pcfg)) {
             fprintf(stderr, "Failed to load pipeline\n");
             return 1;
@@ -319,7 +326,15 @@ int main(int argc, char** argv)
     smoothing_pass(frames, tracks, scene_cuts, (float)fps, cfg);
 
     // PASS 6 — BVH export -----------------------------------------------
-    export_to_bvh(frames, tracks, scene_cuts, fps, cfg);
+    // Guarded on --bvh now that --from + at least one of --bvh/--arf is the
+    // requirement (previously --bvh was itself mandatory, so this call was
+    // always meant to run; an --arf-only invocation must not also write a
+    // stray "_<id>.bvh" from an empty bvh_path stem).
+    if (!cfg.bvh_path.empty())
+        export_to_bvh(frames, tracks, scene_cuts, fps, cfg);
+
+    // PASS 7 — ARF export (no-op when --arf wasn't given) ----------------
+    export_to_arf(frames, tracks, scene_cuts, fps, cfg);
 
     pipeline.print_timing_summary();
     printf("done.\n");

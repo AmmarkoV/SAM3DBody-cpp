@@ -165,6 +165,20 @@ set(GGML_OPENMP         OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(ggml)
 
 # ---------------------------------------------------------------------------
+# miniz  (single-file ZIP read/write; used by ARFWriter, src/SAM3DBODY-cpp/
+# arf_writer.cpp, to assemble the .arfz MPEG ARF container — see ARF.md)
+# ---------------------------------------------------------------------------
+FetchContent_Declare(
+    miniz
+    GIT_REPOSITORY https://github.com/richgel999/miniz.git
+    GIT_TAG        3.0.2
+    GIT_SHALLOW    TRUE
+    GIT_PROGRESS   TRUE
+)
+set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)  # miniz's own option name, not ours
+FetchContent_MakeAvailable(miniz)
+
+# ---------------------------------------------------------------------------
 # ONNX Runtime  (pre-built binaries from GitHub releases)
 # ONNX_RUNTIME_DIR can be set via -DONNX_RUNTIME_DIR=/path/to/onnxruntime
 # Otherwise we try to find it in common locations or download it.
@@ -287,8 +301,11 @@ set(TRAJ_DIR  ${GRAPHICS_ENGINE_DIR}/TrajectoryParser)
 add_library(fast_sam_3dbody SHARED
     src/SAM3DBODY-cpp/fast_sam_3dbody.cpp
     src/SAM3DBODY-cpp/fast_sam_3dbody_capi.cpp
+    src/SAM3DBODY-cpp/mhr_fk.cpp
     src/SAM3DBODY-cpp/bvh_writer.cpp
     src/SAM3DBODY-cpp/bvh_shm.cpp
+    src/SAM3DBODY-cpp/arf_json.cpp
+    src/SAM3DBODY-cpp/arf_writer.cpp
     src/SAM3DBODY-cpp/offline_passes.cpp
     ${GRAPHICS_ENGINE_DIR}/ModelLoader/model_loader_tri.c
     ${GRAPHICS_ENGINE_DIR}/ModelLoader/model_loader_transform_joints.c
@@ -319,6 +336,7 @@ target_include_directories(fast_sam_3dbody PUBLIC
 
 target_link_libraries(fast_sam_3dbody PUBLIC
     ggml
+    miniz
     ${ORT_LIBS}
     ${OpenCV_LIBS}
     ${AMMATRIX_LIB}

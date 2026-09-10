@@ -26,6 +26,7 @@
 #include "bvh_writer.h"
 #include "fast_sam_3dbody.h"
 #include "mhr_joint_table.h"
+#include "mhr_fk.h"
 
 extern "C" {
 #include "ModelLoader/model_loader_transform_joints.h"
@@ -183,30 +184,13 @@ inline bool bbox_looks_valid(const std::array<float,4>& b)
 }
 
 // ─── quaternion helpers (XYZW) ──────────────────────────────────────────────
-inline void qmul(float* r, const float* a, const float* b)
-{
-    r[0] = b[0]*a[3] + b[3]*a[0] + b[2]*a[1] - b[1]*a[2];
-    r[1] = b[1]*a[3] - b[2]*a[0] + b[3]*a[1] + b[0]*a[2];
-    r[2] = b[2]*a[3] + b[1]*a[0] - b[0]*a[1] + b[3]*a[2];
-    r[3] = b[3]*a[3] - b[0]*a[0] - b[1]*a[1] - b[2]*a[2];
-}
-inline void qconj(float* r, const float* a)
-{
-    r[0]=-a[0];
-    r[1]=-a[1];
-    r[2]=-a[2];
-    r[3]=a[3];
-}
-inline void qrot(float* o, const float* q, const float* v)
-{
-    float qx=q[0], qy=q[1], qz=q[2], qw=q[3], vx=v[0], vy=v[1], vz=v[2];
-    float tx = 2.f*(qy*vz - qz*vy);
-    float ty = 2.f*(qz*vx - qx*vz);
-    float tz = 2.f*(qx*vy - qy*vx);
-    o[0]=vx + qw*tx + (qy*tz - qz*ty);
-    o[1]=vy + qw*ty + (qz*tx - qx*tz);
-    o[2]=vz + qw*tz + (qx*ty - qy*tx);
-}
+// The core primitives (qmul/qconj/qrot/euler_mhr_to_quat) now live in
+// mhr_fk.h/.cpp, shared with the ARF writer and the ROS/TF joint-local path;
+// pull them in unqualified so every call site below is unchanged.
+using mhr_fk::qmul;
+using mhr_fk::qconj;
+using mhr_fk::qrot;
+using mhr_fk::euler_mhr_to_quat;
 // Shortest-arc unit quaternion rotating direction `from` onto `to` (both need
 // not be normalised).  Used by the rest-frame retarget to re-aim MHR rotation
 // deltas onto the template's (differently-posed) bones.
@@ -233,16 +217,6 @@ inline void shortest_arc_quat(const float* from, const float* to, float* q)
     q[0]=c[0]; q[1]=c[1]; q[2]=c[2]; q[3]=1.f+d;
     float n=std::sqrt(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]);
     q[0]/=n; q[1]/=n; q[2]/=n; q[3]/=n;
-}
-inline void euler_mhr_to_quat(float ex, float ey, float ez, float* q)
-{
-    float hx=ex*0.5f, hy=ey*0.5f, hz=ez*0.5f;
-    float qx[4]= {sinf(hx),0.f,0.f,cosf(hx)};
-    float qy[4]= {0.f,sinf(hy),0.f,cosf(hy)};
-    float qz[4]= {0.f,0.f,sinf(hz),cosf(hz)};
-    float t[4];
-    qmul(t, qz, qy);
-    qmul(q, t, qx);
 }
 // XYZW quaternion -> row-major 3x3.  Deliberately duplicated from
 // preprocess.hpp's quat_to_mat3(): that header lives in namespace fsb and pulls
@@ -895,30 +869,32 @@ bool BVHWriter::open(const std::string& template_path,
         return false;
     }
 
-    // MHR rest-pose globals (re-used by every frame and every person).
+    // MHR FK core: sizes scratch buffers and computes the rest-pose globals
+    // (fk_.q_global_rest()), re-used by every frame and every person.
     const int nj = lbs_->n_joints;
-    q_global_mhr_rest_.assign((size_t)nj * 4, 0.f);
+    fk_.init(lbs_);
     {
+        // g_t: rest-pose global TRANSLATIONS, needed only here (for the
+        // per-slot rest-direction retarget alignment below) — fk_.init()
+        // already computed the rest-pose global ROTATIONS it depends on.
+        const std::vector<float>& q_rest = fk_.q_global_rest();
         std::vector<float> g_t(nj * 3, 0.f);
         for (int j = 0; j < nj; ++j)
         {
-            const float* p_q = lbs_->joint_prerotations + j*4;
             int parent = lbs_->joint_parents[j];
             if (parent < 0)
             {
                 g_t[j*3+0] = lbs_->joint_offsets[j*3+0];
                 g_t[j*3+1] = lbs_->joint_offsets[j*3+1];
                 g_t[j*3+2] = lbs_->joint_offsets[j*3+2];
-                memcpy(&q_global_mhr_rest_[j*4], p_q, 4*sizeof(float));
             }
             else
             {
                 float rt[3];
-                qrot(rt, &q_global_mhr_rest_[parent*4], lbs_->joint_offsets + j*3);
+                qrot(rt, &q_rest[parent*4], lbs_->joint_offsets + j*3);
                 g_t[j*3+0] = g_t[parent*3+0] + rt[0];
                 g_t[j*3+1] = g_t[parent*3+1] + rt[1];
                 g_t[j*3+2] = g_t[parent*3+2] + rt[2];
-                qmul(&q_global_mhr_rest_[j*4], &q_global_mhr_rest_[parent*4], p_q);
             }
         }
 
@@ -1008,12 +984,6 @@ bool BVHWriter::open(const std::string& template_path,
         }
     }
 
-    joint_params_.assign((size_t)nj * 7, 0.f);
-    q_local_.assign((size_t)nj * 4, 0.f);
-    q_global_mhr_.assign((size_t)nj * 4, 0.f);
-    t_global_mhr_.assign((size_t)nj * 3, 0.f);
-    s_global_mhr_.assign((size_t)nj, 1.f);
-
     tracks_.clear();
     people_.clear();
     next_track_id_  = 0;
@@ -1025,128 +995,14 @@ bool BVHWriter::open(const std::string& template_path,
 }
 
 // ─── Per-frame MHR FK ──────────────────────────────────────────────────────
-
-void BVHWriter::compute_per_frame_mhr_state(const fsb::MHRResult& r)
-{
-    const int nj   = lbs_->n_joints;
-    const int npc  = lbs_->pt_cols;
-    const float* PT = lbs_->PT;
-    const float* pre = lbs_->joint_prerotations;
-    const int*  parents = lbs_->joint_parents;
-
-    // Decode the scale PCA into model_params[136:204], matching the mesh path
-    // (the render loop re-decodes scale before calling mhr_lbs_compute).  The
-    // pipeline runs with skip_body_model=true, so its lbs_data is null and
-    // r.mhr_model_params[136:204] is left ZERO — without this decode the writer's
-    // FK has scale=1 while the mesh has real per-joint scale, so the writer's bone
-    // lengths (→ the median OFFSET rewrite) disagree with the deformed mesh.  This
-    // was the residual foot error (l_lowleg→l_foot 44.6 cm writer vs 38 cm mesh).
-    std::array<float,204> params = r.mhr_model_params;
-    if (lbs_->scale_mean && lbs_->scale_comps && !r.scale.empty())
-    {
-        const int ns = lbs_->n_scale_out;   // 68
-        const int np = lbs_->n_scale_pc;    // 28
-        for (int j = 0; j < ns && 136 + j < 204; ++j)
-            params[136 + j] = lbs_->scale_mean[j];
-        for (int k = 0; k < np && k < (int)r.scale.size(); ++k)
-            for (int j = 0; j < ns && 136 + j < 204; ++j)
-                params[136 + j] += r.scale[k] * lbs_->scale_comps[k * ns + j];
-    }
-
-    const int take = std::min(npc, 204);
-    for (int row = 0; row < nj * 7; ++row)
-    {
-        const float* prow = PT + (size_t)row * npc;
-        float acc = 0.f;
-        for (int k = 0; k < take; ++k) acc += prow[k] * params[k];
-        joint_params_[row] = acc;
-    }
-
-    for (int j = 0; j < nj; ++j)
-    {
-        const float* jp = &joint_params_[j * 7];
-        float q_euler[4];
-        euler_mhr_to_quat(jp[3], jp[4], jp[5], q_euler);
-        qmul(&q_local_[j*4], pre + j*4, q_euler);
-
-        int p = parents[j];
-        const float* off = lbs_->joint_offsets + j*3;
-        // Per-joint local scale = exp2(log2_scale).  mhr_lbs_compute scales each
-        // child offset by the PARENT's accumulated global scale; the BVH writer
-        // used to ignore this, so its FK bone lengths (→ the median offset rewrite)
-        // disagreed with the actual deformed-mesh skeleton (notably the foot chain,
-        // ~7 cm).  Apply the same scaling here so bone_samples match the mesh.
-        float s_local = exp2f(jp[6]);
-        if (p < 0)
-        {
-            memcpy(&q_global_mhr_[j*4], &q_local_[j*4], 4*sizeof(float));
-            t_global_mhr_[j*3+0] = off[0] + jp[0];
-            t_global_mhr_[j*3+1] = off[1] + jp[1];
-            t_global_mhr_[j*3+2] = off[2] + jp[2];
-            s_global_mhr_[j]     = s_local;
-        }
-        else
-        {
-            qmul(&q_global_mhr_[j*4], &q_global_mhr_[p*4], &q_local_[j*4]);
-            float local_off[3] = { off[0] + jp[0], off[1] + jp[1], off[2] + jp[2] };
-            float rt[3];
-            qrot(rt, &q_global_mhr_[p*4], local_off);
-            const float sp = s_global_mhr_[p];
-            t_global_mhr_[j*3+0] = t_global_mhr_[p*3+0] + sp * rt[0];
-            t_global_mhr_[j*3+1] = t_global_mhr_[p*3+1] + sp * rt[1];
-            t_global_mhr_[j*3+2] = t_global_mhr_[p*3+2] + sp * rt[2];
-            s_global_mhr_[j]     = sp * s_local;
-        }
-    }
-}
+// The actual FK now lives in mhr_fk::State (fk_) — see mhr_fk.h/.cpp.
 
 bool BVHWriter::compute_joint_locals(const fsb::MHRResult& r,
                                      std::vector<JointLocal>& out)
 {
-    if (!lbs_ || q_local_.empty()) return false;
-
-    // Reuse the exact FK the BVH path uses: fills q_local_ (parent-relative
-    // local rotations), q_global_mhr_ (global rotations) and t_global_mhr_
-    // (global positions, in the LBS centimetre units).
-    compute_per_frame_mhr_state(r);
-
-    const int nj = lbs_->n_joints;
-    out.clear();
-    out.reserve(nj);
-    for (int j = 0; j < nj; ++j)
-    {
-        JointLocal jl;
-        jl.name = (j < mhr_joint_table::N_JOINTS) ? mhr_joint_table::NAMES[j] : "?";
-        const int p = lbs_->joint_parents[j];
-
-        if (p < 0)
-        {
-            // Root: placed in the camera frame.  Rotation = the body's global
-            // orientation; translation = pred_cam_t (already metres).
-            jl.parent = "";
-            memcpy(jl.q, &q_global_mhr_[j*4], 4*sizeof(float));
-            jl.t[0] = r.pred_cam_t[0];
-            jl.t[1] = r.pred_cam_t[1];
-            jl.t[2] = r.pred_cam_t[2];
-        }
-        else
-        {
-            jl.parent = (p < mhr_joint_table::N_JOINTS) ? mhr_joint_table::NAMES[p] : "?";
-            // Parent-relative rotation is the raw MHR local rotation (xyzw).
-            memcpy(jl.q, &q_local_[j*4], 4*sizeof(float));
-            // Parent-relative translation = R_parent_global^-1 (t[j]-t[p]); this
-            // absorbs the per-joint scale exactly.  cm -> m for ROS/TF.
-            float d[3] = { t_global_mhr_[j*3+0] - t_global_mhr_[p*3+0],
-                           t_global_mhr_[j*3+1] - t_global_mhr_[p*3+1],
-                           t_global_mhr_[j*3+2] - t_global_mhr_[p*3+2] };
-            float qpc[4]; qconj(qpc, &q_global_mhr_[p*4]);
-            float rl[3];  qrot(rl, qpc, d);
-            jl.t[0] = rl[0] * 0.01f;
-            jl.t[1] = rl[1] * 0.01f;
-            jl.t[2] = rl[2] * 0.01f;
-        }
-        out.push_back(jl);
-    }
+    if (!lbs_ || !fk_.is_init()) return false;
+    fk_.compute(r);
+    fk_.joint_locals(r, out);
     return true;
 }
 
@@ -1163,7 +1019,7 @@ static inline void set_channel(BVH_MotionCapture* mc, float* row,
 
 void BVHWriter::append_frame_for(PerPerson& p, const fsb::MHRResult& r)
 {
-    compute_per_frame_mhr_state(r);
+    fk_.compute(r);
     append_row_from_state(p, r);
 }
 
@@ -1193,11 +1049,15 @@ void BVHWriter::fill_motion_row(float* row, const fsb::MHRResult& r,
     mc_->motionValues     = row;
     mc_->motionValuesSize = total_channels_;
 
+    const std::vector<float>& q_global = fk_.q_global();
+    const std::vector<float>& t_global = fk_.t_global();
+    const std::vector<float>& q_rest   = fk_.q_global_rest();
+
     auto delta_mhr = [&](int m, float* out)
     {
         float inv_rest[4];
-        qconj(inv_rest, &q_global_mhr_rest_[m * 4]);
-        qmul(out, &q_global_mhr_[m * 4], inv_rest);
+        qconj(inv_rest, &q_rest[m * 4]);
+        qmul(out, &q_global[m * 4], inv_rest);
     };
 
     for (size_t i = 0; i < slots_.size(); ++i)
@@ -1360,18 +1220,8 @@ void BVHWriter::fill_motion_row(float* row, const fsb::MHRResult& r,
         if (bone_samples && !s.is_root && s.ancestor_mhr_idx >= 0)
         {
             const int mp = s.ancestor_mhr_idx;
-            float dv_world[3] =
-            {
-                t_global_mhr_[s.mhr_idx*3+0] - t_global_mhr_[mp*3+0],
-                t_global_mhr_[s.mhr_idx*3+1] - t_global_mhr_[mp*3+1],
-                t_global_mhr_[s.mhr_idx*3+2] - t_global_mhr_[mp*3+2],
-            };
-            float inv_cur[4];
-            qconj(inv_cur, &q_global_mhr_[mp*4]);
-            float dv_local[3];
-            qrot(dv_local, inv_cur, dv_world);
             float dv_rest[3];
-            qrot(dv_rest, &q_global_mhr_rest_[mp*4], dv_local);
+            fk_.rest_local_bone_vector(s.mhr_idx, mp, dv_rest);
             auto& vec = (*bone_samples)[i];
             vec.push_back(dv_rest[0]);
             vec.push_back(dv_rest[1]);
@@ -1385,17 +1235,17 @@ void BVHWriter::fill_motion_row(float* row, const fsb::MHRResult& r,
 }
 
 // ── Live streaming: one MOTION line for a single tracked person ─────────────
-// Reuses compute_per_frame_mhr_state + fill_motion_row (the exact write_frame
-// decomposition).  No buffering, no OFFSET rewrite, no foot-contact pass — those
-// are whole-clip operations the live path deliberately skips (see GMR.md §5:
-// bvh/lafan_mhr.bvh OFFSETs already equal the MHR rest skeleton, and GMR height-
-// auto-scales).  stream_prev_row_ carries the previous row so sticky-hand mode
-// still works frame-to-frame.
+// Reuses fk_.compute() + fill_motion_row (the exact write_frame decomposition).
+// No buffering, no OFFSET rewrite, no foot-contact pass — those are whole-clip
+// operations the live path deliberately skips (see GMR.md §5: bvh/lafan_mhr.bvh
+// OFFSETs already equal the MHR rest skeleton, and GMR height-auto-scales).
+// stream_prev_row_ carries the previous row so sticky-hand mode still works
+// frame-to-frame.
 bool BVHWriter::stream_frame_line(const fsb::MHRResult& r, std::string& out)
 {
     if (!is_open()) return false;
 
-    compute_per_frame_mhr_state(r);
+    fk_.compute(r);
 
     stream_row_.assign((size_t)total_channels_, 0.0f);
     const float* prev = stream_prev_row_.empty() ? nullptr : stream_prev_row_.data();
@@ -1545,18 +1395,19 @@ void BVHWriter::write_frame_fused(const std::vector<FusedPerson>& persons,
         float root_sum[3] = {0.f,0.f,0.f};
         int   nv = 0;
 
+        std::vector<float>& q_global = fk_.q_global_mut();
         for (const auto& view : fp.views)
         {
             if (!view.mhr) continue;
-            compute_per_frame_mhr_state(*view.mhr);     // fills q_global_mhr_ (camera frame)
-            const size_t N = q_global_mhr_.size();
+            fk_.compute(*view.mhr);                     // fills q_global (camera frame)
+            const size_t N = q_global.size();
             if (qsum.empty()) qsum.assign(N, 0.f);
             else if (qsum.size() != N) continue;        // joint-count mismatch (shouldn't happen)
 
             for (size_t j = 0; j < N; j += 4)
             {
                 float qw[4];
-                qmul(qw, view.q_world_cam.data(), &q_global_mhr_[j]);   // world = q_world_cam · q_cam
+                qmul(qw, view.q_world_cam.data(), &q_global[j]);   // world = q_world_cam · q_cam
                 float* acc = &qsum[j];
                 if (nv == 0) { for (int k=0;k<4;++k) acc[k]=qw[k]; }
                 else {
@@ -1570,13 +1421,13 @@ void BVHWriter::write_frame_fused(const std::vector<FusedPerson>& persons,
         }
         if (nv == 0 || qsum.empty()) continue;
 
-        // Normalise the averaged quaternions back into q_global_mhr_ (world frame).
+        // Normalise the averaged quaternions back into q_global (world frame).
         for (size_t j = 0; j < qsum.size(); j += 4)
         {
             float* a = &qsum[j];
             float n = std::sqrt(a[0]*a[0]+a[1]*a[1]+a[2]*a[2]+a[3]*a[3]);
             if (n < 1e-9f) n = 1.f;
-            for (int k=0;k<4;++k) q_global_mhr_[j+k] = a[k]/n;
+            for (int k=0;k<4;++k) q_global[j+k] = a[k]/n;
         }
 
         fsb::MHRResult fr;                  // only pred_cam_t is read by append_row_from_state

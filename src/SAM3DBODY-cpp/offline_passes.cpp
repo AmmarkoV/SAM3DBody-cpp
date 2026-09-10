@@ -9,6 +9,7 @@
 
 #include "offline_passes.h"
 #include "bvh_writer.h"
+#include "arf_writer.h"
 #include "outputFiltering.h"
 #include "preprocess.hpp"           // fsb::apply_hand_pose
 
@@ -1271,6 +1272,108 @@ void export_to_bvh(const std::vector<FrameRecord>& frames,
         printf("[pass6]   scene %zu [%d,%d): %d person(s)\n", s, a, b, local);
         std::string prefix = "scene" + std::to_string(s) + "_person";
         export_range(frames, tracks, fps, cfg, a, b, prefix, &remap);
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  PASS 7 — ARF EXPORT
+// ════════════════════════════════════════════════════════════════════════════
+//  Same walk-frames-in-order / build-(results,track_ids,pad_ids) shape as
+//  export_range() above, driving ARFWriter::write_frame_external instead of
+//  BVHWriter's. See ARF.md for the container this produces.
+// ════════════════════════════════════════════════════════════════════════════
+
+static void export_range_arf(const std::vector<FrameRecord>& frames,
+                             const std::vector<Track>& tracks,
+                             double fps, const Config& cfg,
+                             int seg_a, int seg_b,
+                             const std::string& id_prefix,
+                             const std::map<int,int>* id_remap)
+{
+    const std::string mesh_path = cfg.mesh_path.empty()
+        ? (cfg.onnx_dir + "/body_mesh.tri") : cfg.mesh_path;
+
+    ARFWriter w;
+    if (!w.open(cfg.arf_path, cfg.lbs_path, mesh_path, 1.0f / (float)fps, !cfg.zero_face))
+    {
+        fprintf(stderr, "[pass7] ARFWriter::open failed — aborting ARF export\n");
+        return;
+    }
+    w.set_id_label_prefix(id_prefix);
+
+    struct TrackState { int first; int last; const std::map<int,int>* fr_to_det; };
+    std::map<int, TrackState> ts;
+    for (const auto& t : tracks) {
+        int first, last;
+        if (!track_detect_span_in(t, seg_a, seg_b, first, last)) continue;
+        if (id_remap && !id_remap->count(t.id)) continue;
+        int out_id = id_remap ? id_remap->at(t.id) : t.id;
+        ts[out_id] = { first, last, &t.frame_to_det };
+    }
+
+    for (int f = seg_a; f < seg_b; ++f)
+    {
+        std::vector<fsb::MHRResult> results;
+        std::vector<int>            ids;
+        std::vector<int>            pad_ids;
+
+        for (const auto& [out_id, st] : ts)
+        {
+            if (f < st.first || f > st.last) continue;
+            auto it = st.fr_to_det->find(f);
+            if (it != st.fr_to_det->end()) {
+                results.push_back(frames[f].detections[it->second]);
+                ids.push_back(out_id);
+            } else {
+                pad_ids.push_back(out_id);
+            }
+        }
+        w.write_frame_external(results, ids, pad_ids);
+    }
+    w.close();
+}
+
+void export_to_arf(const std::vector<FrameRecord>& frames,
+                          const std::vector<Track>& tracks,
+                          const std::vector<int>& scene_cuts,
+                          double fps, const Config& cfg)
+{
+    if (cfg.arf_path.empty()) return;
+    const int F = (int)frames.size();
+
+    if (!cfg.bvh_split_scenes) {
+        printf("[pass7] writing ARF (%.2f fps timeline) …\n", fps);
+        export_range_arf(frames, tracks, fps, cfg, 0, F, "", nullptr);
+        return;
+    }
+
+    std::vector<std::pair<int,int>> segs;
+    int start = 0;
+    for (int c : scene_cuts) { if (c > start && c <= F) { segs.push_back({start, c}); start = c; } }
+    segs.push_back({start, F});
+
+    printf("[pass7] writing ARF split across %zu scene(s) "
+           "(<stem>_scene<S>_person<P>.arfz) …\n", segs.size());
+
+    for (size_t s = 0; s < segs.size(); ++s) {
+        int a = segs[s].first, b = segs[s].second;
+        std::vector<std::pair<int,int>> present;
+        for (const auto& t : tracks) {
+            int first, last;
+            if (track_detect_span_in(t, a, b, first, last)) present.push_back({first, t.id});
+        }
+        if (present.empty()) {
+            printf("[pass7]   scene %zu [%d,%d): no people — skipped\n", s, a, b);
+            continue;
+        }
+        std::sort(present.begin(), present.end());
+        std::map<int,int> remap;
+        int local = 0;
+        for (auto& [ff, gid] : present) remap[gid] = local++;
+
+        printf("[pass7]   scene %zu [%d,%d): %d person(s)\n", s, a, b, local);
+        std::string prefix = "scene" + std::to_string(s) + "_person";
+        export_range_arf(frames, tracks, fps, cfg, a, b, prefix, &remap);
     }
 }
 

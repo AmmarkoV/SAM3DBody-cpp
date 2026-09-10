@@ -1,5 +1,6 @@
 #include "fast_sam_3dbody.h"
 #include "bvh_writer.h"
+#include "arf_writer.h"
 #include "bvh_shm.h"
 #include "outputFiltering.h"
 #include "cli_common.h"
@@ -487,6 +488,7 @@ int main(int argc, char** argv)
     // opened), because its frame time must match the source's real FPS — which
     // is only known once cap is open.  See the open() call further down.
     BVHWriter bvh_writer;
+    ARFWriter arf_writer;   // opened below alongside bvh_writer, once source_fps is known
 
     fsb::PipelineConfig pcfg;
     ensure_models(c);                       // fetch the models if onnx/ is empty
@@ -676,6 +678,24 @@ int main(int argc, char** argv)
     }
 
     // -----------------------------------------------------------------------
+    // Optional ARF output (ARF.md) — independent of --bvh.
+    // -----------------------------------------------------------------------
+    if (!c.arf_path.empty())
+    {
+        const std::string lbs_path  = c.onnx_dir + "/body_model.lbs";
+        const std::string mesh_path = c.onnx_dir + "/body_mesh.tri";
+        if (!arf_writer.open(c.arf_path, lbs_path, mesh_path,
+                             1.0f / (float)source_fps, !c.zero_face))
+        {
+            fprintf(stderr, "[main] ARF writer failed to open (continuing without ARF output).\n");
+        }
+        else
+        {
+            printf("[main] Writing ARF avatar container(s) to: %s\n", c.arf_path.c_str());
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Butterworth filter state (one bank of filters per person slot)
     // -----------------------------------------------------------------------
     struct PersonFilters
@@ -830,6 +850,10 @@ int main(int argc, char** argv)
         if (bvh_writer.is_open() && !c.bvh_path.empty())
             bvh_writer.write_frame(results);
 
+        // ARF (buffered, one .arfz per person at close) — only when --arf is set.
+        if (arf_writer.is_open())
+            arf_writer.write_frame(results);
+
         // BVH live stream (webcam→robot): one MOTION line for the top person,
         // prefixed "@F " so it is unambiguous against stdout diagnostics.  When
         // no one is detected we emit nothing — the consumer holds the last pose.
@@ -909,6 +933,9 @@ int main(int argc, char** argv)
 
     if (bvh_writer.is_open())
         bvh_writer.close();
+
+    if (arf_writer.is_open())
+        arf_writer.close();
 
     if (bvh_stream_fp && bvh_stream_fp != stdout)
         fclose(bvh_stream_fp);

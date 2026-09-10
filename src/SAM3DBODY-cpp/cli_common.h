@@ -138,6 +138,14 @@ struct CommonConfig
     std::string bvh_shm_descriptor;                       // --bvh-shm  (POSIX shm object name)
     std::string bvh_shm_stream = "bvh";                   // --bvh-shm-stream (feed name within it)
 
+    // ── ARF export (ARF.md) ──────────────────────────────────────────────────
+    // Writes one MPEG Avatar Representation Format .arfz container per tracked
+    // person: skeleton + skin + rest mesh (+ face blendshapes when the face
+    // pipeline is enabled — see --dev-face) as the base avatar model, animated
+    // by a per-frame AAU_JOINT (+ AAU_BLENDSHAPE) stream. Independent of
+    // --bvh — pass either, neither, or both.
+    std::string arf_path;
+
     // ── Filtering knobs ─────────────────────────────────────────────────────
     // Defaults match the live binaries; the offline binary overrides
     // rot_clamp_deg to 30.0 before invoking the parser (see comment in
@@ -219,6 +227,9 @@ inline bool parse_common_arg(int argc, const char* const* argv, int& i,
     CLI_STR ("--bvh-stream",               bvh_stream_path)
     CLI_STR ("--bvh-shm",                  bvh_shm_descriptor)
     CLI_STR ("--bvh-shm-stream",           bvh_shm_stream)
+
+    // ARF export
+    CLI_STR ("--arf",                      arf_path)
 
     // Filters
     CLI_FLT ("--bw-cutoff",            bw_cutoff)
@@ -758,6 +769,8 @@ inline void print_common_args_help(FILE* fp)
         "                                 2-bone leg IK to pin planted feet (offline; off by default)\n"
         "  --bvh-static-root              Zero the root position and rotation every frame, pinning the\n"
         "                                 body in place (in-place motion; off by default)\n"
+        "  --arf      PATH                Write MPEG ARF avatar container(s) (.arfz); per-person filenames\n"
+        "                                 appended, same convention as --bvh (see ARF.md)\n"
         "  --bw-cutoff HZ                 Butterworth cutoff (default 6 Hz)\n"
         "  --rot-clamp DEG                Geodesic SLERP clamp on global_rot (default 1 deg/frame;\n"
         "                                 offline binary defaults to 30)\n");

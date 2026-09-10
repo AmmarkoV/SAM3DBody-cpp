@@ -20,6 +20,22 @@ MakeHuman-rigged character from the result. See **[BVH export](#bvh-export---bvh
 # → p_0.bvh, p_1.bvh, …
 ```
 
+### 🧍 MPEG ARF avatar export
+
+`--arf PATH` writes a **[MPEG Avatar Representation Format](knowledge/ARF.md)
+(.arfz) container per detected person** — a self-contained base avatar
+(skeleton + skin weights + personalized rest mesh, plus facial blendshapes
+under `--dev-face`) animated by a per-frame Avatar Animation Unit stream.
+Unlike `--bvh`, it carries the mesh and skinning data too, not just the
+skeleton. Independent of `--bvh` — pass either, neither, or both. See
+**[knowledge/ARF.md](knowledge/ARF.md)** for the container layout, the JSON
+schema subset implemented, and how it maps onto the spec (ISO/IEC 23090-39).
+
+```bash
+./scripts/offline_video.sh --from clip.mp4 --arf ./p.arfz
+# → p_0.arfz, p_1.arfz, …
+```
+
 [![SAM3DBody-cpp — watch a video in Youtube](doc/vid.jpg)](https://www.youtube.com/watch?v=f-tCwCQvurQ)
 
 
@@ -384,6 +400,9 @@ Full option list:
 --from     SRC     Webcam index (0,1,..) or path to image/video
 -o / --out PATH    Write 70-joint 3D keypoints to CSV per frame
 --bvh      PATH    Write BVH motion capture file(s) to PATH (see "BVH export" below)
+--arf      PATH    Write MPEG ARF avatar container(s) (.arfz) to PATH — skeleton + skin +
+                   rest mesh (+ face blendshapes under --dev-face), animated by a per-frame
+                   AAU stream. Independent of --bvh. See knowledge/ARF.md.
 --bvh-template P   BVH skeleton template (default: ./bvh/body_mhr.bvh, MHR-rest aligned;
                    ./bvh/mocapnet.bvh for the MakeHuman/MocapNET copy-rotation retarget;
                    ./bvh/mixamo.bvh for a Mixamo "mixamorig:" rig)

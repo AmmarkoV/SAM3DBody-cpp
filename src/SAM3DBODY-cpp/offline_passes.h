@@ -75,6 +75,13 @@ struct Config : public CommonConfig
     }
 
     std::string lbs_path;          // auto: <onnx_dir>/body_model.lbs
+    std::string mesh_path;         // auto: <onnx_dir>/body_mesh.tri (ARF export topology)
+
+    // Face expression params are zeroed by default (matches the live
+    // binaries' PipelineConfig::zero_face_params) — pass --dev-face to
+    // enable. Off by default here too, since this binary has no --dev-face
+    // flag until an ARF/face consumer needs it.
+    bool      zero_face            = true;
 
     // Iterative refined pose (the live binaries' --refined-pose).  ON by
     // default here: it roughly doubles the per-frame cost, which is exactly the
@@ -191,6 +198,13 @@ void smoothing_pass(std::vector<FrameRecord>& frames,
 
 // PASS 6 — write BVH file(s).
 void export_to_bvh(const std::vector<FrameRecord>& frames,
+                   const std::vector<Track>& tracks,
+                   const std::vector<int>& scene_cuts,
+                   double fps, const Config& cfg);
+
+// PASS 7 — write MPEG ARF avatar container(s) (ARF.md). Independent of
+// export_to_bvh; a no-op when cfg.arf_path is empty.
+void export_to_arf(const std::vector<FrameRecord>& frames,
                    const std::vector<Track>& tracks,
                    const std::vector<int>& scene_cuts,
                    double fps, const Config& cfg);
