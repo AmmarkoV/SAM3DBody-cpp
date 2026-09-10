@@ -87,6 +87,8 @@ static void logmsg(const char *format, ...)
 
     // End processing the variable arguments
     va_end(args);
+ #else
+    (void) format;
  #endif // DEBUG_LOG
 }
 
@@ -149,6 +151,7 @@ static int stick_this_thread_to_core(int core_id)
    pthread_t current_thread = pthread_self();
    return pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
    #else
+    (void) core_id;
     fprintf(stderr,"Cannot stick thread to core without GNU source extensions during compilation\n");
     return EFAULT;
    #endif
@@ -641,8 +644,8 @@ static int threadpoolCreate(struct workerPool * pool,unsigned int numberOfThread
     fprintf(stderr," done \n");
 
     pool->numberOfThreads = threadsCreated;
-    pool->initialized     = (threadsCreated==numberOfThreadsToSpawn);
-    return (threadsCreated==numberOfThreadsToSpawn);
+    pool->initialized     = ((unsigned int)threadsCreated==numberOfThreadsToSpawn);
+    return ((unsigned int)threadsCreated==numberOfThreadsToSpawn);
 }
 
 
