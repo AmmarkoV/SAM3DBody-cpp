@@ -816,7 +816,10 @@ bool ARFWriter::dump_one_person(const PerPerson& p)
     preamble.set("supportedAnimations", supported);
 
     Value metadata = Value::object();
-    metadata.set("name", "SAM3DBody avatar");
+    // "SAM3DBody-cpp", not "SAM3DBody": ARF export exists only in this C++
+    // port, so naming upstream here would credit a producer that cannot emit
+    // these containers.
+    metadata.set("name", "SAM3DBody-cpp avatar");
     metadata.set("id", std::string("person_") + std::to_string(p.id));
 
     Value lod = Value::object();
