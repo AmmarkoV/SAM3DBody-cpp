@@ -811,8 +811,13 @@ bool ARFWriter::dump_one_person(const PerPerson& p)
     Value preamble = Value::object();
     preamble.set("signature", "ARF");
     preamble.set("version", "1.0");
-    Value supported = Value::array().push_back("arf-body-v1");
-    if (export_face_) supported.push_back("arf-face-v1");
+    // supportedAnimations is a SupportedAnimations object (bodyAnimations/
+    // faceAnimations/..., each an array of profile strings), not a flat
+    // array of profile-name strings — matches libarf's arfWriteJson(), see
+    // ARFPlayer's doc/CONFORMANCE_GAPS.md "Preamble / Metadata".
+    Value supported = Value::object();
+    supported.set("bodyAnimations", Value::array().push_back("arf-body-v1"));
+    if (export_face_) supported.set("faceAnimations", Value::array().push_back("arf-face-v1"));
     preamble.set("supportedAnimations", supported);
 
     Value metadata = Value::object();
@@ -821,6 +826,11 @@ bool ARFWriter::dump_one_person(const PerPerson& p)
     // these containers.
     metadata.set("name", "SAM3DBody-cpp avatar");
     metadata.set("id", std::string("person_") + std::to_string(p.id));
+    // age/gender are mandatory per the Metadata schema; this pipeline has no
+    // age/gender source, so these are honest placeholders (matching libarf's
+    // own arfCreate() defaults), not fabricated data.
+    metadata.set("age", -1);
+    metadata.set("gender", std::string("unspecified"));
 
     Value lod = Value::object();
     lod.set("name", "lod0");

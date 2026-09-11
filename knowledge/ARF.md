@@ -47,10 +47,26 @@ repo was updated in lockstep with this rewrite and remains a quick,
 dependency-free local smoke test; `libarf`'s own tools are the deeper,
 independent check.
 
-One deliberate, documented deviation remains from the spec, inherited
-unchanged from before this rewrite: **skin weights use a sparse tensor
-encoding**, not the dense form the spec defines (see "Design decisions"
-below) — the same choice `libarf` itself makes and documents.
+**2026-09-11 follow-up:** a later re-read of `libarf` against the spec text
+surfaced two more gaps in its `preamble`/`metadata`, both now matched here
+too: `preamble.supportedAnimations` is a `SupportedAnimations` object
+(`bodyAnimations`/`faceAnimations`, each a one-entry array of profile
+strings), not the flat array of profile strings this writer used before; and
+`metadata.age`/`metadata.gender` (mandatory per the `Metadata` schema) are
+now written as honest placeholders (`age = -1`, `gender = "unspecified"`) —
+this pipeline has no age/gender source, matching `libarf`'s own
+`arfCreate()` defaults. See `ARFPlayer`'s `doc/CONFORMANCE_GAPS.md`
+"Preamble / Metadata" section for the full reasoning.
+
+Two deliberate, documented deviations remain from the spec:
+- **Skin weights use a sparse tensor encoding**, not the dense form the spec
+  defines (see "Design decisions" below) — the same choice `libarf` itself
+  makes and documents.
+- **Units are centimetres**, not the metre the spec's General Conventions
+  clause names as ARF's default (see "Coordinate convention" below) —
+  `libarf` makes and documents the identical deviation, for the identical
+  reason (this pipeline's tracker output is natively centimetre-scaled;
+  converting at read/write time buys nothing but bug surface).
 
 ## Scope: what's implemented vs. skipped
 
@@ -58,9 +74,12 @@ Implemented:
 - **Container**: ZIP-based `.arfz` only (the spec's simpler, more portable
   option — no ISOBMFF/MP4 muxing).
 - **Base avatar model** (`arf.json`, hand-written JSON — see `arf_json.h`):
-  `preamble`, `metadata`, `structure.assets[].lods[]`, and `components` with
-  `nodes` (all 127 MHR joints), one `skeletons` entry, one `skins` entry, one
-  `meshes` entry, and (when face export is on) one `blendshapeSets` entry.
+  `preamble` (with `supportedAnimations` as the spec's `SupportedAnimations`
+  object), `metadata` (with mandatory `age`/`gender`, both honest
+  placeholders — no source for either in this pipeline),
+  `structure.assets[].lods[]`, and `components` with `nodes` (all 127 MHR
+  joints), one `skeletons` entry, one `skins` entry, one `meshes` entry, and
+  (when face export is on) one `blendshapeSets` entry.
 - **Skeleton**: all 127 MHR joints (`src/SAM3DBODY-cpp/mhr_joint_table.h`),
   parent/child hierarchy, rest local translation + rotation per joint.
 - **Skin**: sparse per-vertex joint weights (`MHR_LBS_Data::skin_*`) +
@@ -167,6 +186,14 @@ real data source ever shows up in this pipeline):
 
 **Y-up, −Z forward, centimetres, origin at the camera.** A reader can display a
 container directly: no basis change, no axis flip, no unit scale.
+
+Centimetres is a deliberate, permanent deviation from the spec's General
+Conventions clause, which names the metre as ARF's default unit — the same
+choice `libarf` documents in `arf.h`/`doc/ARF.md`/`doc/CONFORMANCE_GAPS.md`.
+This pipeline's tracker output (`MHRResult`, `MHR_LBS_Data`) is natively
+centimetre-scaled throughout; converting to metres only at the ARF read/write
+boundary would just add a unit-scale bug surface for no benefit, since
+nothing downstream of this writer assumes metres either.
 
 - The rest mesh and the inverse bind matrices are Y-up (feet near `Y=0`, head
   near `Y=+173`), and the animated pose keeps that — head above feet in `+Y`.
