@@ -1132,9 +1132,18 @@ void BVHWriter::fill_motion_row(float* row, const fsb::MHRResult& r,
             }
             else
             {
-                set_channel(mc_, row, s.bvh_jid, BVH_POSITION_X, r.pred_cam_t[0] * POS_SCALE);
-                set_channel(mc_, row, s.bvh_jid, BVH_POSITION_Y, r.pred_cam_t[1] * POS_SCALE);
-                set_channel(mc_, row, s.bvh_jid, BVH_POSITION_Z, r.pred_cam_t[2] * POS_SCALE);
+                // Y and Z are negated: pred_cam_t is in the camera frame
+                // (+X right / +Y down / +Z forward, see foot_contact_pass's
+                // header and the projection in fast_sam_3dbody.cpp), while the
+                // exported pose is the unflipped Y-up model pose.  The renderer
+                // reconciles the two with F = diag(1,-1,-1) applied to the
+                // translation (mhr_pose_driver.h:252-271); writing t unflipped
+                // put the body above the camera and mirrored its vertical
+                // motion, and reversed depth — the latter is what
+                // gmr_retarget.py --flip-depth used to compensate for.
+                set_channel(mc_, row, s.bvh_jid, BVH_POSITION_X,  r.pred_cam_t[0] * POS_SCALE);
+                set_channel(mc_, row, s.bvh_jid, BVH_POSITION_Y, -r.pred_cam_t[1] * POS_SCALE);
+                set_channel(mc_, row, s.bvh_jid, BVH_POSITION_Z, -r.pred_cam_t[2] * POS_SCALE);
 
                 float ex, ey, ez;
                 mat3_to_euler_for_order(m, jh.channelRotationOrder, ex, ey, ez);
@@ -1431,7 +1440,15 @@ void BVHWriter::write_frame_fused(const std::vector<FusedPerson>& persons,
         }
 
         fsb::MHRResult fr;                  // only pred_cam_t is read by append_row_from_state
-        fr.pred_cam_t = { root_sum[0]/nv, root_sum[1]/nv, root_sum[2]/nv };
+        // root_world is already in the MULTIVIEW WORLD frame (T_world_cam ·
+        // pred_cam_t, sam_3dbody_multiview.cpp:152), not the camera frame, so
+        // the camera-frame Y/Z negation fill_motion_row applies does not belong
+        // here.  Pre-negate to cancel it and keep fused output byte-identical to
+        // what it was before that fix.  Whether the multiview world frame should
+        // itself adopt the Y-up convention is a separate, open question.
+        fr.pred_cam_t = {  root_sum[0]/nv,
+                          -root_sum[1]/nv,
+                          -root_sum[2]/nv };
 
         PerPerson& p = people_[fp.track_id];
         if (p.id < 0) { p.id = fp.track_id; p.frame_count = 0; p.bone_samples.assign(slots_.size(), std::vector<float>{}); }

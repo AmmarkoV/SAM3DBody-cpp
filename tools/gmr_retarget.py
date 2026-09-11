@@ -20,10 +20,11 @@ ap.add_argument("--no-ground", action="store_true")
 ap.add_argument("--human-height", type=float, default=0.0,
                 help="override actual_human_height (m); 0 = auto-scale from skeleton")
 ap.add_argument("--flip-depth", action="store_true",
-                help="reverse the global front/back (depth) motion. MHR is camera-space and "
-                     "its depth sign is opposite to GMR's Y-up->Z-up convention, so the robot "
-                     "otherwise moonwalks. This is a RIGID per-frame translation on the depth "
-                     "axis only (GMR world Y) — pose and facing are untouched.")
+                help="LEGACY: reverse the global front/back (depth) motion. bvh_writer now "
+                     "negates the camera-space Y/Z when writing the root position, so current "
+                     "exports need this OFF. Use it only for BVH files written before that fix "
+                     "(the robot moonwalks without it). RIGID per-frame translation on the "
+                     "depth axis only (GMR world Y) — pose and facing are untouched.")
 ap.add_argument("--no-despike", action="store_true",
                 help="disable the glitch-frame filter (on by default). The filter replaces "
                      "velocity-outlier frames (tracking singularities — esp. root-rotation "

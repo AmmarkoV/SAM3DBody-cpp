@@ -149,8 +149,9 @@ fi
 
 # --max-persons 1: one actor drives the robot. --butterworth (+ root rotation):
 # the live binary's causal smoothing, so the robot isn't fed raw per-frame jitter.
-# --flip-depth: MHR is camera-space; its depth sign is opposite to GMR's (robot
-# would moonwalk otherwise) — same rationale as video_gmr.sh.
+# No --flip-depth: the live stream goes through BVHWriter::fill_motion_row, the
+# same code the file export uses, which now negates the camera-space Y/Z of the
+# root position — so depth already matches GMR's convention.
 BIN_ARGS=(
     --onnx-dir "$REPO/onnx"
     --gguf     "$REPO/onnx/pipeline.gguf"
@@ -168,7 +169,6 @@ PY_ARGS=(
     --config   "$POS_CONFIG"
     --template "$TEMPLATE"
     --sink     "$SINK"
-    --flip-depth
 )
 
 if [ "$SHM_ACTIVE" = 1 ]; then

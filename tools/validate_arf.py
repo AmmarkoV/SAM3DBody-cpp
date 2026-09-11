@@ -226,6 +226,55 @@ def main() -> None:
                       f"Z=[{min(tzs):.1f},{max(tzs):.1f}]  "
                       f"(compare against the matching --bvh run's printed root path)")
 
+            # Placement in the declared frame: Y-up, -Z forward, origin at the
+            # camera (see ARF.md "Coordinate convention").  Composing the first
+            # frame's joint origins catches a sign error in the root translation,
+            # which is invisible in the pose alone — the skeleton stays perfectly
+            # upright while the whole body sits behind and above the camera.
+            parent_of = {n["id"]: n.get("parent") for n in nodes}
+            mats0 = joint_frames[0][2]
+            world = {}
+
+            def compose(nid):
+                if nid in world:
+                    return world[nid]
+                m = mats0.get(nid)
+                if m is None:
+                    return None
+                par = parent_of.get(nid)
+                if par is None:
+                    world[nid] = m
+                else:
+                    pm = compose(par)
+                    if pm is None:
+                        return None
+                    world[nid] = tuple(
+                        sum(pm[4 * i + k] * m[4 * k + j] for k in range(4))
+                        for i in range(4) for j in range(4)
+                    )
+                return world[nid]
+
+            pts = [(w[3], w[7], w[11]) for w in
+                   (compose(nid) for nid in mats0) if w is not None]
+            if pts:
+                ys = [p[1] for p in pts]
+                zs = [p[2] for p in pts]
+                if max(zs) >= 0.0:
+                    fail(f"frame 0 has joints at Z >= 0 (Z range [{min(zs):.1f},{max(zs):.1f}]) — "
+                         "the subject must lie in front of a camera that looks down -Z. "
+                         "A positive Z means the root translation was not negated "
+                         "(see ARF.md 'Coordinate convention').")
+                if min(ys) >= 0.0:
+                    fail(f"frame 0 is entirely above the origin (Y range [{min(ys):.1f},{max(ys):.1f}]) — "
+                         "the subject's feet should sit below a camera at standing height. "
+                         "This is the signature of an un-negated root translation Y.")
+                straddles = min(ys) < 0.0 < max(ys)
+                print(f"OK  frame 0 placement: Y=[{min(ys):.1f},{max(ys):.1f}] "
+                      f"Z=[{min(zs):.1f},{max(zs):.1f}] cm"
+                      + ("" if straddles else
+                         "  WARNING: body does not straddle Y=0 — plausible only if the "
+                         "camera was below the feet or above the head"))
+
         blendshape_sets = comp.get("blendshapeSets", [])
         if blendshape_sets:
             bs = blendshape_sets[0]

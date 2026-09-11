@@ -163,6 +163,29 @@ real data source ever shows up in this pipeline):
   companion scene-description part (23090-14) defines, matching `libarf`'s
   own convention.
 
+## Coordinate convention
+
+**Y-up, −Z forward, centimetres, origin at the camera.** A reader can display a
+container directly: no basis change, no axis flip, no unit scale.
+
+- The rest mesh and the inverse bind matrices are Y-up (feet near `Y=0`, head
+  near `Y=+173`), and the animated pose keeps that — head above feet in `+Y`.
+- The root node's per-frame translation is `(+tx, −ty, −tz) · 100` from
+  `pred_cam_t`. The **negation is deliberate**: `pred_cam_t` is camera-space
+  (+X right / +Y *down* / +Z forward), and the MHR renderer reconciles it with
+  the Y-up pose via `display = v_model + F·t`, `F = diag(1,−1,−1)`
+  (`mhr_pose_driver.h:252-271`; the LBS buffer's `verts[Y,Z] *= -1` and the view
+  matrix's flip cancel on the vertices, so only the translation carries `F`).
+- Consequently a standing subject straddles the origin: feet around `Y ≈ −100`
+  cm, head around `Y ≈ +60` cm for a camera held at ~1.2 m, at `Z ≈ −200…−350`
+  cm — in front of a camera that looks down `−Z`.
+
+Exports before 2026-09-11 wrote `+t` on all three axes, which put the body
+*above* the camera and *behind* it in Z, and mirrored its vertical motion.
+`tools/validate_arf.py` now asserts the placement, so a regression is caught at
+validation time. `bvh_writer.cpp` carries the same convention (its
+`gmr_retarget.py --flip-depth` compensation is retired — see `GMR.md` §6).
+
 ## Container layout
 
 ```

@@ -476,11 +476,21 @@ void ARFWriter::append_frame_for(PerPerson& p, const fsb::MHRResult& r)
         {
             // Root: the PT-decoded translation delta only ever captures a tiny
             // internal wobble — actual world position comes from the camera
-            // translation head (pred_cam_t, metres), same convention BVHWriter
-            // (POS_SCALE) and mhr_fk::State::joint_locals() already use.
-            t[0] = r.pred_cam_t[0] * 100.0f;
-            t[1] = r.pred_cam_t[1] * 100.0f;
-            t[2] = r.pred_cam_t[2] * 100.0f;
+            // translation head (pred_cam_t, metres).
+            //
+            // Y and Z are negated.  The MHR pipeline renders with
+            //     display = F · (F · v_model) + F · t,   F = diag(1,-1,-1)
+            // (mhr_pose_driver.h: the LBS buffer carries verts[Y,Z] *= -1 and
+            // the GL view matrix flips them back while translating by
+            // (+tx,-ty,-tz)).  Since F² = I the two vertex flips cancel, leaving
+            //     display = v_model + F · t.
+            // We export v_model — the unflipped Y-up rest mesh and pose — so the
+            // translation that belongs beside it is F·t, not t.  Exporting t
+            // unflipped put the body above the camera and behind it in Z.
+            // The rotations need no change: F cancels itself on the pose.
+            t[0] =  r.pred_cam_t[0] * 100.0f;
+            t[1] = -r.pred_cam_t[1] * 100.0f;
+            t[2] = -r.pred_cam_t[2] * 100.0f;
         }
         else
         {

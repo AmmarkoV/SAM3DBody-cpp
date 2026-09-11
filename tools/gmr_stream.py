@@ -50,8 +50,10 @@ ap.add_argument("--shm-stream", default="bvh", help="feed name within --bvh-shm"
 ap.add_argument("--shm-lib", default="", help="path to libSharedMemoryVideoBuffers.so "
                 "(default: <repo>/src/SharedMemoryVideoBuffers/libSharedMemoryVideoBuffers.so)")
 ap.add_argument("--flip-depth", action="store_true",
-                help="reverse global front/back drift (MHR camera-space depth sign is opposite to "
-                     "GMR's Y-up->Z-up convention). Rigid per-frame depth-axis shift about frame 0.")
+                help="LEGACY: reverse global front/back drift. BVHWriter::fill_motion_row now "
+                     "negates the camera-space Y/Z of the root position, so live streams need "
+                     "this OFF; use it only against a pre-fix producer. Rigid per-frame "
+                     "depth-axis shift about frame 0.")
 ap.add_argument("--no-ground", action="store_true", help="disable per-frame foot grounding")
 ap.add_argument("--human-height", type=float, default=0.0,
                 help="override actual_human_height (m); 0 = auto-scale from the first frame's skeleton")
