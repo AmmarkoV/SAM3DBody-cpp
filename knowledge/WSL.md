@@ -171,7 +171,7 @@ Before running the pipeline, confirm the ONNX Runtime CUDA provider has all its
 dependencies (no output = success):
 
 ```bash
-ldd build/onnxruntime_dl/lib/libonnxruntime_providers_cuda.so | grep -i "not found"
+ldd build/onnxruntime_dl/onnxruntime-linux-x64-gpu-1.20.1/lib/libonnxruntime_providers_cuda.so | grep -i "not found"
 ```
 
 If anything shows up here, revisit Step 4 (cuDNN) and Step 6 (paths). See

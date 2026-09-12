@@ -10,6 +10,10 @@
 
 extern "C" {
 
+    unsigned int fsb_abi_version(void) { return FSB_ABI_VERSION; }
+    size_t fsb_config_size(void) { return sizeof(FsbConfig); }
+    size_t fsb_result_size(void) { return sizeof(FsbResult); }
+
     FsbHandle fsb_create(void)
     {
         return static_cast<FsbHandle>(new fsb::Pipeline());

@@ -61,10 +61,49 @@
 #include <fstream>    // resolve_backbone_defaults(): probe for backbone_fp16.onnx
 #include <string>
 #include <vector>     // ensure_models(): sentinel file list
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+// Legacy Win16 pointer qualifiers collide with renderer/math identifiers.
+#ifdef near
+#undef near
+#endif
+#ifdef far
+#undef far
+#endif
+#else
 #include <glob.h>     // resolve_detector_defaults(): find libreyolo*.onnx in onnx_dir
 #include <unistd.h>   // ensure_trt_models(): readlink("/proc/self/exe") to locate setup_trt.sh
+#endif
 
 #include "fast_sam_3dbody.h"  // for fsb::PipelineConfig
+
+inline std::string cli_executable_directory()
+{
+#if defined(_WIN32)
+    std::vector<wchar_t> buffer(512);
+    while (buffer.size() <= 32768) {
+        const DWORD count = GetModuleFileNameW(nullptr, buffer.data(),
+                                               static_cast<DWORD>(buffer.size()));
+        if (count == 0) return {};
+        if (count < buffer.size())
+            return std::filesystem::path(std::wstring(buffer.data(), count))
+                .parent_path().u8string();
+        buffer.resize(buffer.size() * 2);
+    }
+    return {};
+#else
+    char buffer[4096];
+    const ssize_t count = ::readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
+    if (count <= 0) return {};
+    return std::filesystem::path(std::string(buffer, count)).parent_path().string();
+#endif
+}
 
 
 struct CommonConfig
@@ -105,6 +144,7 @@ struct CommonConfig
     bool        yolo_path_set   = false;  // --yolo given
     bool        thresh_set      = false;  // --thresh / --detector-threshold given
     bool        backbone_name_set = false; // --backbone given (pins the model; disables fp16 auto-prefer)
+    bool        decoder_name_set = false;  // --decoder given (disables CPU/TRT auto-selection)
 
     // ── Input source ────────────────────────────────────────────────────────
     std::string from;             // file / webcam index / empty = required
@@ -186,6 +226,8 @@ inline bool parse_common_arg(int argc, const char* const* argv, int& i,
     // won't silently auto-upgrade them to backbone_fp16.onnx.
     if (std::strcmp(argv[i], "--backbone") == 0 && i + 1 < argc)
     { c.backbone_name = argv[++i]; c.backbone_name_set = true; return true; }
+    if (std::strcmp(argv[i], "--decoder") == 0 && i + 1 < argc)
+    { c.decoder_name = argv[++i]; c.decoder_name_set = true; return true; }
     CLI_STR ("--from",                 from)
     CLI_INT ("--frames",               max_frames)
     CLI_INT ("--start",                start_frame)
@@ -313,7 +355,9 @@ inline void ensure_models(CommonConfig& c, bool refined_pose = false)
 {
     const bool cpu = (c.cuda_device < 0);
     const char* profile;
-    if (cpu)                      profile = "cpu";     // CPU EP: fp32 backbone + fp16 decoder
+    if (c.backbone_name_set && c.decoder_name_set)
+                                  profile = "shared";  // both model choices are explicit
+    else if (cpu)                 profile = "cpu";     // CPU EP: fp32 backbone + fp16 decoder
     else if (c.use_trt)           profile = "shared";  // the TRT pair is ensure_trt_models()' job
     else if (c.backbone_name_set) profile = "shared";  // user is driving the model choice
     else                          profile = "cuda";    // bf16 backbone + bf16 decoder
@@ -330,15 +374,26 @@ inline void ensure_models(CommonConfig& c, bool refined_pose = false)
         "pipeline.gguf", "body_model.lbs", "yolo.onnx",
         "correctives.bin", "keypoint_mapping.bin"
     };
+    auto require_model = [&](const std::string& name) {
+        sentinels.push_back(name);
+        // These distributed ONNX graphs use external weights. Custom exports
+        // may be self-contained; ORT validates their own external-data mapping.
+        const auto filename = std::filesystem::u8path(name).filename().u8string();
+        if (filename == "backbone.onnx" || filename == "backbone_fp32.onnx" ||
+            filename == "backbone_fp16.onnx" || filename == "backbone_fp16_trt.onnx" ||
+            filename == "decoder_fp16.onnx")
+            sentinels.push_back(name + ".data");
+    };
     if (cpu) {
-        // Fetched even when --backbone is pinned: pinning the backbone says
-        // nothing about the decoder, and the bf16 decoder.onnx has no CPU kernels.
-        sentinels.insert(sentinels.end(), {
-            "backbone_fp32.onnx", "backbone_fp32.onnx.data",
-            "decoder_fp16.onnx",  "decoder_fp16.onnx.data" });
-    } else if (!c.use_trt && !c.backbone_name_set) {
-        sentinels.insert(sentinels.end(), {
-            "backbone.onnx", "backbone.onnx.data", "decoder.onnx" });
+        require_model(c.backbone_name_set ? c.backbone_name : "backbone_fp32.onnx");
+        require_model(c.decoder_name_set ? c.decoder_name : "decoder_fp16.onnx");
+    } else if (!c.use_trt) {
+        require_model(c.backbone_name);
+        require_model(c.decoder_name);
+    } else {
+        // The unpinned TRT defaults remain ensure_trt_models()' responsibility.
+        if (c.backbone_name_set) require_model(c.backbone_name);
+        if (c.decoder_name_set) require_model(c.decoder_name);
     }
     if (refined_pose) {
         // --refined-pose's iterative decoders (the 'refined' profile in
@@ -381,26 +436,28 @@ inline void ensure_models(CommonConfig& c, bool refined_pose = false)
 
     // Where the executable lives, so we can find both the repo's onnx/ and the
     // fetch script without depending on the working directory.
-    std::string exe_dir;
-    {
-        char buf[4096];
-        ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-        if (n > 0) {
-            buf[n] = '\0';
-            std::string exe(buf);
-            size_t s = exe.find_last_of('/');
-            if (s != std::string::npos) exe_dir = exe.substr(0, s);
-        }
-    }
+    const std::string exe_dir = cli_executable_directory();
 
     // Retarget the default './onnx' at the repo's onnx/ when the cwd has none.
     // Only ever fires in the case that fails outright today.
     if (c.onnx_dir == "./onnx" && !std::filesystem::exists("./onnx") && !exe_dir.empty()) {
         std::string repo_onnx = exe_dir + "/../onnx";
+#if defined(_WIN32)
+        // Also support a packaged executable and MSVC's build/Release layout.
+        for (const auto& candidate : {exe_dir + "/onnx", exe_dir + "/../onnx",
+                                      exe_dir + "/../../onnx"}) {
+            std::error_code candidate_ec;
+            if (std::filesystem::is_directory(std::filesystem::u8path(candidate), candidate_ec)) {
+                repo_onnx = candidate;
+                break;
+            }
+        }
+#endif
         std::error_code ec;
-        std::filesystem::path canon = std::filesystem::weakly_canonical(repo_onnx, ec);
+        std::filesystem::path canon = std::filesystem::weakly_canonical(
+            std::filesystem::u8path(repo_onnx), ec);
         if (!ec) {
-            c.onnx_dir = canon.string();
+            c.onnx_dir = canon.u8string();
             // gguf_path / yolo_path default to "./onnx/..." independently of
             // onnx_dir, so they have to move with it — otherwise the backbone
             // loads from the repo while YOLO still looks in the (absent) ./onnx.
@@ -426,6 +483,14 @@ inline void ensure_models(CommonConfig& c, bool refined_pose = false)
     };
     if (!missing()) return;
 
+#if defined(_WIN32)
+    std::fprintf(stderr,
+        "[cli] models missing from '%s'. Download the required model files from\n"
+        "      https://huggingface.co/AmmarkoV/SAM3DBody-cpp-onnx-models\n"
+        "      and select their directory with --onnx-dir. Native Windows does not\n"
+        "      launch Bash or download models automatically. See knowledge/WINDOWS.md.\n",
+        c.onnx_dir.c_str());
+#else
     std::string script;
     if (!exe_dir.empty() && std::ifstream(exe_dir + "/../tools/fetch_model.sh").good())
         script = exe_dir + "/../tools/fetch_model.sh";
@@ -454,6 +519,7 @@ inline void ensure_models(CommonConfig& c, bool refined_pose = false)
             "[cli] model fetch did not complete — continuing; the load below will "
             "report what is still missing.\n");
     }
+#endif
 }
 
 // Resolve the "auto" detector default and the per-detector confidence default.
@@ -475,6 +541,27 @@ inline void resolve_detector_defaults(CommonConfig& c)
     if (c.detector == "auto") {
         // Prefer a LibreYOLO model on disk when the user hasn't pinned --yolo.
         if (!c.yolo_path_set) {
+#if defined(_WIN32)
+            std::string first_model;
+            std::error_code ec;
+            std::filesystem::directory_iterator it(std::filesystem::u8path(c.onnx_dir), ec), end;
+            while (!ec && it != end) {
+                const auto name = it->path().filename().u8string();
+                if (name.compare(0, 9, "libreyolo") == 0 &&
+                    it->path().extension() == ".onnx" && it->is_regular_file(ec)) {
+                    const auto path = it->path().u8string();
+                    // Match glob's stable lexical choice, independent of directory order.
+                    if (first_model.empty() || path < first_model) first_model = path;
+                }
+                it.increment(ec);
+            }
+            if (!first_model.empty()) {
+                c.yolo_path = first_model;
+                std::fprintf(stderr,
+                    "[cli] --detector auto: found LibreYOLO model '%s'; "
+                    "preferring it over yolo-pose\n", c.yolo_path.c_str());
+            }
+#else
             std::string pattern = c.onnx_dir + "/libreyolo*.onnx";
             glob_t g{};
             if (glob(pattern.c_str(), 0, nullptr, &g) == 0 && g.gl_pathc > 0) {
@@ -484,6 +571,7 @@ inline void resolve_detector_defaults(CommonConfig& c)
                     "preferring it over yolo-pose\n", c.yolo_path.c_str());
             }
             globfree(&g);
+#endif
         }
         c.detector = path_looks_like_libreyolo(c.yolo_path) ? "libreyolo"
                                                             : "yolo-pose";
@@ -523,6 +611,13 @@ inline void ensure_trt_models(const CommonConfig& c)
     if (exists("backbone_fp16_trt.onnx") && exists("decoder_fp16.onnx"))
         return;   // already have them
 
+#if defined(_WIN32)
+    std::fprintf(stderr,
+        "[cli] TRT: backbone_fp16_trt.onnx / decoder_fp16.onnx missing from '%s'.\n"
+        "      Download the TRT profile from the model repository and pass --onnx-dir.\n"
+        "      Automatic Bash setup is disabled on native Windows; falling back to CUDA EP.\n",
+        c.onnx_dir.c_str());
+#else
     // Locate setup_trt.sh relative to this executable (binaries live in build/,
     // so ../tools/), with the working dir as a fallback.
     std::string script;
@@ -568,6 +663,7 @@ inline void ensure_trt_models(const CommonConfig& c)
         std::fprintf(stderr,
             "[cli] TRT: models not fetched (declined or unavailable) — "
             "falling back to CUDA EP.\n");
+#endif
 }
 
 // On CUDA, auto-prefer a float16 backbone when one has been exported next to the
@@ -605,7 +701,7 @@ inline void resolve_backbone_defaults(CommonConfig& c)
     // exactly how to get them when they're absent instead of leaving the user with
     // ORT's cryptic MatMul error.
     if (c.cuda_device < 0) {
-        if (c.decoder_name == "decoder.onnx") {
+        if (!c.decoder_name_set && c.decoder_name == "decoder.onnx") {
             if (exists("decoder_fp16.onnx")) {
                 c.decoder_name = "decoder_fp16.onnx";
                 std::fprintf(stderr,
@@ -649,7 +745,7 @@ inline void resolve_backbone_defaults(CommonConfig& c)
     //                                 --output onnx/decoder_fp16.onnx).
     // Pick it up automatically under --trt so the decoder runs on TRT instead of
     // crashing.
-    if (c.use_trt && c.decoder_name == "decoder.onnx" && exists("decoder_fp16.onnx")) {
+    if (c.use_trt && !c.decoder_name_set && c.decoder_name == "decoder.onnx" && exists("decoder_fp16.onnx")) {
         c.decoder_name = "decoder_fp16.onnx";
         std::fprintf(stderr,
             "[cli] TRT: using 'decoder_fp16.onnx' (bf16 decoder.onnx is not TRT-compatible).\n");
@@ -719,6 +815,8 @@ inline void print_common_args_help(FILE* fp)
         "                                 backbone_fp16.onnx is auto-preferred when present — see\n"
         "                                 tools/export_backbone_fp16.py; or backbone_int8.onnx via\n"
         "                                 tools/quantize_backbone.py)\n"
+        "  --decoder NAME                 Decoder filename within onnx-dir (default decoder.onnx;\n"
+        "                                 pin decoder_fp16.onnx to use the FP16 export on CUDA EP)\n"
         "  --gguf     PATH                pipeline.gguf (MHR + camera heads)\n"
         "  --yolo     PATH                Detector model (.onnx); YOLO11-pose or a LibreYOLO/YOLOv9 export\n"
         "  --detector NAME                Bbox provider parsing --yolo output: auto (default; prefers a\n"

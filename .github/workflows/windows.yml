@@ -1,0 +1,32 @@
+name: Windows native build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  msvc:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch official OpenCV and GLEW development packages
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path build/deps -Force | Out-Null
+          Invoke-WebRequest https://github.com/opencv/opencv/releases/download/4.10.0/opencv-4.10.0-windows.exe -OutFile build/deps/opencv.exe
+          7z x build/deps/opencv.exe -obuild/deps -y -bso0 -bsp0
+          if ($LASTEXITCODE -ne 0) { throw 'OpenCV extraction failed' }
+          Invoke-WebRequest https://github.com/nigels-com/glew/releases/download/glew-2.2.0/glew-2.2.0-win32.zip -OutFile build/deps/glew.zip
+          Expand-Archive build/deps/glew.zip build/deps
+      - name: Build all Windows targets and run model-free regression tests
+        shell: pwsh
+        run: |
+          ./scripts/build_windows.ps1 -OpenCVDir build/deps/opencv/build -GLEWRoot build/deps/glew-2.2.0
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/test_fetch_model.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'PowerShell download tests failed' }
+      # A hosted runner has no guaranteed OpenGL 3.3 desktop. test_wgl_context
+      # is compiled here; opt in to its execution locally with -TestOpenGL.

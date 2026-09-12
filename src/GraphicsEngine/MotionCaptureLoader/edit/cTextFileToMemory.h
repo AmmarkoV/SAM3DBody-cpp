@@ -202,7 +202,7 @@ static int ctftm_loadTextFileToMemory(struct cTextFileToMemory * ctftm, const ch
 
         if (ctftm->strings!=0)
         {
-         ssize_t read = ctftm_parselines(ctftm);
+         unsigned int read = ctftm_parselines(ctftm);
          return (read>0);
         }
     }

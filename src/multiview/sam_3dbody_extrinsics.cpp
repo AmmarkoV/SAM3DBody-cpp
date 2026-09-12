@@ -33,9 +33,10 @@ static void euler_zyx_deg(const mv::Mat4& T, double& yaw, double& pitch, double&
 {
     // R = Rz(yaw)Ry(pitch)Rx(roll); extract from the row-major rotation block.
     double r00=T[0], r10=T[4], r20=T[8], r21=T[9], r22=T[10];
-    pitch = std::asin(-std::max(-1.0,std::min(1.0,r20))) * 180.0/M_PI;
-    yaw   = std::atan2(r10, r00) * 180.0/M_PI;
-    roll  = std::atan2(r21, r22) * 180.0/M_PI;
+    const double radians_to_degrees = 180.0 / std::acos(-1.0);
+    pitch = std::asin(-std::max(-1.0,std::min(1.0,r20))) * radians_to_degrees;
+    yaw   = std::atan2(r10, r00) * radians_to_degrees;
+    roll  = std::atan2(r21, r22) * radians_to_degrees;
 }
 
 int main(int argc, char** argv)

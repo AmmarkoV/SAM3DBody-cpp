@@ -1,4 +1,5 @@
 #include "fromBVH.h"
+#include "../../System/portable_getline.h"
 
 #include <string.h>
 #include "../../TrajectoryParser/InputParser_C.h"
@@ -203,10 +204,10 @@ int fastBVHFileToDetermineNumberOfJointsAndMotionFields(struct BVH_MotionCapture
     unsigned int hierarchyLevel=0;
     char * line = NULL;
     size_t len = 0;
-    ssize_t read;
+    ptrdiff_t read;
 
     int done=0;
-    while  ( (!done) && ((read = getline(&line, &len, fd)) != -1) )
+    while  ( (!done) && ((read = fsb_getline(&line, &len, fd)) != -1) )
     {
        ++bvhMotion->linesParsed;
        //printf("Retrieved line of length %zu :\n %s", read,line);
@@ -393,10 +394,10 @@ int readBVHHeader(struct BVH_MotionCapture * bvhMotion,FILE * fd)
     unsigned int hierarchyLevel=0;
     char * line = NULL;
     size_t len = 0;
-    ssize_t read;
+    ptrdiff_t read;
 
     int done=0;
-    while  ( (!done) && ((read = getline(&line, &len, fd)) != -1) )
+    while  ( (!done) && ((read = fsb_getline(&line, &len, fd)) != -1) )
     {
        ++bvhMotion->linesParsed;
        //printf("Retrieved line of length %zu :\n %s", read,line);
@@ -722,7 +723,7 @@ int readBVHHeader(struct BVH_MotionCapture * bvhMotion,FILE * fd)
           else
          {
             //Unexpected input..
-            fprintf(stderr,"BVH Header, Unexpected line num (%u) of length %zd :\n" , bvhMotion->linesParsed , read);
+            fprintf(stderr,"BVH Header, Unexpected line num (%u) of length %td :\n" , bvhMotion->linesParsed , read);
             fprintf(stderr,"%s\n", line);
             //exit(0);
          }
@@ -797,9 +798,9 @@ int readBVHMotion(struct BVH_MotionCapture * bvhMotion , FILE * fd )
     char str[MAX_BVH_FILE_LINE_SIZE+1]={0};
     char * line = NULL;
     size_t len = 0;
-    ssize_t read;
+    ptrdiff_t read;
 
-    while ((read = getline(&line, &len, fd)) != -1)
+    while ((read = fsb_getline(&line, &len, fd)) != -1)
     {
        ++bvhMotion->linesParsed;
 

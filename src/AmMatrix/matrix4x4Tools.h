@@ -6,6 +6,11 @@
 #ifndef MATRIX4X4TOOLS_H_INCLUDED
 #define MATRIX4X4TOOLS_H_INCLUDED
 
+#if defined(_MSC_VER)
+#define AMMATRIX_ALIGN16 __declspec(align(16))
+#else
+#define AMMATRIX_ALIGN16 __attribute__((aligned(16)))
+#endif
 
 #ifdef __cplusplus
 extern "C"
@@ -65,7 +70,7 @@ struct Matrix4x4OfFloats
      I31     , I32 , I33 , I34 ,
      I41     , I42 , I43 , I44
     */
-  float __attribute__((aligned(16))) m[16];
+  AMMATRIX_ALIGN16 float m[16];
 };
 
 
@@ -79,7 +84,7 @@ struct Vector4x1OfFloats
      IRC => Item Row/Column =>
      I11, I12, I13, I14
     */
-  float __attribute__((aligned(16))) m[4];
+  AMMATRIX_ALIGN16 float m[4];
 };
 
 
