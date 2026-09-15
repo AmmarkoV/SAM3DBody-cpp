@@ -45,6 +45,18 @@ if [ -z "$FROM_SRC" ] && [ ${#FORWARD_ARGS[@]} -gt 0 ] && [[ "${FORWARD_ARGS[0]}
     FROM_SRC="${FORWARD_ARGS[0]}"
     FORWARD_ARGS=("${FORWARD_ARGS[@]:1}")
 fi
+# Flags before the source (e.g. `video.sh --refined-pose clip.mp4`): take the
+# first non-flag token that exists on disk, so flag values aren't mistaken for it.
+if [ -z "$FROM_SRC" ]; then
+    for j in "${!FORWARD_ARGS[@]}"; do
+        if [[ "${FORWARD_ARGS[$j]}" != --* ]] && [ -e "${FORWARD_ARGS[$j]}" ]; then
+            FROM_SRC="${FORWARD_ARGS[$j]}"
+            unset 'FORWARD_ARGS[j]'
+            FORWARD_ARGS=("${FORWARD_ARGS[@]}")
+            break
+        fi
+    done
+fi
 
 # --from "$FROM_SRC" is emitted FIRST, right after the binary, so the input
 # filename leads the command line in htop/ps.
