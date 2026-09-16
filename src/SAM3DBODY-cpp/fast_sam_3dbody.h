@@ -119,8 +119,8 @@ struct PipelineConfig {
     int  max_persons     = 0;      // 0 = unlimited; >0 = cap after NMS (top-N by conf)
 
     // --focus: spend inference only on the people who are actually moving, and
-    // retain the previous solution for the ones who are not.  See focus_select()
-    // in fast_sam_3dbody.cpp for the method and its citation.  false = every
+    // retain the previous solution for the ones who are not.  See focus.h
+    // for the method and its citation.  false = every
     // detection is regressed every frame (the behaviour without the flag).
     bool  focus             = false;
     // The one knob: mean per-pixel intensity difference (0-255) inside a person's

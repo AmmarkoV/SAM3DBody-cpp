@@ -300,6 +300,7 @@ set(TRAJ_DIR  ${GRAPHICS_ENGINE_DIR}/TrajectoryParser)
 
 add_library(fast_sam_3dbody SHARED
     src/SAM3DBODY-cpp/fast_sam_3dbody.cpp
+    src/SAM3DBODY-cpp/focus.cpp
     src/SAM3DBODY-cpp/fast_sam_3dbody_capi.cpp
     src/SAM3DBODY-cpp/mhr_fk.cpp
     src/SAM3DBODY-cpp/bvh_writer.cpp
