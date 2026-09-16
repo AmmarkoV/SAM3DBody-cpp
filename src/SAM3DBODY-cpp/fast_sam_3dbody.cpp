@@ -40,6 +40,13 @@
 // ── ONNX Runtime ─────────────────────────────────────────────────────────────
 #include <onnxruntime_cxx_api.h>
 
+// TensorRT workspace sizing reads the device's VRAM (see trt_workspace_bytes()).
+// USE_TENSORRT_EP implies WITH_CUDA in CMakeLists.txt, so cudart is linked
+// whenever this is compiled in.
+#if defined(USE_TENSORRT_EP)
+#include <cuda_runtime.h>
+#endif
+
 // ── OpenCV ───────────────────────────────────────────────────────────────────
 #include <opencv2/imgproc.hpp>
 #include <opencv2/dnn.hpp>
@@ -289,6 +296,66 @@ static const struct FsbDiag
     const char* global_rot_override   = getenv("FSB_GLOBAL_ROT_OVERRIDE");
 } g_diag;
 
+#if defined(USE_TENSORRT_EP)
+// ─────────────────────────────────────────────────────────────────────────────
+// How much scratch to hand TensorRT for building an engine.
+//
+// This is a build-time budget, not a steady-state allocation, but TRT refuses to
+// build a kernel it cannot fit: at 256 MB the backbone engine for the larger
+// batch shapes fails with
+//     Error Code 4: Could not find any implementation for node
+//     {ForeignNode[/norm/ReduceMean.../Gather_10]} due to insufficient workspace
+// and ORT turns that into a throw that aborts the run — so a clip renders fine
+// until the Nth person walks into frame.  Raising it blindly is what the 256 MB
+// cap was walking back from: with up to 3 TRT sessions (backbone, body, YOLO)
+// each reserving 2 GB, plus --refined-pose's ~27 CUDA-EP decoder sessions, a
+// 6 GB laptop card ran its CUDA arena dry mid-inference.
+//
+// So size it from the device instead of picking one number for every GPU:
+//   * 8 GB and under  → 256 MB, exactly the old behaviour, for the cards that
+//     cap was written for.
+//   * larger          → a quarter of what is still free, capped at 2 GB.
+// The quarter is read fresh per session, so each load already accounts for what
+// the previous ones took, and three of them still fit in the free pool.  2 GB is
+// the ceiling because it was enough for every graph here before the cap existed.
+//
+// FSB_TRT_WORKSPACE_MB overrides the whole calculation.
+static size_t trt_workspace_bytes(int device)
+{
+    const size_t MB = (size_t)1 << 20;
+    const size_t floor_mb = 256, cap_mb = 2048, small_gpu_mb = 8192;
+
+    if (const char* ws = getenv("FSB_TRT_WORKSPACE_MB"))
+    {
+        long v = atol(ws);
+        size_t mb = (v < (long)floor_mb) ? floor_mb : (size_t)v;
+        fprintf(stderr, "[ORT] TensorRT workspace %zu MB (FSB_TRT_WORKSPACE_MB).\n", mb);
+        return mb * MB;
+    }
+
+    size_t free_b = 0, total_b = 0;
+    if (cudaSetDevice(device) != cudaSuccess ||
+        cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || total_b == 0)
+    {
+        fprintf(stderr, "[ORT] TensorRT workspace %zu MB (could not read device %d VRAM).\n",
+                floor_mb, device);
+        return floor_mb * MB;
+    }
+
+    const size_t total_mb = total_b / MB, free_mb = free_b / MB;
+    size_t mb = floor_mb;
+    if (total_mb > small_gpu_mb)
+    {
+        mb = free_mb / 4;
+        if (mb > cap_mb)   mb = cap_mb;
+        if (mb < floor_mb) mb = floor_mb;
+    }
+    fprintf(stderr, "[ORT] TensorRT workspace %zu MB (device %d: %zu MB free of %zu MB).\n",
+            mb, device, free_mb, total_mb);
+    return mb * MB;
+}
+#endif
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ONNX Runtime session wrapper
 // ─────────────────────────────────────────────────────────────────────────────
@@ -371,13 +438,8 @@ struct OrtSession
                     OrtTensorRTProviderOptions tp{};
                     tp.device_id             = device;
                     tp.trt_fp16_enable       = fp16_io ? 1 : 0;
-                    // 2 GB build scratch was excessive for these small models (backbone
-                    // is <1 MB, YOLO <85 MB) and left no VRAM headroom on small GPUs
-                    // (e.g. 6 GB laptop cards): with up to 3 TRT sessions (backbone,
-                    // body, YOLO) each capped at 2 GB plus --refined-pose's ~27 extra
-                    // CUDA-EP decoder sessions, the CUDA arena ran out mid-inference
-                    // (bfc_arena.cc alloc failures on tiny buffers). 256 MB is ample.
-                    tp.trt_max_workspace_size = (size_t)256 << 20;
+                    // Scaled to the device's VRAM — see trt_workspace_bytes().
+                    tp.trt_max_workspace_size = trt_workspace_bytes(device);
                     // The legacy options struct is zero-initialised, but TRT
                     // rejects 0 for these two (they must be positive) — set ORT's
                     // documented defaults explicitly to silence the warnings.

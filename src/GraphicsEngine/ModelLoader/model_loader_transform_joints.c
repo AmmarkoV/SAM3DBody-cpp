@@ -1235,6 +1235,7 @@ void mhr_lbs_free(struct MHR_LBS_Data *d)
     free(d->hand_joint_idxs_left); free(d->hand_joint_idxs_right);
     free(d->corr_sp1_row); free(d->corr_sp1_col); free(d->corr_sp1_val);
     free(d->corr_sp2_row); free(d->corr_sp2_col); free(d->corr_sp2_val);
+    free(d->corr_sp2_rowptr);
     free(d);
 }
 
@@ -1302,6 +1303,24 @@ int mhr_correctives_load(struct MHR_LBS_Data *d, const char *path)
     d->corr_nnz1     = nnz1;
     d->corr_nnz2     = nnz2;
     fclose(f);
+
+    /* Build CSR row pointers for layer 2 — only valid if the entries are already
+     * grouped by row (they are, as exported); otherwise leave it NULL and the
+     * per-frame path keeps using the COO loop. */
+    d->corr_sp2_rowptr = NULL;
+    {
+        int sorted = 1, k;
+        for (k = 1; k < nnz2; k++)
+            if (d->corr_sp2_row[k] < d->corr_sp2_row[k-1]) { sorted = 0; break; }
+        if (sorted) {
+            int *rp = (int*)calloc((size_t)nout + 1, sizeof(int));
+            if (rp) {
+                for (k = 0; k < nnz2; k++) rp[d->corr_sp2_row[k] + 1]++;
+                for (k = 0; k < nout; k++) rp[k+1] += rp[k];
+                d->corr_sp2_rowptr = rp;
+            }
+        }
+    }
     fprintf(stderr, "[corr] loaded %s  nnz1=%d nnz2=%d\n", path, nnz1, nnz2);
     return 1;
 
@@ -1310,8 +1329,10 @@ read_err:
 oom:
     free(d->corr_sp1_row); free(d->corr_sp1_col); free(d->corr_sp1_val);
     free(d->corr_sp2_row); free(d->corr_sp2_col); free(d->corr_sp2_val);
+    free(d->corr_sp2_rowptr);
     d->corr_sp1_row = d->corr_sp1_col = NULL; d->corr_sp1_val = NULL;
     d->corr_sp2_row = d->corr_sp2_col = NULL; d->corr_sp2_val = NULL;
+    d->corr_sp2_rowptr = NULL;
     fclose(f); return 0;
 }
 
@@ -1378,11 +1399,23 @@ static int mhr_apply_correctives(const struct MHR_LBS_Data *d,
     mhr_spmv_relu(d->corr_sp1_row, d->corr_sp1_col, d->corr_sp1_val, nnz1, feat, hidden);
     for (int i = 0; i < nhid; i++) if (hidden[i] < 0.f) hidden[i] = 0.f;
 
-    /* Layer 2: sparse matmul → [nout], no ReLU (linear output) */
-    mhr_spmv_relu(d->corr_sp2_row, d->corr_sp2_col, d->corr_sp2_val, nnz2, hidden, out);
-
-    /* Add to unposed vertices */
-    for (int i = 0; i < nout; i++) unposed[i] += out[i];
+    /* Layer 2: sparse matmul → [nout], no ReLU (linear output).  The CSR form
+     * accumulates each row in a register, so the compiler can vectorise the
+     * gather-multiply-add; the COO form's out[row[k]] += ... is a serial
+     * read-modify-write it cannot.  Same arithmetic, same order within a row. */
+    if (d->corr_sp2_rowptr) {
+        const int   *rp  = d->corr_sp2_rowptr;
+        const int   *col = d->corr_sp2_col;
+        const float *val = d->corr_sp2_val;
+        for (int i = 0; i < nout; i++) {
+            float a = 0.f;
+            for (int k = rp[i]; k < rp[i+1]; k++) a += val[k] * hidden[col[k]];
+            unposed[i] += a;               /* fold the add into the same pass */
+        }
+    } else {
+        mhr_spmv_relu(d->corr_sp2_row, d->corr_sp2_col, d->corr_sp2_val, nnz2, hidden, out);
+        for (int i = 0; i < nout; i++) unposed[i] += out[i];
+    }
 
     free(feat); free(hidden); free(out);
     return 1;

@@ -64,6 +64,13 @@ struct MHR_LBS_Data {
     int   *corr_sp2_row;        /* [corr_nnz2]  row idx, layer 2 */
     int   *corr_sp2_col;        /* [corr_nnz2]  col idx, layer 2 */
     float *corr_sp2_val;        /* [corr_nnz2]  values,  layer 2 */
+    /* CSR row pointers for layer 2, built at load time when corr_sp2_row is
+     * already row-sorted (it is, as exported).  Lets the per-frame layer-2
+     * product accumulate into a register per row instead of read-modify-writing
+     * out[] through an indirection the compiler cannot vectorise, and drops the
+     * 11 MB corr_sp2_row stream from the inner loop.  NULL => fall back to the
+     * COO form. */
+    int   *corr_sp2_rowptr;     /* [corr_n_out + 1]  NULL if rows unsorted */
 };
 
 /* Load body_model.lbs produced by tools/extract_lbs_data.py.
