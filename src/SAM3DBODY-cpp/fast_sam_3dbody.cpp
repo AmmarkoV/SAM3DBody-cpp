@@ -1522,6 +1522,20 @@ struct Pipeline::Impl
         const int n = cfg.pipeline_depth;
         if (n <= 1 || pipe_started) return false;
 
+        // --focus reads the previous frame and a per-person track table, so it
+        // only means anything if frames arrive in order and one at a time.  The
+        // pool runs N of them concurrently, which would both race the table and
+        // make "the previous frame" undefined.  Drop focus rather than pipelining
+        // here: the caller asked for depth N explicitly, and focus degrades to
+        // the ordinary every-person path with no change in output.
+        if (cfg.focus)
+        {
+            fprintf(stderr,
+                "[FSB] --focus ignored: it needs frames in order, one at a time, and\n"
+                "      --pipeline %d runs %d concurrently.  Drop --pipeline to use it.\n", n, n);
+            cfg.focus = false;
+        }
+
         // Concurrent Ort::Session::Run() on ONE session is only safe here when
         // the TensorRT EP owns the graph — it serialises internally around its
         // execution context.  Under the CUDA EP it corrupts: measured 4 crashes
@@ -3703,6 +3717,196 @@ struct Pipeline::Impl
     }
 
 
+    // ─── --focus: dynamic distribution of inference over the detected people ──
+    //
+    // Implements the budget-allocation idea of
+    //
+    //   A. Qammaz, N. Kyriazis and A.A. Argyros, "Boosting the Performance of
+    //   Model-based 3D Tracking by Employing Low Level Motion Cues", In British
+    //   Machine Vision Conference (BMVC 2015), BMVA, pp. 144-1, Swansea, UK,
+    //   September 2015.
+    //
+    // There, an ensemble of collaborating trackers shares a pool of PSO budget
+    // and cheap low-level motion cues decide who gets B_max and who gets B_min
+    // (Eq. 7).  Here the "tracker" is one person crop through the backbone and
+    // decoder, and the budget is binary: regress this person again, or retain the
+    // solution we already hold for them.  The observation the paper rests on
+    // carries over directly — in most footage only some of the people present are
+    // moving at any instant, and re-solving someone who has not moved buys an
+    // answer we already have.
+    //
+    // WHICH CUES SURVIVE THE PORT.  The paper had RGBD input and four cues
+    // (Eq. 6): frame difference on colour m_c, the same on depth m_d, tracked
+    // velocity v, and structured depth noise e.  m_d and e need the depth stream
+    // and have no monocular counterpart, so they go.  v (Eq. 4, the change in the
+    // tracked 3D state) was implemented and then removed after measuring it: over
+    // 2682 person-frames from four clips, the people with the LARGEST frame-to-
+    // frame change in regressed camera translation had the most static images
+    // (median m_c of 0.07 for v > 50 mm, against 11.57 for v < 2 mm).  The signal
+    // is monocular depth ambiguity jittering t_z, not motion, so gating on it
+    // regresses the wrong people.  Eq. 6 therefore reduces to
+    //
+    //     m_i = (m_c,i > sensitivity) OR (t_i > 0) OR (r_i >= FOCUS_MAX_RETAIN).
+    //
+    // m_c is also the only cue that stays meaningful under a hard skip: it is
+    // computed from the raw frames, so it keeps reporting whether a person moved
+    // whether or not we regressed them.  A cue derived from the tracker's own
+    // output cannot do that — with B_min = 0 the state stops updating, the cue
+    // freezes, and the person is retained forever.  The paper never hits this
+    // because its B_min is 64 particles x 4 generations, not zero.
+    //
+    // t_i is the paper's timeout: once seen moving, a person stays on the
+    // expensive path for FOCUS_TIMEOUT more frames, so a pause mid-gesture does
+    // not drop them.  Per the paper a t_i that fires on its own only decrements,
+    // it does not re-arm.  r_i is the B_min analogue that bounds staleness: no
+    // one is retained more than FOCUS_MAX_RETAIN frames in a row, whatever the
+    // sensitivity is set to.
+    static constexpr int   FOCUS_TIMEOUT    = 4;     // t_i, frames (paper's value)
+    static constexpr int   FOCUS_MAX_RETAIN = 8;     // r_i cap: forced refresh
+    static constexpr float FOCUS_MATCH_IOU  = 0.3f;  // det <-> track association
+
+    struct FocusTrack
+    {
+        PersonDet det;              // box when we last regressed this person
+        MHRResult result;           // the retained solution
+        int       timeout = 0;      // t_i
+        int       retained = 0;     // r_i, consecutive frames served from cache
+        bool      matched = false;  // scratch, per frame
+    };
+    std::vector<FocusTrack> focus_tracks;
+    cv::Mat                 focus_prev_gray;   // I_{t-1}, for Eq. 3
+    uint64_t                focus_regressed = 0, focus_retained = 0;
+
+    // Eq. 3 on the colour-intensity image: the mean per-pixel absolute difference
+    // inside b between this frame and the last, normalised by the box area N_b.
+    // This is exactly the quantity --focus takes as its sensitivity, in 0-255
+    // units.  Returns "definitely moving" when the box is degenerate or the
+    // previous frame is not comparable, so an unusable cue falls back to
+    // regressing rather than to serving a stale answer.
+    float focus_box_motion(const cv::Mat& gray, const PersonDet& d) const
+    {
+        const float moving = cfg.focus_sensitivity + 1.f;
+        if (focus_prev_gray.empty() ||
+            focus_prev_gray.size() != gray.size()) return moving;
+
+        cv::Rect b(cv::Point((int)std::floor(d.x1), (int)std::floor(d.y1)),
+                   cv::Point((int)std::ceil (d.x2), (int)std::ceil (d.y2)));
+        b &= cv::Rect(0, 0, gray.cols, gray.rows);
+        if (b.width <= 0 || b.height <= 0) return moving;
+
+        return (float)cv::norm(gray(b), focus_prev_gray(b), cv::NORM_L1) /
+               (float)(b.width * b.height);           // N_b normalisation
+    }
+
+    // Partition ctx.dets into the people to regress this frame and the people
+    // whose previous solution we keep.  ctx.dets is rewritten to the former;
+    // `retained` receives (original slot, solution) for the latter, and
+    // `active_slot` maps each surviving det back to its original index so
+    // process_mat can put the frame back together in detection order.
+    void focus_select(FrameContext& ctx,
+                      std::vector<std::pair<int, MHRResult>>& retained,
+                      std::vector<int>& active_slot)
+    {
+        cv::Mat gray;
+        cv::cvtColor(*ctx.bgr, gray, cv::COLOR_BGR2GRAY);
+
+        for (auto& t : focus_tracks) t.matched = false;
+
+        std::vector<PersonDet> active;
+        const int n = (int)ctx.dets.size();
+        for (int i = 0; i < n; ++i)
+        {
+            const PersonDet& d = ctx.dets[i];
+
+            // Associate with the person we were tracking: best IoU against the
+            // boxes we last regressed.  Greedy and per-frame, which is all this
+            // needs — a mis-association costs one wasted regression, never a
+            // wrong answer, because an unmatched detection is always regressed.
+            int   best = -1;
+            float best_iou = FOCUS_MATCH_IOU;
+            for (int k = 0; k < (int)focus_tracks.size(); ++k)
+            {
+                if (focus_tracks[k].matched) continue;
+                float v = iou(d, focus_tracks[k].det);
+                if (v > best_iou) { best_iou = v; best = k; }
+            }
+
+            if (best < 0)                      // new person: no history, no cue
+            {
+                active_slot.push_back(i);
+                active.push_back(d);
+                continue;
+            }
+
+            FocusTrack& tr = focus_tracks[best];
+            tr.matched = true;
+
+            const float m_c   = focus_box_motion(gray, d);
+            const bool  moved = m_c > cfg.focus_sensitivity;
+            const bool  stale = tr.retained >= FOCUS_MAX_RETAIN;
+
+            const char* why = nullptr;
+            if (moved)              { tr.timeout = FOCUS_TIMEOUT; why = "moved";   }
+            else if (stale)         {                             why = "refresh"; }
+            else if (tr.timeout > 0){ --tr.timeout;               why = "timeout"; }
+
+            if (g_diag.debug)
+                printf("[FSB]   focus person %d: m_c=%.2f (sensitivity=%.2f) t_i=%d r_i=%d -> %s\n",
+                       i, m_c, cfg.focus_sensitivity, tr.timeout, tr.retained,
+                       why ? why : "RETAIN");
+
+            if (!why)                          // m_i = 0: keep the answer we have
+            {
+                ++tr.retained;
+                retained.emplace_back(i, tr.result);
+                ++focus_retained;
+                continue;
+            }
+
+            tr.retained = 0;
+            active_slot.push_back(i);
+            active.push_back(d);
+        }
+
+        // Tracks nobody matched this frame have left, or the detector lost them;
+        // drop them so the association above cannot pair a new person with a
+        // stale box.
+        focus_tracks.erase(std::remove_if(focus_tracks.begin(), focus_tracks.end(),
+                                          [](const FocusTrack& t){ return !t.matched; }),
+                           focus_tracks.end());
+
+        focus_prev_gray = std::move(gray);
+        focus_regressed += active.size();
+        ctx.dets = std::move(active);
+    }
+
+    // Fold this frame's fresh solutions into the track table so the next frame
+    // can retain them.  ctx.dets/ctx.results here are the regressed subset, still
+    // index-aligned, because this runs before process_mat merges the retained
+    // people back in.
+    void focus_commit(FrameContext& ctx)
+    {
+        for (size_t j = 0; j < ctx.results.size() && j < ctx.dets.size(); ++j)
+        {
+            const PersonDet& d = ctx.dets[j];
+
+            int   best = -1;
+            float best_iou = FOCUS_MATCH_IOU;
+            for (int k = 0; k < (int)focus_tracks.size(); ++k)
+            {
+                float v = iou(d, focus_tracks[k].det);
+                if (v > best_iou) { best_iou = v; best = k; }
+            }
+            if (best < 0)
+            {
+                focus_tracks.push_back(FocusTrack{});
+                best = (int)focus_tracks.size() - 1;
+            }
+            focus_tracks[best].det    = d;
+            focus_tracks[best].result = ctx.results[j];
+        }
+    }
+
     std::vector<MHRResult> process_mat(const cv::Mat& bgr, int W, int H)
     {
         auto t_total = Clock::now();
@@ -3716,6 +3920,30 @@ struct Pipeline::Impl
         set_camera_intrinsics(ctx);
         if (!detect_people(ctx))
             return {};                       // nobody in frame; nothing to regress
+
+        // --focus: drop the people who have not moved out of this frame's batch
+        // and keep the answer we already have for them (see focus_select).
+        // Without the flag this is skipped entirely and every detection below is
+        // regressed, exactly as before.
+        std::vector<std::pair<int, MHRResult>> retained;
+        std::vector<int>                       active_slot;
+        const int n_detected = (int)ctx.dets.size();
+        if (cfg.focus)
+        {
+            focus_select(ctx, retained, active_slot);
+            if (ctx.dets.empty())
+            {
+                // Nobody moved: the whole frame is answered from the track table
+                // and not one graph runs.  Still counts as a processed frame.
+                add_count(timers.frames, 1);
+                ctx.results.resize(n_detected);
+                for (auto& rt : retained) ctx.results[rt.first] = std::move(rt.second);
+                printf("[FSB] total: %.1f ms  (0 of %d persons regressed)\n",
+                       ms(t_total), n_detected);
+                return std::move(ctx.results);
+            }
+        }
+
         build_person_crops(ctx);
         run_backbone(ctx);
         run_pass1_decoder(ctx);
@@ -3725,7 +3953,25 @@ struct Pipeline::Impl
         assemble_results(ctx);
         run_refined_pass2(ctx);
 
-        printf("[FSB] total: %.1f ms  (%d persons)\n", ms(t_total), ctx.B);
+        if (cfg.focus)
+        {
+            focus_commit(ctx);
+            if (!retained.empty())
+            {
+                // Put the frame back in detection order: the people we regressed
+                // go to the slots focus_select recorded for them, the rest keep
+                // their previous solution.
+                std::vector<MHRResult> merged(n_detected);
+                for (size_t j = 0; j < ctx.results.size() && j < active_slot.size(); ++j)
+                    merged[active_slot[j]] = std::move(ctx.results[j]);
+                for (auto& rt : retained) merged[rt.first] = std::move(rt.second);
+                ctx.results = std::move(merged);
+            }
+            printf("[FSB] total: %.1f ms  (%d of %d persons regressed)\n",
+                   ms(t_total), ctx.B, n_detected);
+        }
+        else
+            printf("[FSB] total: %.1f ms  (%d persons)\n", ms(t_total), ctx.B);
         if (g_diag.debug) printf("[FSB] returning results vector\n");
         return std::move(ctx.results);       // MHRResult carries the meshes; never copy
     }

@@ -794,6 +794,8 @@ int main(int argc, const char** argv) {
         cfg.use_fp16        = fp16;
         cfg.ort_verbose     = cc.ort_verbose;      // --ort-verbose
         cfg.max_persons     = max_persons;
+        cfg.focus           = cc.focus;            // --focus [SENSITIVITY]
+        cfg.focus_sensitivity = cc.focus_sensitivity;
         cfg.pipeline_depth  = pipeline_depth;      // --pipeline N
         cfg.detector        = detector;
         cfg.person_thresh   = cc.person_thresh;   // honour --detector-threshold / per-detector default

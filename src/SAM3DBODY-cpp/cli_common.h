@@ -95,6 +95,8 @@ struct CommonConfig
     float       person_thresh   = 0.50f;
     float       person_nms_iou  = 0.45f;
     int         max_persons     = 0;      // --max-persons N: 0 = unlimited; >0 = top-N by conf
+    bool        focus           = false;  // --focus: regress only the people who moved (F.ECT)
+    float       focus_sensitivity = 2.0f; // --focus [F]: mean |dI| over the box that triggers a regress
     // --detector: bbox provider. "auto" (default) prefers a LibreYOLO model when
     // one is present in onnx_dir (or when --yolo points at a libreyolo/yolov9
     // export), else falls back to yolo-pose. resolve_detector_defaults() turns
@@ -205,6 +207,18 @@ inline bool parse_common_arg(int argc, const char* const* argv, int& i,
     { c.person_thresh = std::stof(argv[++i]); c.thresh_set = true; return true; }
     CLI_FLT ("--nms",                  person_nms_iou)
     CLI_INT ("--max-persons",          max_persons)
+    if (std::strcmp(argv[i], "--focus") == 0)
+    {
+        c.focus = true;
+        if (i + 1 < argc)
+        {
+            char* end = nullptr;
+            float v = std::strtof(argv[i + 1], &end);
+            if (end && *end == '\0' && end != argv[i + 1] && v >= 0.f)
+                { c.focus_sensitivity = v; ++i; }
+        }
+        return true;
+    }
     CLI_STR ("--detector",             detector)
 
     // BVH export
@@ -698,6 +712,8 @@ inline void apply_common_to_pipeline_cfg(const CommonConfig& c,
     pc.person_thresh  = c.person_thresh;
     pc.person_nms_iou = c.person_nms_iou;
     pc.max_persons    = c.max_persons;
+    pc.focus          = c.focus;
+    pc.focus_sensitivity = c.focus_sensitivity;
     pc.detector       = detector_kind_from_string(c.detector);
 }
 
@@ -748,6 +764,16 @@ inline void print_common_args_help(FILE* fp)
         "                                 whose tiny model scores people lower).  Alias: --thresh\n"
         "  --nms      F                   Detector NMS IoU (default 0.45)\n"
         "  --max-persons N                Cap processing to the top-N most-confident people (0 = unlimited)\n"
+        "  --focus [SENSITIVITY]          Spend inference only on the people who are moving; people who\n"
+        "                                 are static keep their previous solution instead of being\n"
+        "                                 regressed again, so a scene where most people hold still costs\n"
+        "                                 a fraction of a full run.  SENSITIVITY (default 2.0) is the\n"
+        "                                 mean per-pixel intensity difference, 0-255, inside a person's\n"
+        "                                 box between consecutive frames, above which that person is\n"
+        "                                 regressed again: raise it to retain more and spend less, lower\n"
+        "                                 it to track finer motion.  Off by default; without the flag\n"
+        "                                 every detection is regressed every frame.  Needs sequential\n"
+        "                                 frames (ignored under --pipeline N > 1).\n"
         "  --bvh      PATH                Write BVH motion-capture file(s); per-person filenames appended\n"
         "  --bvh-template PATH            BVH skeleton template (default ./bvh/body_mhr.bvh,\n"
         "                                 MHR-rest aligned; ./bvh/mocapnet.bvh for MakeHuman,\n"
