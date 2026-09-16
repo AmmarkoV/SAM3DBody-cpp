@@ -158,6 +158,13 @@ add_executable(sam_3dbody_multiview sam_3dbody_multiview.cpp)
 target_link_libraries(sam_3dbody_multiview PRIVATE
     multiview_frontend multiview_sync_io fast_sam_3dbody ${OpenCV_LIBS})
 
+foreach(_target sam_3dbody_multiview aruco_qr_probe sam_3dbody_extrinsics
+        sam_3dbody_synctime sam_3dbody_sync)
+    if(TARGET ${_target})
+        sam3d_stage_runtime(${_target})
+    endif()
+endforeach()
+
 if(MULTIVIEW_HAVE_ARUCO)
     message(STATUS "  multiview: calib + aruco_qr + extrinsics + sync_time + sync_io (libs); tests: calib/extrinsics/sync_time/sync_io; tools: aruco_qr_probe, sam_3dbody_extrinsics, sam_3dbody_synctime, sam_3dbody_sync, sam_3dbody_multiview")
 else()

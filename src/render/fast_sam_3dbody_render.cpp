@@ -29,7 +29,6 @@
 // GLEW must come before any other GL header.
 #include <GL/glew.h>
 #include <GL/gl.h>
-#include <GL/glx.h>
 
 extern "C" {
 #include "../GraphicsEngine/System/glx3.h"
@@ -56,7 +55,13 @@ extern "C" {
 #include <string>
 #include <vector>
 #include <deque>
-#include <time.h>
+#include <chrono>
+#include <thread>
+
+static long long monotonic_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 // ── Inline GLSL shaders ──────────────────────────────────────────────────────
 
@@ -401,7 +406,9 @@ int mat4_transpose(float * mat)
 extern "C" 
 {
     // Called by glx3_checkEvents() on key/mouse events.
-    int handleUserInput(int key, int x, int y) { (void)key; (void)x; (void)y; return 1; }
+    int handleUserInput(int key, int state, int x, int y) {
+        (void)key; (void)state; (void)x; (void)y; return 1;
+    }
     // Called by glx3_checkEvents() when the window is resized.
     int windowSizeUpdated(unsigned int w, unsigned int h) { (void)w; (void)h; return 1; }
 }
@@ -612,7 +619,51 @@ static inline float clamp01(float v) { return v < 0.f ? 0.f : (v > 1.f ? 1.f : v
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 
+static void print_usage(const char* program) {
+    printf("Usage: %s --onnx-dir DIR --gguf FILE --yolo FILE --from SOURCE [options]\n\n",
+           program);
+    printf("Live OpenGL body overlay for a webcam index, image, or video.\n"
+           "Run from the repository root to use the default shaders and BVH templates.\n\n");
+    print_common_args_help(stdout);
+    printf("\nRenderer options:\n"
+           "  -h, --help                   Print help and exit without loading models or opening a camera\n"
+           "  --headless                   Render offscreen (still requires an OpenGL 3.3 driver)\n"
+           "  --title TEXT                 Window title\n"
+           "  --render-size W H            Output surface dimensions (default: input dimensions)\n"
+           "  --render-scale S             Output scale relative to input; --render-size takes priority\n"
+           "  --size W H                   Requested webcam capture resolution\n"
+           "  --fps N                      Requested webcam capture frame rate\n"
+           "  --mjpg                       Request MJPEG capture from the webcam\n"
+           "  --no-drop                    Process every captured frame instead of dropping stale frames\n"
+           "  --mesh PATH                  Mesh topology (default: <onnx-dir>/body_mesh.tri)\n"
+           "  --lbs PATH                   Body model (default: <onnx-dir>/body_model.lbs)\n"
+           "  --vert PATH / --frag PATH    Override the default vertex / fragment shaders\n"
+           "  --color R G B                Mesh color, with channels in 0..255\n"
+           "  --mesh-color R G B           Mesh color, with channels in 0..1\n"
+           "  --transparency F             Mesh transparency, 0 = opaque and 1 = invisible\n"
+           "  --shiny [F]                  Reflective shading (optional strength in 0..1)\n"
+           "  --save-frames PREFIX         Save rendered frames as numbered JPEG images\n"
+           "  --save-depth PREFIX          Save raw float32 depth buffers\n"
+           "  --export-mesh PREFIX         Export per-person, per-frame OBJ meshes\n"
+           "  --export-mesh-stride N        Export an OBJ every N frames (default 1)\n"
+           "  --boxes PATH                 External person boxes, one x1 y1 x2 y2 per line\n"
+           "  --fx F / --fy F              Override camera focal lengths in pixels\n"
+           "  --refined-pose               Enable hand/wrist refinement (requires refinement models)\n"
+           "  --no-pass2                   Skip the second refinement pass\n"
+           "  --butterworth                Smooth body parameters and camera translation\n"
+           "  --butterworth-root-rotation  Smooth the root orientation\n"
+           "  --dev-face                   Enable experimental face parameters\n\n"
+           "Close the window or press Escape to finish and save outputs.\n");
+}
+
 int main(int argc, const char** argv) {
+    // Help must take precedence over model fetching, inference and camera setup.
+    for (int i = 1; i < argc; ++i) {
+        if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
+            print_usage(argv[0]);
+            return 0;
+        }
+    }
     std::string onnx_dir  = "./onnx";
     std::string gguf_path = "./onnx/pipeline.gguf";
     std::string yolo_path = "./onnx/yolo.onnx";
@@ -631,8 +682,8 @@ int main(int argc, const char** argv) {
     int         export_mesh_stride = 1;     // --export-mesh-stride: every Nth frame
     std::string bvh_path           = "";
     std::string bvh_template       = "";
-    // --headless creates a GLX Pbuffer (offscreen surface) instead of a
-    // visible X11 window.  Used by scripts/video.sh in --save mode so the
+    // --headless creates a GLX Pbuffer, or a hidden WGL window on Windows.
+    // Used by scripts/video.sh in --save mode so the
     // long-running render can't be killed by an accidental window close,
     // the screen-saver, or any window-manager interaction with a stale
     // long-lived window.  The GL context is identical either way; only
@@ -919,18 +970,16 @@ int main(int argc, const char** argv) {
         printf("[render] --render-scale %g: %dx%d -> %dx%d\n", render_scale, frame_w, frame_h, W, H);
     }
 
-    // ── GLX surface ───────────────────────────────────────────────────────────
-    // viewWindow=1 → normal visible X11 window
-    // viewWindow=0 → offscreen GLX Pbuffer (no XMapWindow, no event source the
-    //                user can interact with).  Pbuffers were the standard
-    //                pre-EGL way to get offscreen GL on Linux/X11 and the
-    //                fixed-pipeline glReadPixels we use to save frames works
-    //                identically on them.
+    // Visible window, or offscreen GLX Pbuffer / hidden Win32 WGL window.
     if (!window_title.empty()) glx3_set_window_title(window_title.c_str());
     if (!start_glx3_stuff(W, H, headless ? 0 : 1, argc, argv)) {
-        fprintf(stderr, "Failed to start GLX %s\n",
-                headless ? "Pbuffer" : "window"); return 1;
+        fprintf(stderr, "Failed to start OpenGL %s\n",
+                headless ? "offscreen surface" : "window"); return 1;
     }
+    // Also release the native surface on shader/mesh initialization failures.
+    struct GLContextGuard {
+        ~GLContextGuard() { stop_glx3_stuff(); }
+    } context_guard;
     if (headless) printf("[headless] running offscreen — no GUI window\n");
     glewExperimental = GL_TRUE;
     if (glewInit() != GLEW_OK) {
@@ -1075,7 +1124,7 @@ int main(int argc, const char** argv) {
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
     // ── Render loop ───────────────────────────────────────────────────────────
-#define NS_NOW() ({ struct timespec _t; clock_gettime(CLOCK_MONOTONIC,&_t); (long long)_t.tv_sec*1000000000LL + _t.tv_nsec; })
+#define NS_NOW() monotonic_ns()
     long long t_last_frame    = NS_NOW();
     long long t_last_grab     = NS_NOW();   // wall-clock of the last frame we pulled (live sync)
     long long t_session_start = NS_NOW();   // for measuring the effective live frame rate
@@ -1193,10 +1242,7 @@ int main(int argc, const char** argv) {
                     t_next_emit = now;                       // first frame, or lost the beat
                 if (t_next_emit > now)
                 {
-                    struct timespec ts;
-                    ts.tv_sec  = (time_t)((t_next_emit - now) / 1000000000LL);
-                    ts.tv_nsec = (long)  ((t_next_emit - now) % 1000000000LL);
-                    nanosleep(&ts, nullptr);
+                    std::this_thread::sleep_for(std::chrono::nanoseconds(t_next_emit - now));
                     now = NS_NOW();
                 }
                 t_next_emit += period;
@@ -1624,6 +1670,5 @@ int main(int argc, const char** argv) {
     if (bvh_writer.is_open()) bvh_writer.close();
     mhr_lbs_free(lbs);
     tri_freeModel(tri_model);
-    stop_glx3_stuff();
     return 0;
 }

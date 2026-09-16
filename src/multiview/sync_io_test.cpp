@@ -35,7 +35,8 @@ int main()
     b.has_time = true; b.t0_ms = 1769516877724.0; b.fps_eff = 29.9421; b.resid_med_ms = 7.1;
     s.cameras.push_back(b);
 
-    const char* path = "/tmp/sync_io_roundtrip.sync";
+    // CTest runs this in the build directory; /tmp need not exist on Windows.
+    const char* path = "sync_io_roundtrip.sync";
     if (!mv::write_sync(path, s)) { fprintf(stderr,"write_sync failed\n"); return 1; }
 
     mv::SyncSession r;

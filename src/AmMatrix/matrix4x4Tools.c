@@ -79,7 +79,7 @@ enum mat4x4EItem
     12  13  14  15
 */
 
-const float __attribute__((aligned(16))) identityMatrix4x4[16]={1.0,0.0,0.0,0.0,
+AMMATRIX_ALIGN16 const float identityMatrix4x4[16]={1.0,0.0,0.0,0.0,
                                                                 0.0,1.0,0.0,0.0,
                                                                 0.0,0.0,1.0,0.0,
                                                                 0.0,0.0,0.0,1.0};
@@ -1581,7 +1581,7 @@ static inline void multiplyTwo4x4FMatrices_SSE3(float * result ,const float * ma
  __m128 matrixA_r3 = _mm_load_ps(&matrixA[12]);
 
  /* //Instead of _MM_TRANSPOSE4_PS we can transpose the matrixB naively.. kills us @ 0.98% time..
- float __attribute__((aligned(16))) transposedMatrixB[16]={
+ AMMATRIX_ALIGN16 float transposedMatrixB[16]={
       matrixB[0],matrixB[4],matrixB[8] ,matrixB[12],
       matrixB[1],matrixB[5],matrixB[9] ,matrixB[13],
       matrixB[2],matrixB[6],matrixB[10],matrixB[14],

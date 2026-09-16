@@ -608,7 +608,7 @@ int tri_loadModel(const char * filename , struct TRI_Model * triModel)
 
         if (triModel->header.floatSize!=sizeof(float))
              {
-                 fprintf(stderr,"Size of float (%u/%lu) is different , cannot load \n",triModel->header.floatSize,sizeof(float));
+                 fprintf(stderr,"Size of float (%u/%zu) is different , cannot load \n",triModel->header.floatSize,sizeof(float));
                  fclose(fd);
                  return 0;
              }

@@ -4,6 +4,18 @@
 // ============================================================================
 
 #include <stdint.h>
+#include <stddef.h>
+
+#if defined(_WIN32) && defined(FSB_BUILD_DLL)
+#  define FSB_API __declspec(dllexport)
+#elif defined(_WIN32)
+#  define FSB_API __declspec(dllimport)
+#else
+#  define FSB_API
+#endif
+
+// Increment whenever either public struct changes, including appended fields.
+#define FSB_ABI_VERSION 1u
 
 #ifdef __cplusplus
 extern "C" {
@@ -66,8 +78,8 @@ typedef struct {
     //   s/tx/ty → pred_cam_t conversion.  Appended to prev_estimate when the
     //   loaded Python model has an init_camera attribute.
     //
-    // IMPORTANT: these fields are appended at the END of FsbResult so that the
-    // ctypes struct layout for older code is not disturbed.
+    // Appending fields preserves earlier offsets, but changes sizeof(FsbResult)
+    // and array stride. Bindings must match the complete struct before inference.
     float pred_pose_raw[266];  // global_rot_6d[6] + body_cont[260]
     float pred_cam_raw[3];     // raw cam head output before s/tx/ty decode
 
@@ -76,7 +88,7 @@ typedef struct {
     //         [136:204]=scale_out.  Mirrors Python mhr_forward(..., return_model_params=True).
     float mhr_model_params[204];
 
-    // ── Full MHR skeleton (appended at END to preserve older ctypes layouts) ────
+    // ── Full MHR skeleton ─────────────────────────────────────────────────────
     // 127 joint world positions in the same coordinate frame as kps_3d (y,z
     // negated, metres).  Joint names/order are in src/mhr_joint_table.h.  This
     // exposes joints absent from the 70 keypoints — notably root (≈pelvis) and
@@ -86,18 +98,23 @@ typedef struct {
 } FsbResult;
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
-FsbHandle fsb_create(void);
-void      fsb_destroy(FsbHandle h);
+// Call before passing any structs across a foreign-function boundary.
+FSB_API unsigned int fsb_abi_version(void);
+FSB_API size_t fsb_config_size(void);
+FSB_API size_t fsb_result_size(void);
+
+FSB_API FsbHandle fsb_create(void);
+FSB_API void      fsb_destroy(FsbHandle h);
 
 // Returns 1 on success, 0 on failure.
-int fsb_load(FsbHandle h, const FsbConfig* cfg);
+FSB_API int fsb_load(FsbHandle h, const FsbConfig* cfg);
 
 // ── Inference ─────────────────────────────────────────────────────────────────
 // Process a BGR uint8 image.
 // results    : pre-allocated array of FsbResult with at least max_results entries.
 // max_results: capacity of results[].
 // Returns number of persons written (≤ max_results).
-int fsb_process_bgr(FsbHandle        h,
+FSB_API int fsb_process_bgr(FsbHandle        h,
                     const uint8_t*   bgr,
                     int              width,
                     int              height,

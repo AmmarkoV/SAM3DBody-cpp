@@ -10,7 +10,7 @@ at runtime**, you are almost certainly in the right place.
 
 | Component | Version | Notes |
 |-----------|---------|-------|
-| ONNX Runtime | **1.20.1 (GPU build)** | Downloaded automatically by CMake into `build/onnxruntime_dl/` if not found. |
+| ONNX Runtime | **1.20.1 (GPU build)** | Downloaded automatically by CMake into `build/onnxruntime_dl/<full-package-name>/` if not found; for Linux GPU this is `onnxruntime-linux-x64-gpu-1.20.1`. CPU/GPU packages use separate directories. |
 | CUDA | **12.x** | Required by the ORT 1.20.1 CUDA execution provider. |
 | cuDNN | **9.x** | Required by ORT ≥ 1.19. **cuDNN 8 will not work** and is the #1 cause of the CUDA EP failing to load. |
 | NVIDIA driver | Recent enough for CUDA 12 (≥ 525) | Check with `nvidia-smi`. |
@@ -41,7 +41,7 @@ version — virtually always **cuDNN 9** or a CUDA 12 runtime lib.
 nvidia-smi
 
 # 2. THE decisive command — what is the provider .so actually missing?
-ldd build/onnxruntime_dl/lib/libonnxruntime_providers_cuda.so | grep -i "not found"
+ldd build/onnxruntime_dl/onnxruntime-linux-x64-gpu-1.20.1/lib/libonnxruntime_providers_cuda.so | grep -i "not found"
 
 # 3. Is cuDNN 9 / cuBLAS installed and visible to the loader?
 ldconfig -p | grep -i "cudnn\|cublas\|cufft"
@@ -72,7 +72,7 @@ for m in (nvidia.cudnn, nvidia.cublas)))"):$LD_LIBRARY_PATH
 
 ```bash
 # Should now print nothing (no missing libraries):
-ldd build/onnxruntime_dl/lib/libonnxruntime_providers_cuda.so | grep -i "not found"
+ldd build/onnxruntime_dl/onnxruntime-linux-x64-gpu-1.20.1/lib/libonnxruntime_providers_cuda.so | grep -i "not found"
 ```
 
 Re-run `scripts/webcam.sh` — the CUDA EP should load and the pipeline should run
@@ -172,7 +172,7 @@ A system `.deb`/`.tar` TensorRT 10.4 install from developer.nvidia.com/tensorrt
 (then `sudo ldconfig`) works too. Verify the runtime is visible:
 
 ```bash
-ldd build/onnxruntime_dl/lib/libonnxruntime_providers_tensorrt.so | grep -i nvinfer
+ldd build/onnxruntime_dl/onnxruntime-linux-x64-gpu-1.20.1/lib/libonnxruntime_providers_tensorrt.so | grep -i nvinfer
 # every libnvinfer*.so.10 / libnvonnxparser.so.10 line should resolve (no "not found")
 ```
 
