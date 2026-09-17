@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>poseEstimation3D</name>
+  <version>0.0.1</version>
+  <description>
+    ROS 2 node that publishes 3D human skeletons estimated by SAM3DBody-cpp.
+    Drop-in replacement for magician_body_pose_estimation (same topics, message
+    shape and TF frames) with the SAM-3D-Body C++ engine instead of D-PoSE.
+  </description>
+
+  <maintainer email="ammarkov@gmail.com">Ammar Qammaz</maintainer>
+  <author email="ammarkov@gmail.com">Ammar Qammaz</author>
+  <license>MIT</license>
+  <url type="website">http://ammar.gr/</url>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <build_depend>rosidl_default_generators</build_depend>
+  <exec_depend>rosidl_default_runtime</exec_depend>
+  <member_of_group>rosidl_interface_packages</member_of_group>
+
+  <exec_depend>python3</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+
+  <export/>
+</package>

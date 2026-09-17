@@ -28,6 +28,14 @@ typedef struct {
     float principal_y;
     int   zero_face_params;   // 0/1  — force face expression coefficients to zero
     int   detector;           // bbox provider: 0 = YOLO11-pose (default), 1 = LibreYOLO (YOLOv9 bbox)
+    // 0/1 — the CLI binaries' --refined-pose (iterative decoder + wrist-IK splice).
+    // Needs the 'refined' model profile next to the others (the decoder_*.onnx
+    // graphs + pipeline_refined.gguf, `bash tools/fetch_model.sh cuda refined`);
+    // fsb_load() returns 0 when they are missing.  Appended at the END of the
+    // struct, like the two fields above, so older ctypes layouts keep working —
+    // but a caller whose FsbConfig stops short of this field leaves it
+    // uninitialised, so every in-repo frontend declares the full struct.
+    int   refined_pose;
 } FsbConfig;
 
 // ── Per-person result (fixed-size for easy ctypes mapping) ────────────────────

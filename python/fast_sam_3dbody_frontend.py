@@ -44,6 +44,8 @@ class FsbConfig(ctypes.Structure):
         ("principal_x",    ctypes.c_float),
         ("principal_y",    ctypes.c_float),
         ("zero_face_params", ctypes.c_int),  # 0/1 — force face expression to neutral
+        ("detector",         ctypes.c_int),
+        ("refined_pose",     ctypes.c_int),
     ]
 
 class FsbResult(ctypes.Structure):

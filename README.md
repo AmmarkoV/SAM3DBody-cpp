@@ -233,7 +233,8 @@ SAM3DBody-cpp/
     ├── net/                          Networked client/server (sam_3dbody_net) — see knowledge/CLIENTSERVER.md
     ├── multiview/                    Multi-camera calibration, sync and fusion — see knowledge/MULTIVIEW_PLAN.md
     ├── synchronization/              QR timecode display tool (xqr_time_sync)
-    ├── ros1/                         Standalone ROS1 catkin package (poseEstimation3D node)
+    ├── ros1/                         Standalone ROS1 catkin package (poseEstimation3D node, remote server)
+    ├── ros2/                         Standalone ROS2 ament package (poseEstimation3D node, local engine)
     ├── GraphicsEngine/
     │   ├── System/glx3.{h,c}         GLX window management
     │   └── ModelLoader/              .tri mesh loader + LBS joint transform

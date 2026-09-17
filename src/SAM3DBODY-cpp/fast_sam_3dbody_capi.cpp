@@ -45,6 +45,7 @@ extern "C" {
         pc.principal_x      = cfg->principal_x;
         pc.principal_y      = cfg->principal_y;
         pc.zero_face_params = cfg->zero_face_params != 0;
+        pc.refined_pose     = cfg->refined_pose != 0;
 
         return p->load(pc) ? 1 : 0;
     }

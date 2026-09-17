@@ -70,10 +70,10 @@ MHR70_IDX = {n: i for i, n in enumerate(MHR70_NAMES)}
 
 MHR127_IDX = {
     "root":     1,   # ≈ pelvis
-    "c_spine0": 33,
-    "c_spine1": 34,
-    "c_spine2": 35,
-    "c_spine3": 36,
+    "c_spine0": 34,
+    "c_spine1": 35,
+    "c_spine2": 36,
+    "c_spine3": 37,
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -173,6 +173,7 @@ class FsbConfig(ctypes.Structure):
         ("principal_y",      ctypes.c_float),
         ("zero_face_params", ctypes.c_int),
         ("detector",         ctypes.c_int),
+        ("refined_pose",     ctypes.c_int),
     ]
 
 

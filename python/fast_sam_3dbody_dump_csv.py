@@ -124,6 +124,9 @@ class FsbConfig(ctypes.Structure):
         ("focal_y",         ctypes.c_float),
         ("principal_x",     ctypes.c_float),
         ("principal_y",     ctypes.c_float),
+        ("zero_face_params", ctypes.c_int),
+        ("detector",         ctypes.c_int),
+        ("refined_pose",     ctypes.c_int),
     ]
 
 
