@@ -21,6 +21,46 @@
 //   root position, so the .obj and .bvh overlay 1:1 in Blender for armature
 //   verification (import both with default axis settings, no rotation needed).
 //
+// --skin-color accumulates each person's appearance from the video onto the
+//   mesh vertices (see src/SAM3DBODY-cpp/skin_color.h) and draws the mesh with
+//   those colours instead of the uniform --color tint; --export-mesh then
+//   writes them as per-vertex OBJ colours (v x y z r g b).
+// --skin-color-default R G B (0-255, like --color) colours the vertices the
+//   video never shows with R G B instead of filling them in from their seen
+//   neighbours (implies --skin-color).  --skin-color-default arms uses each
+//   person's own skin tone instead: the median observed colour of their
+//   forearms, measured at exit on their rest pose.
+// --skin-color-mirror: a vertex the video never shows takes the colour of its
+//   left/right mirror vertex when that one was seen, before
+//   --skin-color-default or the neighbour fill (implies --skin-color).
+// --skin-hair-cap CM [DEG] paints every vertex within CM centimetres of the
+//   top of the head (measured along pelvis -> head on the person's rest pose)
+//   black, over what was observed; DEG tilts the cut plane that many degrees
+//   about its centre, lower at the back of the head and higher at the front —
+//   a blunt fix for a crown the video only shows as shiny skin (implies
+//   --skin-color).  Applied once at exit, so it reaches --skin-color-save and
+//   --arf, not the live view.
+// --skin-color-save PREFIX writes, at exit, each person's accumulated colours
+//   on their rest-pose mesh as PREFIX_p<person>.obj (implies --skin-color).
+// --skin-match gpu|cpu picks how --skin-color tells people apart between
+//   frames by appearance: a GLSL tiled render-and-diff (default, see
+//   skin_match_gl.h) or the same score per vertex on the CPU.
+// --skin-turntable PREFIX also writes PREFIX<frame>.jpg: every person's live
+//   posed mesh with its accumulated colours, spinning 2 deg per frame, side
+//   by side (implies --skin-color; video.sh encodes it to *_skin_turntable.mp4).
+//   With FSB_SKIN_MATCH_DEBUG=1 and --skin-color on a windowed run the same
+//   view is also shown live in its own window.
+// --arf PATH writes MPEG ARF avatar container(s) (ARF.md); with --skin-color
+//   each person is a skin-colour slot and their container also carries their
+//   accumulated colours (a TextureSet with a COLOR_0 GLB material).
+// --skin-color with --focus replaces --focus's per-person cue (frame difference
+//   over the whole box) with one measured on the person's silhouette: the
+//   retained pose is projected into this frame and the frame it was regressed
+//   on, and the larger of (a) the colour change under its visible vertices and
+//   (b) the growth of its mismatch with the stored colours decides, in the same
+//   0-255 units as the --focus sensitivity.  Background motion inside the box
+//   (a fan, another person) no longer counts, and slow drift adds up against
+//   the keyframe instead of hiding below the threshold frame by frame.
 // --title STR sets the GL window's title (WM_NAME / _NET_WM_NAME), e.g.
 //   --title "Camera 1". Defaults to "SAM3DBody-cpp OpenGL3.x+ Visualization".
 //
@@ -43,12 +83,18 @@ extern "C" {
 #include "../SAM3DBODY-cpp/cli_common.h"      // shared --onnx-dir / --bvh / … parser
 #include "mhr_pose_driver.h"
 
+#include <opencv2/highgui.hpp>     // --skin-color turntable window
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/videoio.hpp>
 
 #include "../SAM3DBODY-cpp/bvh_writer.h"
+#include "../SAM3DBODY-cpp/arf_writer.h"
 #include "../SAM3DBODY-cpp/v4l2_capture.h"
+#include "../SAM3DBODY-cpp/skin_color.h"
+#include "../SAM3DBODY-cpp/mhr_joint_table.h"   // --skin-hair-cap: c_head
+#include "../SAM3DBODY-cpp/skin_match_gl.h"
+#include "../SAM3DBODY-cpp/skin_turntable_gl.h"
 
 #include <cstdio>
 #include <cstdlib>   // getenv (FSB_LBS_DUMP gate)
@@ -529,7 +575,8 @@ static void write_obj_mesh(const std::string& path,
                            const struct TRI_Model* m,
                            const float* cam_t,
                            const float* pelvis_lbs,
-                           float scale)
+                           float scale,
+                           const float* rgb = nullptr)   // optional per-vertex colour, 0-1
 {
     FILE* f = fopen(path.c_str(), "wb");
     if (!f) { fprintf(stderr, "[export] cannot open %s\n", path.c_str()); return; }
@@ -542,11 +589,14 @@ static void write_obj_mesh(const std::string& path,
     const float tz = cam_t ? cam_t[2] * scale : 0.f;
 
     const unsigned int nv = m->header.numberOfVertices;
-    for (unsigned int i = 0; i + 2 < nv; i += 3)
-        fprintf(f, "v %.6f %.6f %.6f\n",
+    for (unsigned int i = 0; i + 2 < nv; i += 3) {
+        fprintf(f, "v %.6f %.6f %.6f",
                  (m->vertices[i]   - px) * scale + tx,
                 -(m->vertices[i+1] - py) * scale + ty,
                 -(m->vertices[i+2] - pz) * scale + tz);
+        if (rgb) fprintf(f, " %.4f %.4f %.4f", rgb[i], rgb[i+1], rgb[i+2]);
+        fputc('\n', f);
+    }
 
     // numberOfIndices is the raw index count (3 per triangle); OBJ is 1-based.
     const unsigned int ni = m->header.numberOfIndices;
@@ -609,6 +659,42 @@ static inline void apply_bw_bank(std::vector<ButterWorthWrap>& bank,
 // reads as an almost invisible flat tint instead of a shaded body. Clamping
 // here keeps every caller in the [0,1] range the shader expects.
 static inline float clamp01(float v) { return v < 0.f ? 0.f : (v > 1.f ? 1.f : v); }
+
+// Per-person LBS model parameters: the pipeline's mhr_model_params with the
+// hand pose and the scale PCA decoded in, ready for mhr_lbs_compute.
+static std::array<float, 204> person_model_params(const struct MHR_LBS_Data* lbs,
+                                                  const fsb::MHRResult&      r)
+{
+    // Decode scale PCA into model_params[136:204] if available.
+    // Python: scales = scale_mean + scale_params @ scale_comps  ([28]→[68])
+    // build_model_params zeros [136:204]; fill them here if lbs has scale data.
+    std::array<float, 204> mp = r.mhr_model_params;
+    // Apply hand pose (v3 lbs file required).  This overrides the zeroed
+    // hand joint slots that build_model_params left in mp with the
+    // PCA-decoded per-finger Euler angles, exactly as Python's
+    // replace_hands_in_pose() does.
+    if (lbs->hand_pose_mean && lbs->hand_pose_comps &&
+        lbs->hand_joint_idxs_left && lbs->hand_joint_idxs_right &&
+        !r.hand_pose.empty())
+    {
+        fsb::apply_hand_pose(mp.data(),
+                              r.hand_pose.data(),
+                              lbs->hand_pose_mean,
+                              lbs->hand_pose_comps,
+                              lbs->hand_joint_idxs_left,
+                              lbs->hand_joint_idxs_right);
+    }
+    if (lbs->scale_mean && lbs->scale_comps && !r.scale.empty()) {
+        int ns = lbs->n_scale_out;  // 68
+        int np = lbs->n_scale_pc;   // 28
+        for (int i = 0; i < ns; ++i)
+            mp[136 + i] = lbs->scale_mean[i];
+        for (int k = 0; k < np && k < (int)r.scale.size(); ++k)
+            for (int i = 0; i < ns; ++i)
+                mp[136 + i] += r.scale[k] * lbs->scale_comps[k * ns + i];
+    }
+    return mp;
+}
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 
@@ -680,6 +766,16 @@ int main(int argc, const char** argv) {
     bool   no_drop    = false; // --no-drop: process every captured frame (lockstep),
                                // disabling the live-source stale-frame skipping
     std::string window_title;  // --title: overrides the GL window's title
+    bool   skin_color = false; // --skin-color: colour the mesh from the video (skin_color.h)
+    std::string skin_color_save; // --skin-color-save: rest-pose coloured OBJ per person at exit
+    bool   skin_default_set = false; // --skin-color-default R G B (0-255): colour of unseen vertices
+    float  skin_default[3] = {0.f, 0.f, 0.f};
+    bool   skin_default_arms = false; // --skin-color-default arms: each person's forearm colour
+    bool   skin_mirror = false;       // --skin-color-mirror: unseen vertices borrow their mirror
+    float  skin_hair_cap_cm = 0.f;   // --skin-hair-cap CM: paint the crown, 0 = off
+    float  skin_hair_cap_deg = 0.f;  // --skin-hair-cap CM DEG: tilt, lower at the back
+    std::string skin_match = "gpu"; // --skin-match gpu|cpu: appearance check between frames
+    std::string skin_turntable_prefix; // --skin-turntable: rotating coloured-mesh frames
 
     // Common flags go through the shared parser; binary-specific flags
     // (--mesh, --lbs, --save-frames, --render-size, --size, --fps, --mjpg,
@@ -701,6 +797,9 @@ int main(int argc, const char** argv) {
         A1("--fy",          focal_y,            std::stof)
         A1("--boxes",       boxes_path,         std::string)
         A1("--title",       window_title,       std::string)
+        A1("--skin-color-save", skin_color_save,  std::string)
+        A1("--skin-match",  skin_match,         std::string)
+        A1("--skin-turntable", skin_turntable_prefix, std::string)
 #undef A1
         if (!strcmp(argv[i], "--export-mesh-stride") && i+1 < argc) {
             export_mesh_stride = std::stoi(argv[++i]);
@@ -715,6 +814,18 @@ int main(int argc, const char** argv) {
         if (!strcmp(argv[i], "--color") && i+3 < argc)
             { mesh_color[0]=clamp01(std::stof(argv[++i])/255.0f); mesh_color[1]=clamp01(std::stof(argv[++i])/255.0f);
               mesh_color[2]=clamp01(std::stof(argv[++i])/255.0f); continue; }
+        if (!strcmp(argv[i], "--skin-color-default") && i+1 < argc && !strcmp(argv[i+1], "arms"))
+            { skin_default_arms = true; ++i; continue; }
+        if (!strcmp(argv[i], "--skin-color-default") && i+3 < argc)
+            { for (int c = 0; c < 3; ++c) skin_default[c] = clamp01(std::stof(argv[++i])/255.0f);
+              skin_default_set = true; continue; }
+        if (!strcmp(argv[i], "--skin-hair-cap") && i+1 < argc) {
+            skin_hair_cap_cm = std::stof(argv[++i]);
+            if (i+1 < argc && (isdigit((unsigned char)argv[i+1][0]) || argv[i+1][0]=='.' ||
+                               (argv[i+1][0]=='-' && isdigit((unsigned char)argv[i+1][1]))))
+                skin_hair_cap_deg = std::stof(argv[++i]);
+            continue;
+        }
         if (!strcmp(argv[i], "--transparency") && i+1 < argc)
             { transparency = 1.0f - std::stof(argv[++i]); continue; }  // value is transparency; uAlpha is opacity
         // --shiny enables the reflective look at a default strength; an optional
@@ -741,6 +852,8 @@ int main(int argc, const char** argv) {
         if (!strcmp(argv[i], "--butterworth-root-rotation")){ filter_root_rot  = true; continue; }
         if (!strcmp(argv[i], "--headless"))                 { headless = true; continue; }
         if (!strcmp(argv[i], "--no-drop"))                  { no_drop = true; continue; }
+        if (!strcmp(argv[i], "--skin-color"))               { skin_color = true; continue; }
+        if (!strcmp(argv[i], "--skin-color-mirror"))        { skin_mirror = true; continue; }
     }
     ensure_models(cc, refined_pose);  // fetch the models if onnx/ is empty
                                       // (incl. the 'refined' profile under
@@ -956,6 +1069,7 @@ int main(int argc, const char** argv) {
     GLint  res_loc   = glGetUniformLocation(prog_mesh, "uResolution");
     GLint  shiny_loc = glGetUniformLocation(prog_mesh, "uShiny");
     GLint  alpha_loc = glGetUniformLocation(prog_mesh, "uAlpha");
+    GLint  vcolor_loc = glGetUniformLocation(prog_mesh, "uVertexColor");
     GLint  tex_loc   = glGetUniformLocation(prog_quad, "uTex");
 
     // ── Load body mesh from .tri ──────────────────────────────────────────────
@@ -979,6 +1093,48 @@ int main(int argc, const char** argv) {
 
     MeshGPU mesh_gpu = upload_mesh_once(tri_model);
 
+    // --skin-color: one accumulator per detection slot, plus a per-vertex
+    // colour stream on attribute 2 of the mesh VAO (default.vert aColor).
+    if (!skin_color_save.empty() || !skin_turntable_prefix.empty() || skin_default_set ||
+        skin_default_arms || skin_hair_cap_cm > 0.f || skin_mirror) skin_color = true;
+    fsb::PersonSlots                       skin_slots;  // tracks who is who
+    fsb::SkinObserver                      skin_observer;
+    fsb::SkinMatchGL                       skin_matcher;
+    fsb::SkinTurntableGL                   skin_turntable;
+    int                                    skin_turntable_idx = 0;
+    bool                                   skin_turntable_window = false;
+    bool                                   skin_match_gpu = false;
+    std::vector<fsb::SkinColorAccumulator> skin_acc;
+    std::vector<std::array<float, 204>>    skin_mp;     // last params per slot,
+    std::vector<std::vector<float>>        skin_shape;  // for the rest-pose export
+    GLuint skin_vbo = 0;
+    if (skin_color) {
+        glBindVertexArray(mesh_gpu.vao);
+        glGenBuffers(1, &skin_vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, skin_vbo);
+        glBufferData(GL_ARRAY_BUFFER, MHR_VERTEX_FLOATS * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
+        glEnableVertexAttribArray(2);
+        glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
+        glBindVertexArray(0);
+        skin_observer.init(tri_model->indices, tri_model->header.numberOfIndices, MHR_VERTEX_COUNT);
+        if (skin_match != "cpu") {
+            skin_match_gpu = skin_matcher.init(tri_model->indices, tri_model->header.numberOfIndices,
+                                               MHR_VERTEX_COUNT);
+            if (!skin_match_gpu)
+                fprintf(stderr, "[skin-color] GPU matcher unavailable, matching on the CPU\n");
+        }
+        printf("[skin-color] accumulating per-vertex appearance from the video (%s matching)\n",
+               skin_match_gpu ? "GPU" : "CPU");
+        skin_turntable_window = !headless && getenv("FSB_SKIN_MATCH_DEBUG");
+        if ((!skin_turntable_prefix.empty() || skin_turntable_window) &&
+            !skin_turntable.init(tri_model->indices, tri_model->header.numberOfIndices,
+                                 MHR_VERTEX_COUNT, W, H)) {
+            fprintf(stderr, "[skin-color] turntable unavailable\n");
+            skin_turntable_prefix.clear();
+            skin_turntable_window = false;
+        }
+    }
+
     if (!export_mesh_prefix.empty())
         printf("[export] writing deformed mesh to %s_p<person>_<frame>.obj "
                "(every %d frame%s, world Y-up cm, pelvis at BVH root — overlay 1:1 in Blender)\n",
@@ -989,6 +1145,53 @@ int main(int argc, const char** argv) {
     if (lbs_path.empty()) lbs_path = onnx_dir + "/body_model.lbs";
     struct MHR_LBS_Data* lbs = mhr_lbs_load(lbs_path.c_str());
     if (!lbs) fprintf(stderr, "Warning: LBS data not loaded — mesh will not deform\n");
+
+    // --skin-color + --focus: judge each retained person's motion on their
+    // silhouette instead of their whole box (see the usage notes at the top).
+    if (skin_color && cc.focus && lbs) {
+        pipeline.set_focus_motion(
+            [&, verts = std::vector<float>(), joints = std::vector<float>(),
+             obs_now = fsb::SkinObservation(), obs_key = fsb::SkinObservation()]
+            (const uint8_t* now_bgr, const uint8_t* key_bgr, int w, int h,
+             const fsb::MHRResult& r) mutable -> float
+        {
+            // Pose the retained solution; the draw loop overwrites tri_model
+            // later, so it is free to use as scratch here.
+            static const float zero_face_focus[72] = {};
+            std::array<float, 204> mp = person_model_params(lbs, r);
+            verts.resize(MHR_VERTEX_FLOATS);
+            joints.resize((size_t)lbs->n_joints * 3);
+            mhr_lbs_compute(lbs, mp.data(), r.shape.data(),
+                            zero_face ? zero_face_focus : r.face_params.data(),
+                            verts.data(), joints.data(), nullptr);
+            mhr_update_mesh_vertices(tri_model, verts.data());
+            mhr_update_mesh_normals(tri_model);
+            if (normal_smooth_iters > 0)
+                mhr_smooth_mesh_normals(tri_model, vert_adj, normal_smooth_scratch, normal_smooth_iters);
+            for (auto [obs, img] : {std::pair{&obs_now, now_bgr}, std::pair{&obs_key, key_bgr}})
+                skin_observer.observe(*obs, img, w, h, verts.data(), tri_model->normal,
+                                      r.pred_cam_t.data(), r.focal_length, w * 0.5f, h * 0.5f);
+
+            // (a) silhouette frame difference against the keyframe.
+            float m = fsb::observation_change(obs_now, obs_key);
+            if (m >= 0.f) m *= 255.f;
+            // (b) mismatch with the stored colours, relative to the keyframe's
+            // own, so each person's fit/lighting baseline cancels.  The stored
+            // person is whoever explains the keyframe best.
+            float best_key = -1.f;
+            size_t best = 0;
+            for (size_t s = 0; s < skin_acc.size(); ++s) {
+                float k = skin_acc[s].discrepancy(obs_key);
+                if (k >= 0.f && (best_key < 0.f || k < best_key)) { best_key = k; best = s; }
+            }
+            if (best_key >= 0.f) {
+                float now = skin_acc[best].discrepancy(obs_now);
+                if (now >= 0.f) m = std::max(m, std::max(0.f, now - best_key) * 255.f);
+            }
+            return m;   // < 0 = neither cue usable: FocusTracker uses the box
+        });
+        printf("[skin-color] --focus measures motion on each person's silhouette\n");
+    }
     if (lbs) {
         std::string corr_path = onnx_dir + "/correctives.bin";
         if (mhr_correctives_load(lbs, corr_path.c_str()))
@@ -1024,6 +1227,17 @@ int main(int argc, const char** argv) {
             bvh_writer.set_static_root(bvh_static_root);
             printf("[BVH] Writing to %s (%.1f fps)\n", bvh_path.c_str(), video_fps);
         }
+    }
+
+    // ── ARF writer (--arf) ────────────────────────────────────────────────────
+    ARFWriter arf_writer;
+    if (!cc.arf_path.empty()) {
+        if (!arf_writer.open(cc.arf_path, lbs_path, mesh_path, 1.f / video_fps, !zero_face))
+            fprintf(stderr, "[ARF] Warning: could not open ARF writer\n");
+        else
+            printf("[ARF] Writing avatar container(s) to %s%s\n", cc.arf_path.c_str(),
+                   skin_color ? " (with skin colours)" : "");
+        arf_writer.set_ground(cc.arf_ground);
     }
 
     // ── Butterworth filter banks ──────────────────────────────────────────────
@@ -1298,10 +1512,72 @@ int main(int argc, const char** argv) {
         // reflection in the shader, so this is a no-op when --shiny is off.
         glUniform1f(shiny_loc, shininess);
         glUniform1f(alpha_loc, transparency);
+        glUniform1f(vcolor_loc, skin_color ? 1.f : 0.f);
         glUniform2f(res_loc, (float)W, (float)H);
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, bg.id);
         glUniform1i(scene_loc, 1);
+
+        // ── --skin-color: pose everyone first, then decide who is who ────────
+        // Matching a detection to a stored person needs every detection's posed
+        // mesh before any of them is accumulated or drawn, so the LBS pass runs
+        // here and the draw loop below reuses its output.
+        std::vector<int>                  skin_slot_of;   // accumulator per detection
+        std::vector<std::vector<float>>   skin_verts, skin_joints;
+        std::vector<fsb::SkinObservation> skin_obs;
+        if (skin_color && lbs) {
+            const size_t D = results.size();
+            skin_verts.resize(D);
+            skin_joints.resize(D);
+            skin_obs.resize(D);
+            std::vector<std::array<float, 16>> mvps(D);
+            std::vector<std::array<float, 4>>  boxes(D);
+            static const float zero_face_pre[72] = {};
+            for (size_t d = 0; d < D; ++d) {
+                const auto& r = results[d];
+                std::array<float, 204> mp = person_model_params(lbs, r);
+                skin_verts[d].resize(MHR_VERTEX_FLOATS);
+                skin_joints[d].resize((size_t)lbs->n_joints * 3);
+                mhr_lbs_compute(lbs, mp.data(), r.shape.data(),
+                                zero_face ? zero_face_pre : r.face_params.data(),
+                                skin_verts[d].data(), skin_joints[d].data(), nullptr);
+                mhr_update_mesh_vertices(tri_model, skin_verts[d].data());
+                mhr_update_mesh_normals(tri_model);
+                if (normal_smooth_iters > 0)
+                    mhr_smooth_mesh_normals(tri_model, vert_adj, normal_smooth_scratch, normal_smooth_iters);
+                skin_observer.observe(skin_obs[d], frame.data, frame.cols, frame.rows,
+                                      skin_verts[d].data(), tri_model->normal,
+                                      r.pred_cam_t.data(), r.focal_length,
+                                      frame.cols * 0.5f, frame.rows * 0.5f);
+                float proj[16], view[16];
+                mhr_camera_matrices(proj, view, r.focal_length, r.pred_cam_t.data(), frame_w, frame_h);
+                mat4_mul(mvps[d].data(), proj, view);
+                boxes[d] = r.bbox;
+            }
+
+            // Appearance discrepancy of every detection vs every stored person.
+            const size_t S = skin_acc.size();
+            std::vector<float> discrepancy;
+            if (D > 0 && S > 0) {
+                if (skin_match_gpu && bg_ok && bg.ready) {
+                    std::vector<const float*> dv(D), sc(S);
+                    for (size_t d = 0; d < D; ++d) dv[d] = skin_verts[d].data();
+                    for (size_t s = 0; s < S; ++s) sc[s] = skin_acc[s].colors_rgba().data();
+                    discrepancy = skin_matcher.score(bg.id, frame_w, frame_h, dv, mvps, boxes, sc);
+                } else {
+                    discrepancy.assign(D * S, -1.f);
+                    for (size_t d = 0; d < D; ++d)
+                        for (size_t s = 0; s < S; ++s)
+                            discrepancy[d * S + s] = skin_acc[s].discrepancy(skin_obs[d]);
+                }
+                if (getenv("FSB_SKIN_MATCH_DEBUG")) {
+                    fprintf(stderr, "\n[skin-match] frame %d:", frame_index);
+                    for (size_t k = 0; k < discrepancy.size(); ++k)
+                        fprintf(stderr, " d%zu/s%zu=%.3f", k / S, k % S, discrepancy[k]);
+                }
+            }
+            skin_slot_of = skin_slots.assign(boxes, discrepancy);
+        }
 
         int person_idx = -1;
         for (const auto& r : results) {
@@ -1313,34 +1589,7 @@ int main(int argc, const char** argv) {
             // R G B (0-1).
             glUniform3fv(color_loc, 1, mesh_color);
 
-            // Decode scale PCA into model_params[136:204] if available.
-            // Python: scales = scale_mean + scale_params @ scale_comps  ([28]→[68])
-            // build_model_params zeros [136:204]; fill them here if lbs has scale data.
-            std::array<float, 204> mp = r.mhr_model_params;
-            // Apply hand pose (v3 lbs file required).  This overrides the zeroed
-            // hand joint slots that build_model_params left in mp with the
-            // PCA-decoded per-finger Euler angles, exactly as Python's
-            // replace_hands_in_pose() does.
-            if (lbs->hand_pose_mean && lbs->hand_pose_comps &&
-                lbs->hand_joint_idxs_left && lbs->hand_joint_idxs_right &&
-                !r.hand_pose.empty())
-            {
-                fsb::apply_hand_pose(mp.data(),
-                                      r.hand_pose.data(),
-                                      lbs->hand_pose_mean,
-                                      lbs->hand_pose_comps,
-                                      lbs->hand_joint_idxs_left,
-                                      lbs->hand_joint_idxs_right);
-            }
-            if (lbs->scale_mean && lbs->scale_comps && !r.scale.empty()) {
-                int ns = lbs->n_scale_out;  // 68
-                int np = lbs->n_scale_pc;   // 28
-                for (int i = 0; i < ns; ++i)
-                    mp[136 + i] = lbs->scale_mean[i];
-                for (int k = 0; k < np && k < (int)r.scale.size(); ++k)
-                    for (int i = 0; i < ns; ++i)
-                        mp[136 + i] += r.scale[k] * lbs->scale_comps[k * ns + i];
-            }
+            std::array<float, 204> mp = person_model_params(lbs, r);
 
             // Run native C LBS forward pass, stream result to GPU.
             // Always compute joint positions (127×3 floats) — negligible overhead
@@ -1349,13 +1598,18 @@ int main(int argc, const char** argv) {
             static const float zero_face_buf[72] = {};
             if (lbs_joints.empty())
                 lbs_joints.assign((size_t)lbs->n_joints * 3, 0.f);
-            mhr_lbs_compute(lbs,
-                            mp.data(),
-                            r.shape.data(),
-                            zero_face ? zero_face_buf : r.face_params.data(),
-                            lbs_out.data(),
-                            lbs_joints.data(),
-                            nullptr);
+            if (!skin_verts.empty()) {   // --skin-color already posed everyone
+                std::copy(skin_verts[person_idx].begin(), skin_verts[person_idx].end(), lbs_out.begin());
+                lbs_joints = skin_joints[person_idx];
+            } else {
+                mhr_lbs_compute(lbs,
+                                mp.data(),
+                                r.shape.data(),
+                                zero_face ? zero_face_buf : r.face_params.data(),
+                                lbs_out.data(),
+                                lbs_joints.data(),
+                                nullptr);
+            }
             // DIAGNOSTIC: override vertices/camera with externally-supplied ground
             // truth (e.g. Python's real pred_vertices/pred_cam_t/focal_length) to
             // isolate whether the C++ OpenGL rendering pipeline itself is at fault
@@ -1392,6 +1646,54 @@ int main(int argc, const char** argv) {
             if (normal_smooth_iters > 0)
                 mhr_smooth_mesh_normals(tri_model, vert_adj, normal_smooth_scratch, normal_smooth_iters);
 
+            // --skin-color: fold this frame's pixels into the person's colours
+            // (the slot follows the person across frames, see PersonSlots).
+            const float* skin_rgb = nullptr;
+            if (skin_color) {
+                const int slot = skin_slot_of[person_idx];
+                if ((int)skin_acc.size() <= slot) {
+                    skin_acc.resize(slot + 1);
+                    skin_mp.resize(slot + 1);
+                    skin_shape.resize(slot + 1);
+                }
+                skin_mp[slot]    = mp;
+                skin_shape[slot] = r.shape;
+                fsb::SkinColorAccumulator& acc = skin_acc[slot];
+                if (!acc.initialized()) {
+                    acc.init(tri_model->indices, tri_model->header.numberOfIndices, MHR_VERTEX_COUNT);
+                    if (skin_default_set) acc.set_default_color(skin_default);
+                    if (skin_mirror && lbs) {
+                        // The MHR template is left/right symmetric about X
+                        // (mean mirror error ~1e-5 m): pair each vertex with
+                        // the nearest vertex to its reflection.  Brute force,
+                        // once per run.
+                        static std::vector<unsigned int> mirror;
+                        if (mirror.empty()) {
+                            const float* b = lbs->base_shape;
+                            const size_t n = (size_t)lbs->n_verts;
+                            double mx = 0.0;
+                            for (size_t v = 0; v < n; ++v) mx += b[v*3];
+                            const float plane2 = (float)(2.0 * mx / (double)n);
+                            mirror.resize(n);
+                            for (size_t v = 0; v < n; ++v) {
+                                const float x = plane2 - b[v*3], y = b[v*3+1], z = b[v*3+2];
+                                float best = 1e30f;
+                                for (size_t u = 0; u < n; ++u) {
+                                    const float dx = b[u*3]-x, dy = b[u*3+1]-y, dz = b[u*3+2]-z;
+                                    const float d2 = dx*dx + dy*dy + dz*dz;
+                                    if (d2 < best) { best = d2; mirror[v] = (unsigned int)u; }
+                                }
+                            }
+                        }
+                        acc.set_mirror(mirror);
+                    }
+                }
+                acc.add(skin_obs[person_idx]);
+                skin_rgb = acc.colors().data();
+                glBindBuffer(GL_ARRAY_BUFFER, skin_vbo);
+                glBufferSubData(GL_ARRAY_BUFFER, 0, MHR_VERTEX_FLOATS * sizeof(float), skin_rgb);
+            }
+
             // Export the deformed mesh (Blender-importable) for offline checking
             // of the BVH armature.  Same space/units the BVH writer uses, so the
             // .obj and the .bvh overlay 1:1.  Frame index matches BVH frame F.
@@ -1404,7 +1706,7 @@ int main(int argc, const char** argv) {
                          export_mesh_prefix.c_str(), person_idx, frame_index);
                 write_obj_mesh(opath, tri_model, r.pred_cam_t.data(),
                                lbs_joints.data() + 3,   // joint[1] = pelvis LBS position
-                               MESH_EXPORT_POS_SCALE);
+                               MESH_EXPORT_POS_SCALE, skin_rgb);
                 // Companion MHR joint-centre dump for centre-to-centre overlay checks.
                 snprintf(opath, sizeof(opath), "%s_p%d_%05d.joints",
                          export_mesh_prefix.c_str(), person_idx, frame_index);
@@ -1538,12 +1840,52 @@ int main(int argc, const char** argv) {
         }
         glBindVertexArray(0);
 
+        // ARF frame output.  With --skin-color the skin slots are the person ids,
+        // so each container's colours belong to the person it animates; slots
+        // absent this frame get a continuation frame, like ARFWriter's own
+        // tracker does.
+        if (arf_writer.is_open()) {
+            if (skin_color && lbs) {
+                std::vector<char> present(skin_acc.size(), 0);
+                for (int s : skin_slot_of) present[s] = 1;
+                std::vector<int> pad;
+                for (size_t s = 0; s < present.size(); ++s) if (!present[s]) pad.push_back((int)s);
+                arf_writer.write_frame_external(results, skin_slot_of, pad);
+            } else {
+                arf_writer.write_frame(results);
+            }
+        }
+
         // Save this frame before buffer swap when --save-frames is active
         if (!save_frames_prefix.empty()) {
             char path[4096];
             snprintf(path, sizeof(path), "%s%05d.jpg",
                      save_frames_prefix.c_str(), ++save_frame_idx);
             save_framebuffer(path, W, H);
+        }
+        // --skin-turntable: the rotating coloured-mesh view, one image per frame
+        // (people absent = empty frame, so it stays in step with the main video),
+        // and/or shown live in its own window under FSB_SKIN_MATCH_DEBUG.
+        if (!skin_turntable_prefix.empty() || skin_turntable_window) {
+            std::vector<const float*> tv, tc;
+            for (size_t d = 0; d < skin_verts.size(); ++d) {
+                tv.push_back(skin_verts[d].data());
+                tc.push_back(skin_acc[skin_slot_of[d]].colors().data());
+            }
+            const std::vector<uint8_t>& px = skin_turntable.render(tv, tc, 2.f * frame_index);
+            cv::Mat img(skin_turntable.height(), skin_turntable.width(), CV_8UC3,
+                        const_cast<uint8_t*>(px.data()));
+            cv::Mat bgr;
+            cv::cvtColor(img, bgr, cv::COLOR_RGB2BGR);
+            if (!skin_turntable_prefix.empty()) {
+                char path[4096];
+                snprintf(path, sizeof(path), "%s%05d.jpg", skin_turntable_prefix.c_str(), ++skin_turntable_idx);
+                cv::imwrite(path, bgr);
+            }
+            if (skin_turntable_window) {
+                cv::imshow("skin-color turntable", bgr);
+                cv::waitKey(1);
+            }
         }
         if (!save_depth_prefix.empty()) {
             char path[4096];
@@ -1621,9 +1963,137 @@ int main(int argc, const char** argv) {
     }
 
     pipeline.print_timing_summary();
+    for (size_t p = 0; p < skin_acc.size(); ++p) {
+        printf("[skin-color] person slot %zu: %.1f%% of vertices observed\n",
+               p, 100.f * skin_acc[p].coverage());
+        // --skin-color-save: the person's colours on their own body shape in
+        // the MHR rest pose (pose params zeroed, scale block [136:204] kept).
+        // --skin-hair-cap and --skin-color-default arms measure on that same
+        // rest pose.
+        if ((skin_color_save.empty() && skin_hair_cap_cm <= 0.f && !skin_default_arms) ||
+            !lbs || skin_shape[p].empty() || lbs_joints.empty()) continue;
+        std::array<float, 204> rest{};
+        std::copy(skin_mp[p].begin() + 136, skin_mp[p].end(), rest.begin() + 136);
+        static const float zero_face_rest[72] = {};
+        mhr_lbs_compute(lbs, rest.data(), skin_shape[p].data(), zero_face_rest,
+                        lbs_out.data(), lbs_joints.data(), nullptr);
+        auto joint_index = [](const char* name) {
+            for (int j = 0; j < mhr_joint_table::N_JOINTS; ++j)
+                if (!strcmp(mhr_joint_table::NAMES[j], name)) return j;
+            return 0;
+        };
+        if (skin_default_arms) {
+            // Observed vertices within 5 cm of either forearm bone, away from
+            // the elbow and wrist ends; their per-channel median is the skin
+            // tone the never-seen vertices take.
+            const std::vector<float>& rgba = skin_acc[p].colors_rgba();
+            std::vector<float> ch[3];
+            const char* bones[2][2] = { {"l_lowarm", "l_wrist"}, {"r_lowarm", "r_wrist"} };
+            for (auto& bone : bones) {
+                const float* a = &lbs_joints[joint_index(bone[0]) * 3];
+                const float* b = &lbs_joints[joint_index(bone[1]) * 3];
+                float ab[3] = { b[0]-a[0], b[1]-a[1], b[2]-a[2] };
+                float ab2 = ab[0]*ab[0] + ab[1]*ab[1] + ab[2]*ab[2];
+                if (ab2 <= 0.f) continue;
+                for (size_t v = 0; v < MHR_VERTEX_COUNT; ++v) {
+                    if (rgba[v*4 + 3] <= 0.f) continue;   // only filled in, never seen
+                    const float* x = &lbs_out[v*3];
+                    float ax[3] = { x[0]-a[0], x[1]-a[1], x[2]-a[2] };
+                    float t = (ax[0]*ab[0] + ax[1]*ab[1] + ax[2]*ab[2]) / ab2;
+                    if (t < 0.2f || t > 0.8f) continue;
+                    float d2 = 0.f;
+                    for (int c = 0; c < 3; ++c) { float d = ax[c] - t*ab[c]; d2 += d*d; }
+                    if (d2 > 0.05f * 0.05f) continue;
+                    for (int c = 0; c < 3; ++c) ch[c].push_back(rgba[v*4 + c]);
+                }
+            }
+            if (ch[0].empty()) {
+                fprintf(stderr, "[skin-color] person slot %zu: forearms never seen, "
+                                "keeping the neighbour fill\n", p);
+            } else {
+                float tone[3];
+                for (int c = 0; c < 3; ++c) {
+                    std::nth_element(ch[c].begin(), ch[c].begin() + ch[c].size()/2, ch[c].end());
+                    tone[c] = ch[c][ch[c].size()/2];
+                }
+                skin_acc[p].set_default_color(tone);
+                printf("[skin-color] person slot %zu: skin tone from %zu forearm vertices: %d %d %d\n",
+                       p, ch[0].size(), (int)(tone[0]*255.f + .5f), (int)(tone[1]*255.f + .5f),
+                       (int)(tone[2]*255.f + .5f));
+            }
+        }
+        if (skin_hair_cap_cm > 0.f) {
+            // "Up" is pelvis (joint 1) -> c_head, so the sign of the LBS
+            // space's flipped Y never matters.
+            const int head = joint_index("c_head");
+            float up[3], len = 0.f;
+            for (int c = 0; c < 3; ++c) {
+                up[c] = lbs_joints[head*3 + c] - lbs_joints[3 + c];
+                len  += up[c] * up[c];
+            }
+            len = std::sqrt(len);
+            for (float& c : up) c /= len;
+            // The untilted cut: CM below the top, measured along up.
+            float top = -1e30f;
+            for (size_t v = 0; v < MHR_VERTEX_COUNT; ++v)
+                top = std::max(top, lbs_out[v*3]*up[0] + lbs_out[v*3+1]*up[1] + lbs_out[v*3+2]*up[2]);
+            // Tilt pivots that plane about the left/right axis through the
+            // middle of the untilted cap (its vertex centroid, moved onto the
+            // plane) -- not c_head, which sits at the back of the skull -- so
+            // the back drops as much as the front rises.  "Forward" is where
+            // the feet point (ankle -> ball of the foot), perpendicular to up.
+            const float cut = top - skin_hair_cap_cm / 100.f;
+            float pivot[3] = {0.f, 0.f, 0.f}, normal[3] = { up[0], up[1], up[2] };
+            size_t n_flat = 0;
+            for (size_t v = 0; v < MHR_VERTEX_COUNT; ++v) {
+                const float* x = &lbs_out[v*3];
+                if (x[0]*up[0] + x[1]*up[1] + x[2]*up[2] <= cut) continue;
+                for (int c = 0; c < 3; ++c) pivot[c] += x[c];
+                ++n_flat;
+            }
+            if (n_flat) {
+                float h = 0.f;
+                for (int c = 0; c < 3; ++c) { pivot[c] /= (float)n_flat; h += pivot[c] * up[c]; }
+                for (int c = 0; c < 3; ++c) pivot[c] += (cut - h) * up[c];
+            }
+            if (skin_hair_cap_deg != 0.f) {
+                const int ankle = joint_index("l_talocrural"), ball = joint_index("l_ball");
+                float fwd[3], d = 0.f, n = 0.f;
+                for (int c = 0; c < 3; ++c) fwd[c] = lbs_joints[ball*3 + c] - lbs_joints[ankle*3 + c];
+                for (int c = 0; c < 3; ++c) d += fwd[c] * up[c];
+                for (int c = 0; c < 3; ++c) { fwd[c] -= d * up[c]; n += fwd[c] * fwd[c]; }
+                n = std::sqrt(n);
+                const float a = skin_hair_cap_deg * 3.14159265f / 180.f;
+                if (n > 0.f)
+                    for (int c = 0; c < 3; ++c) normal[c] = std::cos(a) * up[c] - std::sin(a) * fwd[c] / n;
+            }
+            std::vector<unsigned int> cap;
+            for (size_t v = 0; v < MHR_VERTEX_COUNT; ++v) {
+                float h = 0.f;
+                for (int c = 0; c < 3; ++c) h += (lbs_out[v*3 + c] - pivot[c]) * normal[c];
+                if (h > 0.f) cap.push_back((unsigned int)v);
+            }
+            static const float black[3] = {0.f, 0.f, 0.f};
+            skin_acc[p].set_override(cap, black);
+            printf("[skin-color] person slot %zu: --skin-hair-cap painted %zu vertices within %.1f cm of the crown, "
+                   "tilted %.1f deg\n", p, cap.size(), skin_hair_cap_cm, skin_hair_cap_deg);
+        }
+        if (skin_color_save.empty()) continue;
+        mhr_update_mesh_vertices(tri_model, lbs_out.data());
+        char opath[4096];
+        snprintf(opath, sizeof(opath), "%s_p%zu.obj", skin_color_save.c_str(), p);
+        write_obj_mesh(opath, tri_model, nullptr, lbs_joints.data() + 3,
+                       MESH_EXPORT_POS_SCALE, skin_acc[p].colors().data());
+        printf("[skin-color] wrote %s\n", opath);
+    }
 
     // ── Cleanup ───────────────────────────────────────────────────────────────
     if (bvh_writer.is_open()) bvh_writer.close();
+    if (arf_writer.is_open()) {
+        for (size_t p = 0; p < skin_acc.size(); ++p)
+            arf_writer.set_person_colors((int)p, skin_acc[p].colors());
+        arf_writer.close();
+    }
     mhr_lbs_free(lbs);
     tri_freeModel(tri_model);
     stop_glx3_stuff();

@@ -147,6 +147,7 @@ struct CommonConfig
     // by a per-frame AAU_JOINT (+ AAU_BLENDSHAPE) stream. Independent of
     // --bvh — pass either, neither, or both.
     std::string arf_path;
+    bool        arf_ground = false;   // --ground: level each person's floor at Y = 0 (ARF.md)
 
     // ── Filtering knobs ─────────────────────────────────────────────────────
     // Defaults match the live binaries; the offline binary overrides
@@ -244,6 +245,7 @@ inline bool parse_common_arg(int argc, const char* const* argv, int& i,
 
     // ARF export
     CLI_STR ("--arf",                      arf_path)
+    CLI_BOOL("--ground",                   arf_ground, true)
 
     // Filters
     CLI_FLT ("--bw-cutoff",            bw_cutoff)
@@ -799,6 +801,8 @@ inline void print_common_args_help(FILE* fp)
         "                                 body in place (in-place motion; off by default)\n"
         "  --arf      PATH                Write MPEG ARF avatar container(s) (.arfz); per-person filenames\n"
         "                                 appended, same convention as --bvh (see ARF.md)\n"
+        "  --ground                       With --arf: fit each person's floor from their feet and level it\n"
+        "                                 at Y = 0, undoing the camera's pitch (see ARF.md)\n"
         "  --bw-cutoff HZ                 Butterworth cutoff (default 6 Hz)\n"
         "  --rot-clamp DEG                Geodesic SLERP clamp on global_rot (default 1 deg/frame;\n"
         "                                 offline binary defaults to 30)\n");

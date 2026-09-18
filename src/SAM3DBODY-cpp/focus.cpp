@@ -35,6 +35,7 @@ float FocusTracker::box_motion(const cv::Mat& gray, const PersonDet& d,
 }
 
 void FocusTracker::select(const cv::Mat& bgr, float sensitivity, bool debug,
+                          const FocusMotionFn& motion,
                           std::vector<PersonDet>& dets,
                           std::vector<std::pair<int, MHRResult>>& retained,
                           std::vector<int>& active_slot)
@@ -73,7 +74,12 @@ void FocusTracker::select(const cv::Mat& bgr, float sensitivity, bool debug,
         FocusTrack& tr = tracks_[best];
         tr.matched = true;
 
-        const float m_c   = box_motion(gray, d, sensitivity);
+        float m_c = -1.f;
+        if (motion && !tr.key_bgr.empty() && tr.key_bgr.size() == bgr.size() &&
+            bgr.isContinuous())
+            m_c = motion(bgr.data, tr.key_bgr.data, bgr.cols, bgr.rows, tr.result);
+        const bool from_motion = m_c >= 0.f;
+        if (!from_motion) m_c = box_motion(gray, d, sensitivity);
         const bool  moved = m_c > sensitivity;
         const bool  stale = tr.retained >= FOCUS_MAX_RETAIN;
 
@@ -83,9 +89,11 @@ void FocusTracker::select(const cv::Mat& bgr, float sensitivity, bool debug,
         else if (tr.timeout > 0){ --tr.timeout;               why = "timeout"; }
 
         if (debug)
-            printf("[FSB]   focus person %d: m_c=%.2f (sensitivity=%.2f) t_i=%d r_i=%d -> %s\n",
-                   i, m_c, sensitivity, tr.timeout, tr.retained,
+            printf("[FSB]   focus person %d: m_c=%.2f%s (sensitivity=%.2f) t_i=%d r_i=%d -> %s\n",
+                   i, m_c, from_motion ? " [cue]" : "", sensitivity, tr.timeout, tr.retained,
                    why ? why : "RETAIN");
+        if (debug && from_motion)   // the box cue it replaced, for comparison
+            printf("[FSB]   focus person %d: box m_c=%.2f\n", i, box_motion(gray, d, sensitivity));
 
         if (!why)                          // m_i = 0: keep the answer we have
         {
@@ -113,8 +121,11 @@ void FocusTracker::select(const cv::Mat& bgr, float sensitivity, bool debug,
 }
 
 void FocusTracker::commit(const std::vector<PersonDet>& dets,
-                          const std::vector<MHRResult>& results)
+                          const std::vector<MHRResult>& results,
+                          const cv::Mat& bgr, bool keep_key)
 {
+    // One copy shared by everyone regressed on this frame (cv::Mat refcount).
+    cv::Mat key = keep_key ? bgr.clone() : cv::Mat();
     for (size_t j = 0; j < results.size() && j < dets.size(); ++j)
     {
         const PersonDet& d = dets[j];
@@ -131,8 +142,9 @@ void FocusTracker::commit(const std::vector<PersonDet>& dets,
             tracks_.push_back(FocusTrack{});
             best = (int)tracks_.size() - 1;
         }
-        tracks_[best].det    = d;
-        tracks_[best].result = results[j];
+        tracks_[best].det     = d;
+        tracks_[best].result  = results[j];
+        tracks_[best].key_bgr = key;
     }
 }
 

@@ -1323,6 +1323,7 @@ static void export_range_arf(const std::vector<FrameRecord>& frames,
         return;
     }
     w.set_id_label_prefix(id_prefix);
+    w.set_ground(cfg.arf_ground);
 
     struct TrackState { int first; int last; const std::map<int,int>* fr_to_det; };
     std::map<int, TrackState> ts;

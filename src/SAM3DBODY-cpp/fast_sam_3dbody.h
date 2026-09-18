@@ -15,6 +15,7 @@
 // ============================================================================
 
 #include <array>
+#include <functional>
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -83,6 +84,14 @@ struct MHRResult {
     std::array<float, 8> hand_box{};       // [2][4]: left, right
     std::array<float, 4> hand_box_cls{};   // [2][2] softmax-able logits
 };
+
+// ─── --focus: caller-supplied motion cue (Pipeline::set_focus_motion) ─────────
+// How much a person we could retain has moved: `now_bgr` is this frame, `key_bgr`
+// the frame their retained solution was regressed on (both width x height BGR),
+// `retained` that solution.  Returns mean change in 0-255, the same units as
+// PipelineConfig::focus_sensitivity; < 0 = cannot tell, use the box cue instead.
+using FocusMotionFn = std::function<float(const uint8_t* now_bgr, const uint8_t* key_bgr,
+                                          int width, int height, const MHRResult& retained)>;
 
 // ─── Pipeline configuration ───────────────────────────────────────────────────
 struct PipelineConfig {
@@ -238,6 +247,12 @@ public:
     // robust, semantic scene-cut signal (used by the offline detector).
     // Returns an empty vector if the backbone session isn't available.
     std::vector<float> scene_embedding(const uint8_t* bgr, int width, int height);
+
+    // --focus: replace the per-person cue (mean frame difference over the whole
+    // box, focus.h) with `fn`, e.g. one measured only on the person's silhouette.
+    // The retain/regress rule, timeout and refresh cap stay as they are.  An empty
+    // fn restores the box cue.
+    void set_focus_motion(FocusMotionFn fn);
 
     // True after a successful load().
     bool is_loaded() const;

@@ -97,11 +97,52 @@ Implemented:
 - **`id_map.txt`**: a non-normative `<type>\t<id>\t<name>` debug sidecar,
   mirroring `libarf`'s own convention.
 
+Implemented only with `fast_sam_3dbody_render --skin-color --arf`:
+- **`TextureSet`** carrying the person's accumulated per-vertex colours
+  (`src/SAM3DBODY-cpp/skin_color.h`). `body_mesh.tri` has no UVs, so there is
+  no image to map; instead the material is a GLB (`data/skin_color.glb`,
+  `model/gltf-binary`) of the personalized rest mesh with a standard glTF
+  `COLOR_0` vertex attribute — the "GLB material" case `libarf`'s
+  `materialPath` note allows, so any glTF viewer can open that entry and show
+  the coloured avatar. Linked the way `libarf` expects: `skins[0].textureSet:
+  0`, `lods[0].textureSets: [0]`, `animationInfo: []`, `materialPath: ""`.
+  `libarf`'s reader rejects a `TextureSet` without targets, so its single
+  target names the same data item as the material — this pipeline's own
+  convention. In the renderer, ARF person ids are the skin-colour slots, so
+  `<stem>_<N>.arfz` carries the colours of the same person as
+  `_skin_p<N>.obj`. Verified 2026-09-18: `tools/validate_arf.py` passes and
+  `arfinfo_cpp`/`arfplay --info` load the texture set.
+
+### Grounding (`--ground`, opt-in)
+
+The pose is estimated in the capture camera's frame, so with a pitched camera
+the real floor is a sloped plane in the data, and per-frame depth noise bobs
+the body up and down (a 20 cm depth error is ~7 cm of height when the camera
+looks down). `--ground` fixes both at `ARFWriter::close()`, per person, and
+only ever changes the root joint's matrices (rest mesh, skin, colours and
+every other joint are untouched):
+1. Skin the foot vertices of every frame (globals × inverse bind × rest mesh,
+   as a player does) and take the lowest point per foot.
+2. Fit a trimmed plane through the per-frame lowest points, only along
+   horizontal directions the feet travel ≥ 10 cm (1 std); rotate it level
+   about the middle of the feet's path and put it at Y = 0 (one rigid
+   transform). Tilts > 30° are treated as noise; a person standing in place
+   is only dropped onto the floor.
+3. Per frame: a foot is planted while it moves < 50 cm/s horizontally; in
+   those frames the lower foot is put at Y = 0, other frames interpolate the
+   vertical shift, the shift is smoothed (two ±2-frame box passes) and no
+   frame may leave a foot below the floor.
+
+Measured with libarf on the ARFPlayer samples (lowest posed vertex per frame,
+10th/50th/90th percentile): summerlove −0.3/0.0/+0.4 cm (was ~112 cm below 0
+with a 14 cm spread), zeimpekiko −0.2/0.0/+0.7 cm, sign 0.0/0.0/+0.3 cm.
+It drops the camera-relative placement, which is why it is opt-in.
+
 Not implemented (out of scope for this writer; the spec defines all of
-these, and `libarf` already supports the writer side of the first three if a
+these, and `libarf` already supports the writer side of the first two if a
 real data source ever shows up in this pipeline):
 - `LandmarkSet`/`AAU_LANDMARK` — no landmark tracking in this pipeline.
-- `TextureSet`/`TextureTarget` — no textured-avatar export in this pipeline.
+- Image-texture `TextureSet`s (UV-mapped) — the mesh has no UVs.
 - LoDs beyond one (`structure.assets[].lods` always has exactly one entry).
 - ISOBMFF container, RTP payload streaming, `MPEG_node_avatar` glTF scene
   integration, authentication/biometric features, protection/DRM
@@ -338,6 +379,6 @@ ISO/IEC 23090-39 FDIS-stage text:
 - No ISOBMFF container, RTP streaming, or scene-description integration.
 - Skin weights stay on the sparse encoding rather than the spec's dense
   form — see "Design decisions" above.
-- No `LandmarkSet`/`TextureSet` export — nothing in this pipeline produces
-  landmark or texture data yet; `libarf` already supports reading/writing
-  both if that changes.
+- No `LandmarkSet` export — nothing in this pipeline produces landmark data
+  yet. `TextureSet` is written only for `--skin-color` per-vertex colours
+  (see above), never as a UV-mapped image.

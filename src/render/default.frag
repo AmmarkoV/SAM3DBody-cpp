@@ -1,11 +1,13 @@
 #version 330 core
 in  vec3 vNorm;
 in  vec3 vViewNorm;
+in  vec3 vColor;               // per-vertex colour (--skin-color)
 uniform vec3      uColor;       // mesh tint, 0-1 per channel (--mesh-color / --color)
 uniform sampler2D uScene;       // the background camera image
 uniform vec2      uResolution;  // viewport size, to map gl_FragCoord -> UV
 uniform float     uShiny;       // 0 = matte (original look), 1 = full chrome
 uniform float     uAlpha;       // mesh opacity (0 = invisible, 1 = opaque)
+uniform float     uVertexColor; // 1 = tint with vColor instead of uColor (--skin-color)
 out vec4 fragColor;
 
 void main() {
@@ -26,7 +28,8 @@ void main() {
     float d = clamp((ndotl + wrap) / (1.0 + wrap), 0.0, 1.0);
     d = d * d * (3.0 - 2.0 * d);   // smoothstep ease, kills the remaining clamp kinks
     d = d * 0.65 + 0.35;           // same overall range as the old 0.3..1.0 ramp
-    vec3  base = uColor * d;
+    vec3  tint = mix(uColor, vColor, uVertexColor);
+    vec3  base = tint * d;
 
     // ── Screen-space pseudo-reflection ("Silicon Dreams" chrome) ─────────────
     // Sample the scene behind the mesh, displaced by the view-space normal so
@@ -46,7 +49,7 @@ void main() {
     // Tint the reflection with uColor too (colored metal, not a plain
     // mirror) so --color stays visible at every --shiny level instead of
     // fading out to a neutral reflection as k -> 1.
-    vec3 col = mix(base, refl * uColor, k);
+    vec3 col = mix(base, refl * tint, k);
 
     // Cheap ordered dither (one hash, a couple ALU ops) to break up the
     // 8-bit quantization bands that a smooth shading gradient otherwise

@@ -62,6 +62,18 @@ public:
     // shared by the --bvh-split-scenes path for ARF output (ARF.md).
     void set_id_label_prefix(const std::string& p) { id_prefix_ = p; }
 
+    // Per-vertex colours (RGB 0-1, one per rest-mesh vertex) for person `id`,
+    // e.g. fast_sam_3dbody_render --skin-color's accumulated appearance.  Call
+    // before close(); that person's container then carries a TextureSet whose
+    // material is a GLB of the rest mesh with a glTF COLOR_0 attribute (ARF.md).
+    void set_person_colors(int id, const std::vector<float>& rgb) { colors_[id] = rgb; }
+
+    // --ground: at close(), fit each person's floor from their lowest foot
+    // point per frame and move the root so that floor is level at Y = 0,
+    // undoing the capture camera's pitch (ARF.md "Grounding").  Opt-in: it
+    // drops the camera-relative placement.
+    void set_ground(bool on) { ground_ = on; }
+
     void close();
     bool is_open() const { return lbs_ != nullptr; }
 
@@ -106,16 +118,19 @@ private:
     mhr_fk::State     fk_;
     float             frame_time_     = 1.0f / 30.0f;
     bool              export_face_    = false;
+    bool              ground_         = false;   // set_ground
     int               session_frames_ = 0;
 
     std::vector<Track>                 tracks_;
     int                                 next_track_id_ = 0;
     std::unordered_map<int, PerPerson>  people_;
+    std::unordered_map<int, std::vector<float>> colors_;   // set_person_colors
 
     std::vector<int> assign_tracks(const std::vector<fsb::MHRResult>& results);
     static float bbox_iou(const float a[4], const float b[4]);
 
     void append_frame_for(PerPerson& p, const fsb::MHRResult& r);
     void pad_continuation_frame(PerPerson& p);
-    bool dump_one_person(const PerPerson& p);
+    bool dump_one_person(PerPerson& p);
+    void ground_person(PerPerson& p, const std::vector<float>& rest_verts);
 };

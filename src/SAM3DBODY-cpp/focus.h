@@ -73,7 +73,11 @@ public:
     // `retained` receives (original slot, solution) for the latter, and
     // `active_slot` maps each surviving det back to its original index so
     // process_mat can put the frame back together in detection order.
+    // `motion`, when set, replaces box_motion() as the per-person cue
+    // (Pipeline::set_focus_motion), measured against the frame each person was
+    // last regressed on.
     void select(const cv::Mat& bgr, float sensitivity, bool debug,
+                const FocusMotionFn& motion,
                 std::vector<PersonDet>& dets,
                 std::vector<std::pair<int, MHRResult>>& retained,
                 std::vector<int>& active_slot);
@@ -82,8 +86,11 @@ public:
     // can retain them.  dets/results here are the regressed subset, still
     // index-aligned, because this runs before process_mat merges the retained
     // people back in.
+    // `keep_key` (a motion cue is set) also stores bgr as those people's
+    // keyframe.
     void commit(const std::vector<PersonDet>& dets,
-                const std::vector<MHRResult>& results);
+                const std::vector<MHRResult>& results,
+                const cv::Mat& bgr, bool keep_key);
 
 private:
     static constexpr int   FOCUS_TIMEOUT    = 4;     // t_i, frames (paper's value)
@@ -94,6 +101,7 @@ private:
     {
         PersonDet det;              // box when we last regressed this person
         MHRResult result;           // the retained solution
+        cv::Mat   key_bgr;          // frame `result` was regressed on (motion cue only)
         int       timeout = 0;      // t_i
         int       retained = 0;     // r_i, consecutive frames served from cache
         bool      matched = false;  // scratch, per frame

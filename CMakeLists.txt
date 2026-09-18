@@ -308,6 +308,7 @@ add_library(fast_sam_3dbody SHARED
     src/SAM3DBODY-cpp/arf_json.cpp
     src/SAM3DBODY-cpp/arf_writer.cpp
     src/SAM3DBODY-cpp/offline_passes.cpp
+    src/SAM3DBODY-cpp/skin_color.cpp
     ${GRAPHICS_ENGINE_DIR}/ModelLoader/model_loader_tri.c
     ${GRAPHICS_ENGINE_DIR}/ModelLoader/model_loader_transform_joints.c
     # MotionCaptureLoader (BVH I/O) ------------------------------------------------
@@ -418,6 +419,8 @@ if(NOT WIN32)
     add_executable(fast_sam_3dbody_render
         src/render/fast_sam_3dbody_render.cpp
         src/SAM3DBODY-cpp/v4l2_capture.cpp
+        src/SAM3DBODY-cpp/skin_match_gl.cpp
+        src/SAM3DBODY-cpp/skin_turntable_gl.cpp
         ${GRAPHICS_ENGINE_DIR}/System/glx3.c
         ${GRAPHICS_ENGINE_DIR}/ModelLoader/model_loader_tri.c
         ${GRAPHICS_ENGINE_DIR}/ModelLoader/model_loader_transform_joints.c

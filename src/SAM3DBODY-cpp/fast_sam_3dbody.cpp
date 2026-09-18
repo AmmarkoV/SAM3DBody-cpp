@@ -3737,6 +3737,7 @@ struct Pipeline::Impl
     // --focus state; the method and its citation are in focus.h
     FocusTracker   focus_tracker;     // per person: regress only who moved
     FocusFrameGate focus_gate;        // per frame: skip the detector when nothing moved
+    FocusMotionFn  focus_motion;      // optional per-person cue (set_focus_motion)
 
     std::vector<MHRResult> process_mat(const cv::Mat& bgr, int W, int H)
     {
@@ -3762,7 +3763,7 @@ struct Pipeline::Impl
         if (cfg.focus)
         {
             focus_tracker.select(*ctx.bgr, cfg.focus_sensitivity, g_diag.debug,
-                                 ctx.dets, retained, active_slot);
+                                 focus_motion, ctx.dets, retained, active_slot);
             if (ctx.dets.empty())
             {
                 // Nobody moved: the whole frame is answered from the track table
@@ -3787,7 +3788,7 @@ struct Pipeline::Impl
 
         if (cfg.focus)
         {
-            focus_tracker.commit(ctx.dets, ctx.results);
+            focus_tracker.commit(ctx.dets, ctx.results, *ctx.bgr, (bool)focus_motion);
             if (!retained.empty())
             {
                 // Put the frame back in detection order: the people we regressed
@@ -3984,6 +3985,11 @@ const uint8_t* Pipeline::last_result_bgr(int& w, int& h) const
     h = impl_->pipe_last.frame.rows;
     return impl_->pipe_last.frame.data;
 }
+void Pipeline::set_focus_motion(FocusMotionFn fn)
+{
+    if (impl_) impl_->focus_motion = std::move(fn);
+}
+
 void Pipeline::print_timing_summary() const
 {
     if (impl_) impl_->print_timing_summary();

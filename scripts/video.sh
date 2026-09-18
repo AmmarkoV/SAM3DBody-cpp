@@ -108,7 +108,22 @@ FRAME_PREFIX="${TMPFRAMES}/colorFrame_0_"
 # regression: the renderer was killed before reaching the end and the
 # encode silently used the truncated frame set.
 HEADLESS_ARG=("--headless")
-"$BIN" --from "$FROM_SRC" "${FIXED_FLAGS[@]}" "${FORWARD_ARGS[@]}" "${HEADLESS_ARG[@]}" --save-frames "$FRAME_PREFIX"
+# --skin-color: also keep the accumulated per-vertex colours next to the mp4,
+# as <output>_skin_p<person>.obj (rest-pose mesh with v x y z r g b).
+# With FSB_SKIN_MATCH_DEBUG=1 it also renders a rotating view of the coloured
+# meshes, encoded below to <output>_skin_turntable.mp4.
+SKIN_ARGS=()
+TURN_PREFIX=""
+for a in "${FORWARD_ARGS[@]}"; do
+    if [ "$a" = "--skin-color" ]; then
+        SKIN_ARGS=(--skin-color-save "${SAVE_OUTPUT%.*}_skin")
+        if [ "$FSB_SKIN_MATCH_DEBUG" = "1" ]; then
+            TURN_PREFIX="${TMPFRAMES}/turntable_"
+            SKIN_ARGS+=(--skin-turntable "$TURN_PREFIX")
+        fi
+    fi
+done
+"$BIN" --from "$FROM_SRC" "${FIXED_FLAGS[@]}" "${FORWARD_ARGS[@]}" "${HEADLESS_ARG[@]}" "${SKIN_ARGS[@]}" --save-frames "$FRAME_PREFIX"
 RENDER_EXIT=$?
 
 # ── Validate the rendered frame count ─────────────────────────────────────────
@@ -199,8 +214,15 @@ ffmpeg -framerate "$FPS" \
        "$SAVE_OUTPUT"
 FFMPEG_EXIT=$?
 
+if [ -n "$TURN_PREFIX" ] && ls "${TURN_PREFIX}"*.jpg >/dev/null 2>&1; then
+    TURN_OUTPUT="${SAVE_OUTPUT%.*}_skin_turntable.mp4"
+    echo "Encoding skin-colour turntable: $TURN_OUTPUT"
+    ffmpeg -framerate "$FPS" -i "${TURN_PREFIX}%05d.jpg" "${SIZE_ARG[@]}" \
+           -y -r "$FPS" -pix_fmt yuv420p -threads 8 "$TURN_OUTPUT"
+fi
+
 # ── Clean up JPEG frames ──────────────────────────────────────────────────────
-rm -f "${TMPFRAMES}"/colorFrame_0_*.jpg
+rm -f "${TMPFRAMES}"/colorFrame_0_*.jpg "${TMPFRAMES}"/turntable_*.jpg
 rmdir "$TMPFRAMES"
 
 exit $FFMPEG_EXIT

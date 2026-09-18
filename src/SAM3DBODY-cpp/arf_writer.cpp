@@ -191,12 +191,16 @@ inline void flt(std::string& s, float v)
 // One GLB per blendshape target: `positions` holds that shape's *absolute*
 // deformed vertex positions (base mesh + delta — see the BlendshapeSet.shapes
 // note in ARF.md), `indices` is the same topology as the base mesh.
+// `colors` (RGB 0-1 per vertex) adds a glTF COLOR_0 attribute — used for the
+// --skin-color TextureSet material, never for blendshapes.
 Bytes build_glb_mesh(const std::vector<float>& positions, uint32_t n_verts,
-                     const std::vector<uint32_t>& indices, uint32_t n_tris)
+                     const std::vector<uint32_t>& indices, uint32_t n_tris,
+                     const std::vector<float>* colors = nullptr)
 {
     using namespace glb;
     const size_t positions_bytes = (size_t)n_verts * 3 * sizeof(float);
     const size_t indices_bytes   = (size_t)n_tris * 3 * sizeof(uint32_t);
+    const size_t colors_bytes    = colors ? (size_t)n_verts * 3 * sizeof(float) : 0;
 
     float mn[3] = {  1e30f,  1e30f,  1e30f };
     float mx[3] = { -1e30f, -1e30f, -1e30f };
@@ -211,7 +215,7 @@ Bytes build_glb_mesh(const std::vector<float>& positions, uint32_t n_verts,
     std::string json;
     text(json, "{\"asset\":{\"version\":\"2.0\"},");
     text(json, "\"buffers\":[{\"byteLength\":");
-    num(json, (unsigned long long)(positions_bytes + indices_bytes));
+    num(json, (unsigned long long)(positions_bytes + indices_bytes + colors_bytes));
     text(json, "}],");
     text(json, "\"bufferViews\":[");
     text(json, "{\"buffer\":0,\"byteOffset\":0,\"byteLength\":");
@@ -221,7 +225,16 @@ Bytes build_glb_mesh(const std::vector<float>& positions, uint32_t n_verts,
     num(json, (unsigned long long)positions_bytes);
     text(json, ",\"byteLength\":");
     num(json, (unsigned long long)indices_bytes);
-    text(json, ",\"target\":"); num(json, TARGET_INDEX); text(json, "}],");
+    text(json, ",\"target\":"); num(json, TARGET_INDEX); text(json, "}");
+    if (colors)
+    {
+        text(json, ",{\"buffer\":0,\"byteOffset\":");
+        num(json, (unsigned long long)(positions_bytes + indices_bytes));
+        text(json, ",\"byteLength\":");
+        num(json, (unsigned long long)colors_bytes);
+        text(json, ",\"target\":"); num(json, TARGET_ARRAY); text(json, "}");
+    }
+    text(json, "],");
     text(json, "\"accessors\":[");
     text(json, "{\"bufferView\":0,\"componentType\":"); num(json, GLTF_FLOAT);
     text(json, ",\"count\":"); num(json, n_verts);
@@ -232,16 +245,25 @@ Bytes build_glb_mesh(const std::vector<float>& positions, uint32_t n_verts,
     text(json, "]},");
     text(json, "{\"bufferView\":1,\"componentType\":"); num(json, GLTF_UNSIGNED_INT);
     text(json, ",\"count\":"); num(json, (unsigned long long)n_tris * 3);
-    text(json, ",\"type\":\"SCALAR\"}],");
-    text(json, "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0},\"indices\":1,\"mode\":4}]}]}");
+    text(json, ",\"type\":\"SCALAR\"}");
+    if (colors)
+    {
+        text(json, ",{\"bufferView\":2,\"componentType\":"); num(json, GLTF_FLOAT);
+        text(json, ",\"count\":"); num(json, n_verts);
+        text(json, ",\"type\":\"VEC3\"}");
+    }
+    text(json, "],");
+    text(json, colors ? "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0,\"COLOR_0\":2},\"indices\":1,\"mode\":4}]}]}"
+                      : "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0},\"indices\":1,\"mode\":4}]}]}");
 
     while (json.size() % 4 != 0) json.push_back(' ');   // pad JSON chunk to 4 bytes
 
     Bytes bin;
-    bin.reserve(positions_bytes + indices_bytes);
+    bin.reserve(positions_bytes + indices_bytes + colors_bytes);
     put_bytes(bin, positions.data(), positions_bytes);
     put_bytes(bin, indices.data(), indices_bytes);
-    // No padding needed: both source arrays are already multiples of 4 bytes.
+    if (colors) put_bytes(bin, colors->data(), colors_bytes);
+    // No padding needed: every source array is already a multiple of 4 bytes.
 
     const uint32_t total_length = (uint32_t)(12 + 8 + json.size() + 8 + bin.size());
 
@@ -616,7 +638,287 @@ void ARFWriter::write_frame(const std::vector<fsb::MHRResult>& results)
 
 // ─── close-time: bake mesh, build arf.json, assemble the .arfz ────────────
 
-bool ARFWriter::dump_one_person(const PerPerson& p)
+// Row-major 4x4: out = a * b.
+inline void mul4(const float* a, const float* b, float* out)
+{
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+            out[r*4+c] = a[r*4]*b[c] + a[r*4+1]*b[4+c] + a[r*4+2]*b[8+c] + a[r*4+3]*b[12+c];
+}
+
+// --ground.  The pose is estimated in the capture camera's frame, so with a
+// pitched camera the real floor is a sloped plane in the data and the feet
+// sink or float as the person moves in depth.  Per frame, skin just the foot
+// vertices exactly as a player would (globals * inverse bind * rest mesh) and
+// take the lowest one; fit a plane through those points; then rotate/shift
+// the root so that plane is Y = 0.  That rigid transform removes the camera
+// pitch; per-frame depth noise still bobs the body up and down (a 20 cm depth
+// error is ~7 cm of height for a camera looking down), so a second pass then
+// shifts the root vertically per frame to put the planted foot on the floor.
+// Only the root's matrices change.
+//   * Tilt is fitted only along horizontal directions the feet travel at
+//     least GROUND_MIN_TRAVEL_CM (1 std); elsewhere it is unmeasurable, and
+//     a person standing in place is only dropped onto the floor.
+//   * Frames with a foot in the air are trimmed: GROUND_ITERS rounds, each
+//     keeping the GROUND_KEEP lowest residuals.
+//   * A fitted tilt above GROUND_MAX_TILT_DEG is taken as noise and ignored.
+//   * A foot is planted while its lowest point moves slower than
+//     GROUND_PLANT_CMS horizontally (centred over +-GROUND_SPEED_HALF
+//     frames); in a frame with a planted foot the lower foot (a sliding
+//     step can be lower than the planted one) is put at Y = 0; frames with no
+//     planted foot interpolate the shift between their neighbours, but
+//     never so far that a foot ends up below the floor.
+void ARFWriter::ground_person(PerPerson& p, const std::vector<float>& rest_verts)
+{
+    static constexpr float GROUND_MIN_TRAVEL_CM = 10.f;
+    static constexpr float GROUND_KEEP          = 0.7f;
+    static constexpr int   GROUND_ITERS         = 5;
+    static constexpr float GROUND_MAX_TILT_DEG  = 30.f;
+    static constexpr float GROUND_PLANT_CMS     = 50.f;
+    static constexpr int   GROUND_SPEED_HALF    = 2;
+    static constexpr int   GROUND_SMOOTH_HALF   = 2;
+
+    const int nj = lbs_->n_joints, nv = lbs_->n_verts, nf = p.frame_count;
+    for (int j = 0; j < nj; ++j)
+        if (lbs_->joint_parents[j] >= j)
+        {
+            fprintf(stderr, "[ARFWriter] --ground: joint %d is listed before its parent, skipped\n", j);
+            return;
+        }
+
+    // Foot vertices: at least half their skin weight on a foot joint.
+    std::vector<char> is_foot(nj, 0);
+    for (int j = 0; j < nj && j < mhr_joint_table::N_JOINTS; ++j)
+    {
+        const char* n = mhr_joint_table::NAMES[j];
+        if ((n[0] == 'l' || n[0] == 'r') && n[1] == '_' &&
+            (strstr(n, "foot") || strstr(n, "talocrural") || strstr(n, "subtalar") ||
+             strstr(n, "transversetarsal") || strstr(n, "ball")))
+            is_foot[j] = 1;
+    }
+    std::vector<float> foot_w(nv, 0.f), side_best(nv, 0.f);
+    std::vector<char>  side(nv, 0);   // 0 = left, 1 = right: heaviest foot joint
+    for (int i = 0; i < lbs_->n_skin; ++i)
+    {
+        const int j = lbs_->skin_joint_idx[i], v = lbs_->skin_vert_idx[i];
+        if (!is_foot[j]) continue;
+        foot_w[v] += lbs_->skin_weights[i];
+        if (lbs_->skin_weights[i] > side_best[v])
+            { side_best[v] = lbs_->skin_weights[i]; side[v] = mhr_joint_table::NAMES[j][0] == 'r'; }
+    }
+    std::vector<int> slot(nv, -1), feet;
+    for (int v = 0; v < nv; ++v)
+        if (foot_w[v] >= 0.5f) { slot[v] = (int)feet.size(); feet.push_back(v); }
+    if (feet.empty()) { fprintf(stderr, "[ARFWriter] --ground: no foot vertices, skipped\n"); return; }
+    std::vector<std::vector<std::pair<int, float>>> infl(feet.size());
+    for (int i = 0; i < lbs_->n_skin; ++i)
+    {
+        const int s = slot[lbs_->skin_vert_idx[i]];
+        if (s >= 0) infl[s].push_back({ lbs_->skin_joint_idx[i], lbs_->skin_weights[i] });
+    }
+
+    std::vector<float> ibm((size_t)nj * 16);
+    for (int j = 0; j < nj; ++j)
+    {
+        const float* ib = lbs_->inv_bind_pose + (size_t)j * 8;
+        compose_trs_mat4(ib, ib + 3, ib[7], &ibm[(size_t)j*16]);
+    }
+
+    // Lowest skinned foot point per frame (cm, Y up), overall and per foot.
+    std::vector<std::array<float, 3>> low(nf), foot_low[2];
+    foot_low[0].resize(nf); foot_low[1].resize(nf);
+    std::vector<float> glob((size_t)nj * 16), skin((size_t)nj * 16);
+    for (int f = 0; f < nf; ++f)
+    {
+        const float* L = &p.joint_mats[(size_t)f * nj * 16];
+        for (int j = 0; j < nj; ++j)
+        {
+            const int par = lbs_->joint_parents[j];
+            if (par < 0) std::copy(L + j*16, L + j*16 + 16, &glob[(size_t)j*16]);
+            else         mul4(&glob[(size_t)par*16], L + j*16, &glob[(size_t)j*16]);
+            mul4(&glob[(size_t)j*16], &ibm[(size_t)j*16], &skin[(size_t)j*16]);
+        }
+        low[f] = { 0.f, 1e30f, 0.f };
+        foot_low[0][f] = foot_low[1][f] = { 0.f, 1e30f, 0.f };
+        for (size_t k = 0; k < feet.size(); ++k)
+        {
+            const float* v = &rest_verts[(size_t)feet[k] * 3];
+            float x[3] = { 0.f, 0.f, 0.f };
+            for (const auto& jw : infl[k])
+            {
+                const float* S = &skin[(size_t)jw.first * 16];
+                for (int c = 0; c < 3; ++c)
+                    x[c] += jw.second * (S[c*4]*v[0] + S[c*4+1]*v[1] + S[c*4+2]*v[2] + S[c*4+3]);
+            }
+            if (x[1] < low[f][1]) low[f] = { x[0], x[1], x[2] };
+            auto& fl = foot_low[(int)side[feet[k]]][f];
+            if (x[1] < fl[1]) fl = { x[0], x[1], x[2] };
+        }
+    }
+
+    // Robust fit of y = c + g . (xz - m) over the frames with a foot down.
+    std::vector<char> use(nf, 1);
+    float mx = 0.f, mz = 0.f, c0 = 0.f, gx = 0.f, gz = 0.f;
+    int   n_axes = 0;
+    std::vector<float> res(nf);
+    for (int it = 0; it <= GROUND_ITERS; ++it)
+    {
+        double sx = 0, sz = 0, sy = 0; int n = 0;
+        for (int f = 0; f < nf; ++f) if (use[f]) { sx += low[f][0]; sz += low[f][2]; sy += low[f][1]; ++n; }
+        mx = (float)(sx / n); mz = (float)(sz / n); c0 = (float)(sy / n);
+        double cxx = 0, cxz = 0, czz = 0;
+        for (int f = 0; f < nf; ++f) if (use[f])
+        {
+            const double dx = low[f][0] - mx, dz = low[f][2] - mz;
+            cxx += dx*dx; cxz += dx*dz; czz += dz*dz;
+        }
+        cxx /= n; cxz /= n; czz /= n;
+        // Principal horizontal axes of the feet's travel (2x2 symmetric eigen).
+        const double tr = cxx + czz, det = cxx*czz - cxz*cxz;
+        const double disc = std::sqrt(std::max(0.0, tr*tr/4 - det));
+        const double lam[2] = { tr/2 + disc, tr/2 - disc };
+        gx = gz = 0.f; n_axes = 0;
+        for (int a = 0; a < 2; ++a)
+        {
+            if (std::sqrt(std::max(0.0, lam[a])) < GROUND_MIN_TRAVEL_CM) continue;
+            double ex = cxz, ez = lam[a] - cxx;            // (A - lam I) e = 0
+            if (std::fabs(ex) + std::fabs(ez) < 1e-9) { ex = (cxx >= czz) == (a == 0); ez = !ex; }
+            const double en = std::sqrt(ex*ex + ez*ez); ex /= en; ez /= en;
+            double suy = 0, suu = 0;
+            for (int f = 0; f < nf; ++f) if (use[f])
+            {
+                const double u = (low[f][0] - mx) * ex + (low[f][2] - mz) * ez;
+                suy += u * (low[f][1] - c0); suu += u * u;
+            }
+            const double slope = suy / suu;
+            gx += (float)(slope * ex); gz += (float)(slope * ez);
+            ++n_axes;
+        }
+        for (int f = 0; f < nf; ++f)
+            res[f] = low[f][1] - (c0 + gx * (low[f][0] - mx) + gz * (low[f][2] - mz));
+        if (it == GROUND_ITERS) break;
+        std::vector<float> sorted(res);
+        const size_t k = (size_t)(GROUND_KEEP * (nf - 1));
+        std::nth_element(sorted.begin(), sorted.begin() + k, sorted.end());
+        for (int f = 0; f < nf; ++f) use[f] = res[f] <= sorted[k];
+    }
+
+    // Plane normal; rotate it onto +Y about the middle of the feet's path.
+    float nrm[3] = { -gx, 1.f, -gz };
+    const float nl = std::sqrt(nrm[0]*nrm[0] + 1.f + nrm[2]*nrm[2]);
+    for (float& c : nrm) c /= nl;
+    float tilt = std::acos(std::min(1.f, nrm[1])) * 180.f / 3.14159265f;
+    const bool skip_tilt = tilt > GROUND_MAX_TILT_DEG;
+    float R[9] = { 1,0,0, 0,1,0, 0,0,1 };
+    if (!skip_tilt && tilt > 0.f)
+    {
+        // Rodrigues: axis = n x Y = (-n.z, 0, n.x), cos = n.y.
+        float ax = -nrm[2], az = nrm[0];
+        const float s = std::sqrt(ax*ax + az*az), c = nrm[1];
+        ax /= s; az /= s;
+        const float t = 1.f - c;
+        R[0] = t*ax*ax + c; R[1] = -s*az;  R[2] = t*ax*az;
+        R[3] = s*az;        R[4] = c;      R[5] = -s*ax;
+        R[6] = t*ax*az;     R[7] = s*ax;   R[8] = t*az*az + c;
+    }
+    // v' = R (v - q) + (mx, 0, mz), q = the plane point above the path's middle.
+    const float q[3] = { mx, c0, mz };
+    float G[16] = { R[0], R[1], R[2], 0.f,  R[3], R[4], R[5], 0.f,
+                    R[6], R[7], R[8], 0.f,  0.f,  0.f,  0.f,  1.f };
+    const float shift[3] = { mx, 0.f, mz };
+    for (int r = 0; r < 3; ++r)
+        G[r*4+3] = shift[r] - (R[r*3]*q[0] + R[r*3+1]*q[1] + R[r*3+2]*q[2]);
+    if (skip_tilt)   // level floor only: drop onto the median contact height
+    {
+        std::vector<float> ys; for (int f = 0; f < nf; ++f) if (use[f]) ys.push_back(low[f][1]);
+        G[7] = -median_of(ys);
+    }
+
+    for (int f = 0; f < nf; ++f)
+        for (int j = 0; j < nj; ++j)
+            if (lbs_->joint_parents[j] < 0)
+            {
+                float* M = &p.joint_mats[((size_t)f * nj + j) * 16];
+                float out[16]; mul4(G, M, out);
+                std::copy(out, out + 16, M);
+            }
+
+    // ── Per frame: the planted foot onto the floor ─────────────────────────
+    // The feet in the grounded space: p' = G p.
+    for (auto& fl : foot_low)
+        for (auto& x : fl)
+        {
+            const std::array<float, 3> o = x;
+            for (int r = 0; r < 3; ++r)
+                x[r] = G[r*4]*o[0] + G[r*4+1]*o[1] + G[r*4+2]*o[2] + G[r*4+3];
+        }
+    std::vector<float> dy(nf, 0.f);
+    std::vector<char>  planted(nf, 0);
+    const float fps = 1.f / frame_time_;
+    for (int f = 0; f < nf; ++f)
+    {
+        const int f0 = std::max(0, f - GROUND_SPEED_HALF), f1 = std::min(nf - 1, f + GROUND_SPEED_HALF);
+        for (const auto& fl : foot_low)
+        {
+            const float dx = fl[f1][0] - fl[f0][0], dz = fl[f1][2] - fl[f0][2];
+            const float speed = f1 > f0 ? std::sqrt(dx*dx + dz*dz) * fps / (float)(f1 - f0) : 0.f;
+            if (speed < GROUND_PLANT_CMS) planted[f] = 1;
+        }
+        // The lower foot, planted or sliding, is the one on the floor.
+        if (planted[f]) dy[f] = -std::min(foot_low[0][f][1], foot_low[1][f][1]);
+    }
+    int n_planted = 0, prev = -1;
+    for (int f = 0; f < nf; ++f)
+    {
+        if (!planted[f]) continue;
+        ++n_planted;
+        if (prev < 0)            for (int g = 0; g < f; ++g) dy[g] = dy[f];   // hold at the start
+        else for (int g = prev + 1; g < f; ++g)
+            dy[g] = dy[prev] + (dy[f] - dy[prev]) * (float)(g - prev) / (float)(f - prev);
+        prev = f;
+    }
+    if (prev < 0) std::fill(dy.begin(), dy.end(), 0.f);         // never planted: rigid only
+    else for (int g = prev + 1; g < nf; ++g) dy[g] = dy[prev];  // hold at the end
+    // Snapping to each frame's foot height and switching between snapped and
+    // interpolated frames makes the pelvis jerk; two passes of a centred box
+    // (+-GROUND_SMOOTH_HALF frames, ~triangular) take that out.  Then no
+    // frame may push a foot below Y = 0 (smoothing, or a fast-moving foot
+    // that still brushes the floor in a dance step).
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        const std::vector<float> in(dy);
+        for (int f = 0; f < nf; ++f)
+        {
+            const int a = std::max(0, f - GROUND_SMOOTH_HALF), b = std::min(nf - 1, f + GROUND_SMOOTH_HALF);
+            float sum = 0.f;
+            for (int g = a; g <= b; ++g) sum += in[g];
+            dy[f] = sum / (float)(b - a + 1);
+        }
+    }
+    for (int f = 0; f < nf; ++f)
+        dy[f] = std::max(dy[f], -std::min(foot_low[0][f][1], foot_low[1][f][1]));
+
+    for (int f = 0; f < nf; ++f)
+        for (int j = 0; j < nj; ++j)
+            if (lbs_->joint_parents[j] < 0) p.joint_mats[((size_t)f * nj + j) * 16 + 7] += dy[f];
+
+    std::vector<float> shifts(dy.begin(), dy.end());
+    for (float& v : shifts) v = std::fabs(v);
+    std::sort(shifts.begin(), shifts.end());
+    const float p90 = shifts[(size_t)(0.9f * (nf - 1))];
+    if (skip_tilt)
+        printf("[ARFWriter] person %d: --ground fitted a %.1f deg floor, implausible, levelled only\n", p.id, tilt);
+    else if (n_axes == 0)
+        printf("[ARFWriter] person %d: --ground: feet travel under %.0f cm, floor tilt unmeasurable, "
+               "dropped onto the floor only\n", p.id, GROUND_MIN_TRAVEL_CM);
+    else
+        printf("[ARFWriter] person %d: --ground floor tilted %.1f deg (%s)\n", p.id, tilt,
+               n_axes == 2 ? "both axes" : "along the feet's travel");
+    printf("[ARFWriter] person %d: --ground planted a foot in %d of %d frames; per-frame height fix "
+           "under %.1f cm in 90%% of frames\n", p.id, n_planted, nf, p90);
+}
+
+bool ARFWriter::dump_one_person(PerPerson& p)
 {
     if (p.frame_count == 0) return true;   // nothing tracked long enough to write
 
@@ -656,6 +958,8 @@ bool ARFWriter::dump_one_person(const PerPerson& p)
             rest_offset[j] = { m[0], m[1], m[2] };
         }
     }
+
+    if (ground_) ground_person(p, verts);
 
     // ── Binary data items ───────────────────────────────────────────────────
     // data[].id is a running count assigned in this fixed order: mesh_positions=0,
@@ -718,6 +1022,18 @@ bool ARFWriter::dump_one_person(const PerPerson& p)
         items.push_back({ 4 + s, name, path, "model/gltf-binary",
             build_glb_mesh(shape_pos, (uint32_t)nv, idx, n_tris) });
     }
+
+    // TextureSet (--skin-color): the mesh has no UVs, so the appearance travels
+    // as a GLB of this rest mesh with per-vertex COLOR_0 — the "GLB material"
+    // case libarf's materialPath note allows.  libarf rejects a TextureSet
+    // without targets, so its one target names the same item (ARF.md).
+    const auto colors_it = colors_.find(p.id);
+    const bool has_colors = colors_it != colors_.end() &&
+                            colors_it->second.size() == (size_t)nv * 3;
+    const int  texture_id = 4 + n_face_shapes;
+    if (has_colors)
+        items.push_back({ texture_id, "skin_color", "data/skin_color.glb", "model/gltf-binary",
+            build_glb_mesh(verts, (uint32_t)nv, idx, n_tris, &colors_it->second) });
 
     // ── Animation streams ───────────────────────────────────────────────────
     // joint_set_id/blendshape_set_id are the declared ids of skeletons[0]/
@@ -782,6 +1098,7 @@ bool ARFWriter::dump_one_person(const PerPerson& p)
     skin.set("skeleton", 0);
     skin.set("mesh", 0);
     skin.set("weights", 2);   // data[] id
+    if (has_colors) skin.set("textureSet", 0);   // the TextureSet's only link
 
     Value mesh = Value::object();
     mesh.set("id", 0);
@@ -806,6 +1123,23 @@ bool ARFWriter::dump_one_person(const PerPerson& p)
         bs.set("baseMesh", 0);
         bs.set("shapes", shapes);
         components.set("blendshapeSets", Value::array().push_back(bs));
+    }
+
+    if (has_colors)
+    {
+        Value target = Value::object();
+        target.set("id", 0);
+        target.set("name", "skin_color");
+        target.set("texture", texture_id);
+        target.set("texturePath", "");
+        Value ts = Value::object();
+        ts.set("id", 0);
+        ts.set("name", "skin_color");
+        ts.set("animationInfo", Value::array());
+        ts.set("material", texture_id);
+        ts.set("materialPath", "");
+        ts.set("targets", Value::array().push_back(target));
+        components.set("textureSets", Value::array().push_back(ts));
     }
 
     Value preamble = Value::object();
@@ -838,6 +1172,7 @@ bool ARFWriter::dump_one_person(const PerPerson& p)
     lod.set("meshes", Value::array().push_back(0));
     lod.set("skeletons", Value::array().push_back(0));
     if (export_face_) lod.set("blendshapeSets", Value::array().push_back(0));
+    if (has_colors)   lod.set("textureSets", Value::array().push_back(0));
 
     Value asset = Value::object();
     asset.set("name", "body");
@@ -873,6 +1208,7 @@ bool ARFWriter::dump_one_person(const PerPerson& p)
     id_map += "skin\t0\tskin0\n";
     id_map += "skeleton\t0\tskeleton0\n";
     if (export_face_) id_map += "blendshapeSet\t0\tface_expression\n";
+    if (has_colors)   id_map += "textureSet\t0\tskin_color\n";
 
     // ── Assemble the .arfz ZIP container ────────────────────────────────────
     const std::string out_file = per_person_path(out_path_, id_prefix_, p.id);
@@ -912,11 +1248,12 @@ bool ARFWriter::dump_one_person(const PerPerson& p)
 void ARFWriter::close()
 {
     if (!lbs_) return;
-    for (const auto& kv : people_) dump_one_person(kv.second);
+    for (auto& kv : people_) dump_one_person(kv.second);
 
     mhr_lbs_free(lbs_);
     lbs_ = nullptr;
     if (mesh_) { tri_freeModel(mesh_); mesh_ = nullptr; }
     tracks_.clear();
     people_.clear();
+    colors_.clear();
 }

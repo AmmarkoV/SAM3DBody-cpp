@@ -692,6 +692,7 @@ int main(int argc, char** argv)
         else
         {
             printf("[main] Writing ARF avatar container(s) to: %s\n", c.arf_path.c_str());
+            arf_writer.set_ground(c.arf_ground);
         }
     }
 
