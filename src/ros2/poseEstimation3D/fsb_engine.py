@@ -16,7 +16,7 @@ import numpy as np
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ctypes structs  (must match src/SAM3DBODY-cpp/fast_sam_3dbody_capi.h exactly)
+# ctypes structs  (must match src/core/fast_sam_3dbody_capi.h exactly)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class FsbConfig(ctypes.Structure):
@@ -78,7 +78,7 @@ class FsbResult(ctypes.Structure):
 #     the full 127-joint MHR skeleton (FsbResult.skel_3d).
 #
 # Indices below are from python/fast_sam_3dbody_dump_csv.py (MHR70) and
-# src/SAM3DBODY-cpp/mhr_joint_table.h (MHR127, verified against its PARENTS
+# src/core/mhr_joint_table.h (MHR127, verified against its PARENTS
 # table: root(1) -> c_spine0(34) -> c_spine1(35) -> c_spine2(36) -> c_spine3(37)
 # -> c_neck(110) -> c_head(113)).
 # ──────────────────────────────────────────────────────────────────────────────

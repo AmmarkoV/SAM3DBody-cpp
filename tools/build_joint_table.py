@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Extract MHR joint names from the JIT body model and emit a C++ header.
 
-Output: src/SAM3DBODY-cpp/mhr_joint_table.h  (compiled in via bvh_writer.cpp).
+Output: src/core/mhr_joint_table.h  (compiled in via bvh_writer.cpp).
 
 The names come from `character_torch.skeleton.joint_names` inside mhr_model.pt.
 They never change between checkpoints (the body skeleton is fixed), so we bake

@@ -68,9 +68,9 @@
 // live in src/offline_passes.{h,cpp} so the multi-view tool can reuse them
 // (PLAN.md §6 / MULTIVIEW_PLAN.md).  This file is just CLI + orchestration.
 
-#include "../SAM3DBODY-cpp/offline_passes.h"
-#include "../SAM3DBODY-cpp/fast_sam_3dbody.h"
-#include "../SAM3DBODY-cpp/cli_common.h"
+#include "../core/offline_passes.h"
+#include "../core/fast_sam_3dbody.h"
+#include "../core/cli_common.h"
 
 #include <algorithm>
 #include <cctype>

@@ -9,7 +9,7 @@ skin weights, a personalized rest mesh, and (optionally) facial blendshapes —
 not just an animated skeleton, packaged with its own animation stream so the
 whole thing is self-contained and loadable independently of this pipeline.
 
-Implemented by `src/SAM3DBODY-cpp/arf_writer.{h,cpp}`
+Implemented by `src/core/arf_writer.{h,cpp}`
 (+ `arf_json.{h,cpp}` for JSON serialization, `mhr_fk.{h,cpp}` for the shared
 forward-kinematics core also used by `BVHWriter`). Wired into the offline
 binary as Pass 7 (`offline::export_to_arf`, `offline_passes.cpp`) and into
@@ -80,7 +80,7 @@ Implemented:
   `structure.assets[].lods[]`, and `components` with `nodes` (all 127 MHR
   joints), one `skeletons` entry, one `skins` entry, one `meshes` entry, and
   (when face export is on) one `blendshapeSets` entry.
-- **Skeleton**: all 127 MHR joints (`src/SAM3DBODY-cpp/mhr_joint_table.h`),
+- **Skeleton**: all 127 MHR joints (`src/core/mhr_joint_table.h`),
   parent/child hierarchy, rest local translation + rotation per joint.
 - **Skin**: sparse per-vertex joint weights (`MHR_LBS_Data::skin_*`) +
   inverse bind matrices.
@@ -99,7 +99,7 @@ Implemented:
 
 Implemented only with `fast_sam_3dbody_render --skin-color --arf`:
 - **`TextureSet`** carrying the person's accumulated per-vertex colours
-  (`src/SAM3DBODY-cpp/skin_color.h`). `body_mesh.tri` has no UVs, so there is
+  (`src/core/skin_color.h`). `body_mesh.tri` has no UVs, so there is
   no image to map; instead the material is a GLB (`data/skin_color.glb`,
   `model/gltf-binary`) of the personalized rest mesh with a standard glTF
   `COLOR_0` vertex attribute — the "GLB material" case `libarf`'s
@@ -344,7 +344,7 @@ always 0.
                    the live and offline binaries).
 ```
 
-`--arf` is parsed in `src/SAM3DBODY-cpp/cli_common.h` (shared by every
+`--arf` is parsed in `src/core/cli_common.h` (shared by every
 binary that includes it) next to `--bvh`. It's independent of `--bvh` — pass
 either, neither, or both; `--from` plus at least one of `--bvh`/`--arf` is
 required by the offline binary.

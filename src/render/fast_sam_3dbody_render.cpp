@@ -22,7 +22,7 @@
 //   verification (import both with default axis settings, no rotation needed).
 //
 // --skin-color accumulates each person's appearance from the video onto the
-//   mesh vertices (see src/SAM3DBODY-cpp/skin_color.h) and draws the mesh with
+//   mesh vertices (see src/core/skin_color.h) and draws the mesh with
 //   those colours instead of the uniform --color tint; --export-mesh then
 //   writes them as per-vertex OBJ colours (v x y z r g b).
 // --skin-color-default R G B (0-255, like --color) colours the vertices the
@@ -77,10 +77,10 @@ extern "C" {
 #include "../GraphicsEngine/ModelLoader/model_loader_transform_joints.h"
 }
 
-#include "../SAM3DBODY-cpp/fast_sam_3dbody.h"
-#include "../SAM3DBODY-cpp/preprocess.hpp"   // for fsb::apply_hand_pose
-#include "../SAM3DBODY-cpp/outputFiltering.h" // for QuatLPF + euler_zyx_to_quat helpers
-#include "../SAM3DBODY-cpp/cli_common.h"      // shared --onnx-dir / --bvh / … parser
+#include "../core/fast_sam_3dbody.h"
+#include "../core/preprocess.hpp"   // for fsb::apply_hand_pose
+#include "../core/outputFiltering.h" // for QuatLPF + euler_zyx_to_quat helpers
+#include "../core/cli_common.h"      // shared --onnx-dir / --bvh / … parser
 #include "mhr_pose_driver.h"
 
 #include <opencv2/highgui.hpp>     // --skin-color turntable window
@@ -88,13 +88,13 @@ extern "C" {
 #include <opencv2/imgproc.hpp>
 #include <opencv2/videoio.hpp>
 
-#include "../SAM3DBODY-cpp/bvh_writer.h"
-#include "../SAM3DBODY-cpp/arf_writer.h"
-#include "../SAM3DBODY-cpp/v4l2_capture.h"
-#include "../SAM3DBODY-cpp/skin_color.h"
-#include "../SAM3DBODY-cpp/mhr_joint_table.h"   // --skin-hair-cap: c_head
-#include "../SAM3DBODY-cpp/skin_match_gl.h"
-#include "../SAM3DBODY-cpp/skin_turntable_gl.h"
+#include "../core/bvh_writer.h"
+#include "../core/arf_writer.h"
+#include "../core/v4l2_capture.h"
+#include "../core/skin_color.h"
+#include "../core/mhr_joint_table.h"   // --skin-hair-cap: c_head
+#include "../core/skin_match_gl.h"
+#include "../core/skin_turntable_gl.h"
 
 #include <cstdio>
 #include <cstdlib>   // getenv (FSB_LBS_DUMP gate)

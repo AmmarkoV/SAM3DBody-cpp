@@ -216,7 +216,7 @@ SAM3DBody-cpp/
 ├── scripts/
 │   └── build.sh / setup.sh / webcam.sh / video.sh / offline_video.sh
 └── src/                              All C/C++ sources live here
-    ├── SAM3DBODY-cpp/                The core pipeline library + CLI
+    ├── core/                         The core pipeline library + CLI
     │   ├── fast_sam_3dbody.h         C++ public API
     │   ├── fast_sam_3dbody.cpp       Pipeline implementation
     │   ├── fast_sam_3dbody_capi.h    Plain C API (for ctypes)
@@ -625,7 +625,7 @@ reasons rooted in the geometry of rotations:
 
 So instead, when `--butterworth-root-rotation` is on, `global_rot` is filtered
 in **quaternion space** by a 1st-order SLERP-EMA (`QuatLPF` in
-`src/SAM3DBODY-cpp/outputFiltering.h`):
+`src/core/outputFiltering.h`):
 
   1. Convert the input Euler triple to a unit quaternion.
   2. **Hemisphere-correct** — if `dot(q_filt_prev, q_input) < 0`, negate
@@ -666,7 +666,7 @@ measured value rather than zero.
 
 ### Implementation
 
-Implemented in `src/SAM3DBODY-cpp/outputFiltering.h` — a header-only, dependency-free,
+Implemented in `src/core/outputFiltering.h` — a header-only, dependency-free,
 C-compatible file containing two primitives:
 
 - `ButterWorth` — scalar 2nd-order IIR low-pass used for `keypoints_3d`,
@@ -719,7 +719,7 @@ For each detected person, every frame:
   and orientation from MHR's global rotation, in the BVH root's
   `Zrotation Yrotation Xrotation` channel order.
 * **Body joints** matched by name to MHR (~50 joints incl. spine, arms, legs,
-  fingers — full table in `src/SAM3DBODY-cpp/bvh_writer.cpp` `NAME_MAP`). The local rotation
+  fingers — full table in `src/core/bvh_writer.cpp` `NAME_MAP`). The local rotation
   is computed in MHR's frame as `inv(delta[parent]) · delta[self]`, where
   `delta[j] = R_global_mhr[j] · R_global_mhr_rest[j]⁻¹`, then decomposed to the
   joint's BVH channel order (`Zrotation Xrotation Yrotation`).
@@ -791,7 +791,7 @@ The MHR body model uses 127 named joints (`body_world`, `root`, `l_uparm`,
 from the JIT model:
 
 ```bash
-# (Re)generate src/SAM3DBODY-cpp/mhr_joint_table.h from a checkpoint
+# (Re)generate src/core/mhr_joint_table.h from a checkpoint
 source venv/bin/activate
 python3 tools/build_joint_table.py
 # pass MHR_MODEL_PT=/path/to/mhr_model.pt to override the default location

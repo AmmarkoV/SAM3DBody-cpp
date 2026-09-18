@@ -20,13 +20,13 @@ else()
     set(RT_LIB   rt)
 endif()
 
-# RobustCapture (src/SAM3DBODY-cpp/v4l2_capture.cpp) uses raw V4L2 (linux/videodev2.h) to
+# RobustCapture (src/core/v4l2_capture.cpp) uses raw V4L2 (linux/videodev2.h) to
 # re-grab webcam frames the kernel flags as incomplete/corrupt, instead of
 # handing back the torn image cv::VideoCapture's V4L2 backend would return.
 # That header only exists on Linux, so probe for it explicitly rather than
 # just relying on the outer NOT WIN32 guard (BSD/macOS are NOT WIN32 either
 # but have no V4L2). When it's missing, FSB_HAVE_V4L2 is left undefined and
-# src/SAM3DBODY-cpp/v4l2_capture.cpp compiles to a thin pass-through to cv::VideoCapture —
+# src/core/v4l2_capture.cpp compiles to a thin pass-through to cv::VideoCapture —
 # same public API, old behavior.
 include(CheckIncludeFileCXX)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -165,7 +165,7 @@ set(GGML_OPENMP         OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(ggml)
 
 # ---------------------------------------------------------------------------
-# miniz  (single-file ZIP read/write; used by ARFWriter, src/SAM3DBODY-cpp/
+# miniz  (single-file ZIP read/write; used by ARFWriter, src/core/
 # arf_writer.cpp, to assemble the .arfz MPEG ARF container — see ARF.md)
 # ---------------------------------------------------------------------------
 FetchContent_Declare(
@@ -299,16 +299,16 @@ set(MOCAP_DIR ${GRAPHICS_ENGINE_DIR}/MotionCaptureLoader)
 set(TRAJ_DIR  ${GRAPHICS_ENGINE_DIR}/TrajectoryParser)
 
 add_library(fast_sam_3dbody SHARED
-    src/SAM3DBODY-cpp/fast_sam_3dbody.cpp
-    src/SAM3DBODY-cpp/focus.cpp
-    src/SAM3DBODY-cpp/fast_sam_3dbody_capi.cpp
-    src/SAM3DBODY-cpp/mhr_fk.cpp
-    src/SAM3DBODY-cpp/bvh_writer.cpp
-    src/SAM3DBODY-cpp/bvh_shm.cpp
-    src/SAM3DBODY-cpp/arf_json.cpp
-    src/SAM3DBODY-cpp/arf_writer.cpp
-    src/SAM3DBODY-cpp/offline_passes.cpp
-    src/SAM3DBODY-cpp/skin_color.cpp
+    src/core/fast_sam_3dbody.cpp
+    src/core/focus.cpp
+    src/core/fast_sam_3dbody_capi.cpp
+    src/core/mhr_fk.cpp
+    src/core/bvh_writer.cpp
+    src/core/bvh_shm.cpp
+    src/core/arf_json.cpp
+    src/core/arf_writer.cpp
+    src/core/offline_passes.cpp
+    src/core/skin_color.cpp
     ${GRAPHICS_ENGINE_DIR}/ModelLoader/model_loader_tri.c
     ${GRAPHICS_ENGINE_DIR}/ModelLoader/model_loader_transform_joints.c
     # MotionCaptureLoader (BVH I/O) ------------------------------------------------
@@ -326,7 +326,7 @@ add_library(fast_sam_3dbody SHARED
 )
 
 target_include_directories(fast_sam_3dbody PUBLIC
-    src/SAM3DBODY-cpp
+    src/core
     ${GRAPHICS_ENGINE_DIR}
     ${MOCAP_DIR}
     ${TRAJ_DIR}
@@ -351,7 +351,7 @@ if(WIN32)
 endif()
 
 if(WITH_CUDA)
-    target_sources(fast_sam_3dbody PRIVATE src/SAM3DBODY-cpp/mhr_lbs_cuda.cu)
+    target_sources(fast_sam_3dbody PRIVATE src/core/mhr_lbs_cuda.cu)
     target_compile_definitions(fast_sam_3dbody PUBLIC GGML_USE_CUDA FSB_CUDA)
     target_link_libraries(fast_sam_3dbody PUBLIC CUDA::cudart)
 endif()
@@ -396,7 +396,7 @@ target_compile_options(fast_sam_3dbody PRIVATE
 # ---------------------------------------------------------------------------
 # fast_sam_3dbody_run  executable
 # ---------------------------------------------------------------------------
-add_executable(fast_sam_3dbody_run src/SAM3DBODY-cpp/main.cpp)
+add_executable(fast_sam_3dbody_run src/core/main.cpp)
 
 target_link_libraries(fast_sam_3dbody_run PRIVATE fast_sam_3dbody)
 
@@ -418,9 +418,9 @@ if(NOT WIN32)
 
     add_executable(fast_sam_3dbody_render
         src/render/fast_sam_3dbody_render.cpp
-        src/SAM3DBODY-cpp/v4l2_capture.cpp
-        src/SAM3DBODY-cpp/skin_match_gl.cpp
-        src/SAM3DBODY-cpp/skin_turntable_gl.cpp
+        src/core/v4l2_capture.cpp
+        src/core/skin_match_gl.cpp
+        src/core/skin_turntable_gl.cpp
         ${GRAPHICS_ENGINE_DIR}/System/glx3.c
         ${GRAPHICS_ENGINE_DIR}/ModelLoader/model_loader_tri.c
         ${GRAPHICS_ENGINE_DIR}/ModelLoader/model_loader_transform_joints.c
@@ -432,7 +432,7 @@ if(NOT WIN32)
     endif()
 
     target_include_directories(fast_sam_3dbody_render PRIVATE
-        src/SAM3DBODY-cpp
+        src/core
         ${GRAPHICS_ENGINE_DIR}
         ${ORT_INCLUDE_DIRS}
         ${OpenCV_INCLUDE_DIRS}
@@ -489,7 +489,7 @@ add_executable(offline_sam_3dbody_render
 )
 
 target_include_directories(offline_sam_3dbody_render PRIVATE
-    src/SAM3DBODY-cpp
+    src/core
     ${GRAPHICS_ENGINE_DIR}
     ${ORT_INCLUDE_DIRS}
     ${OpenCV_INCLUDE_DIRS}
@@ -527,7 +527,7 @@ if(NOT WIN32 AND EXISTS "${_AMM_SRV_HDR}" AND EXISTS "${_AMM_CLI_HDR}"
    AND EXISTS "${_AMM_SRV_LIB}" AND EXISTS "${_AMM_CLI_LIB}")
     add_executable(sam_3dbody_net src/net/sam_3dbody_net.cpp)
     target_include_directories(sam_3dbody_net PRIVATE
-        src/SAM3DBODY-cpp
+        src/core
         ${OpenCV_INCLUDE_DIRS}
         "${_AMM_DIR}/src/AmmServerlib"
         "${_AMM_DIR}/src/AmmClient"

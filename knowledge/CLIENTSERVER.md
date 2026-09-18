@@ -199,8 +199,8 @@ The client never queues frames; one in flight, newest only.
 
 | Used as-is | From |
 |---|---|
-| `fsb_create / fsb_load / fsb_process_bgr`, `FsbConfig`, `FsbResult` | `src/SAM3DBODY-cpp/fast_sam_3dbody_capi.h` |
-| `BVHWriter::open / write_frame_external / close / set_frame_time` | `src/SAM3DBODY-cpp/bvh_writer.{h,cpp}` |
+| `fsb_create / fsb_load / fsb_process_bgr`, `FsbConfig`, `FsbResult` | `src/core/fast_sam_3dbody_capi.h` |
+| `BVHWriter::open / write_frame_external / close / set_frame_time` | `src/core/bvh_writer.{h,cpp}` |
 | `AmmServer_StartWithArgs / AddResourceHandler / SetIntSettingValue`, `_FILES / _POST*`, `rqst->content` | `AmmarServer/src/AmmServerlib` |
 | `AmmClient_Initialize / SendFile / Recv / seekEndOfHeader / Close` | `AmmarServer/src/AmmClient` |
 | JPEG encode/decode | OpenCV `imgcodecs` |
@@ -313,7 +313,7 @@ Frame is the native MHR **camera-optical** convention (x-right, y-down,
 z-forward, metres).  A ROS client remaps to its target with one static basis
 change `B` (similarity transform `B·q·B⁻¹` on rotations, `B·t` on translations)
 — see **[mocapnet_rosnode](https://github.com/FORTH-ModelBasedTracker/mocapnet_rosnode)**
-(`src/SAM3DBODY-cpp/main.cpp`), which broadcasts a BVH skeleton to TF the same way
+(`src/core/main.cpp`), which broadcasts a BVH skeleton to TF the same way
 (parent→child frames, cm→m, `geometry_msgs::TransformStamped` +
 `tf2_ros::TransformBroadcaster`).  It re-derived quaternions from BVH Euler with
 per-axis negation only because it lacked quaternions; here they are emitted
