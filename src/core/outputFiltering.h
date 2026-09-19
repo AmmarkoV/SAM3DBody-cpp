@@ -261,6 +261,12 @@ static void initButterWorth(struct ButterWorth * sensor,float fsampling,float fc
     sensor->fs = fsampling;
     sensor->fx = fcutoff;
 
+    /* Reset the running state too, so re-initialising a used filter starts
+     * clean instead of continuing from its previous signal. */
+    sensor->initialized = 0;
+    sensor->unfilteredValue = sensor->filteredValue = 0.0f;
+    sensor->y_p = sensor->y_pp = sensor->x_p = sensor->x_pp = 0.0f;
+
     sensor->i   = 0;
     sensor->ff  = (float) sensor->fx/sensor->fs;
     sensor->ita = (float) 1.0/tan((float) 3.14159265359 * sensor->ff);

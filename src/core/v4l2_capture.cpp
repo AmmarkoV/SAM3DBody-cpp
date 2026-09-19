@@ -25,6 +25,7 @@ struct RobustCapture::V4L2Impl {
     uint32_t width  = 0;
     uint32_t height = 0;
     uint32_t fourcc = 0;      // 0 until the first G_FMT/S_FMT
+    uint32_t bytesperline = 0; // row stride of uncompressed formats; may exceed width*bpp
     int      buffer_count = 4;
     bool     streaming = false;
 
@@ -55,6 +56,7 @@ struct RobustCapture::V4L2Impl {
         width  = fmt.fmt.pix.width;
         height = fmt.fmt.pix.height;
         fourcc = fmt.fmt.pix.pixelformat;
+        bytesperline = fmt.fmt.pix.bytesperline;
 
         v4l2_requestbuffers req{};
         req.count  = (uint32_t)std::max(2, buffer_count);
@@ -290,11 +292,21 @@ bool RobustCapture::retrieve(cv::Mat& frame) {
     if (!v4l2_ || !v4l2_->held) return false;
 
     auto& b = v4l2_->buffers[v4l2_->held_index];
+    const int w = (int)v4l2_->width, h = (int)v4l2_->height;
+    // Drivers may pad each row; wrap the buffer with the driver's stride, and
+    // refuse a raw buffer too small to hold the frame it claims to be.
+    auto raw_view = [&](int type, size_t bpp, cv::Mat& out) {
+        size_t step = std::max((size_t)v4l2_->bytesperline, (size_t)w * bpp);
+        if (h <= 0 || step * (size_t)h > b.length) return false;
+        out = cv::Mat(h, w, type, b.start, step);
+        return true;
+    };
     bool ok = true;
     switch (v4l2_->fourcc) {
     case V4L2_PIX_FMT_YUYV: {
-        cv::Mat yuyv((int)v4l2_->height, (int)v4l2_->width, CV_8UC2, b.start);
-        cv::cvtColor(yuyv, frame, cv::COLOR_YUV2BGR_YUYV);
+        cv::Mat yuyv;
+        ok = raw_view(CV_8UC2, 2, yuyv);
+        if (ok) cv::cvtColor(yuyv, frame, cv::COLOR_YUV2BGR_YUYV);
         break;
     }
     case V4L2_PIX_FMT_MJPEG:
@@ -305,13 +317,16 @@ bool RobustCapture::retrieve(cv::Mat& frame) {
         break;
     }
     case V4L2_PIX_FMT_BGR24: {
-        cv::Mat((int)v4l2_->height, (int)v4l2_->width, CV_8UC3, b.start).copyTo(frame);
+        cv::Mat bgr;
+        ok = raw_view(CV_8UC3, 3, bgr);
+        if (ok) bgr.copyTo(frame);
         break;
     }
     default: {
         // Unhandled raw fourcc: best-effort as YUYV, the common UVC default.
-        cv::Mat yuyv((int)v4l2_->height, (int)v4l2_->width, CV_8UC2, b.start);
-        cv::cvtColor(yuyv, frame, cv::COLOR_YUV2BGR_YUYV);
+        cv::Mat yuyv;
+        ok = raw_view(CV_8UC2, 2, yuyv);
+        if (ok) cv::cvtColor(yuyv, frame, cv::COLOR_YUV2BGR_YUYV);
         break;
     }
     }

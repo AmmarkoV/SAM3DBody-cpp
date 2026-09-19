@@ -717,8 +717,9 @@ int main(int argc, char** argv)
     // Butterworth is only valid below the Nyquist frequency (fps/2).
     // Above that, tan(π·fc/fs)→0, all IIR coefficients collapse to zero, and
     // filter() outputs 0 after 3 frames — corrupting pred_cam_t, keypoints, etc.
-    // When the cutoff is at or above Nyquist we skip the filter (pass-through).
-    const bool use_bw = c.butterworth && (c.bw_cutoff < bw_fps * 0.5f);
+    // A cutoff of 0 is just as bad the other way (1/tan(0) → NaN coefficients).
+    // Outside (0, Nyquist) we skip the filter (pass-through), as the renderer does.
+    const bool use_bw = c.butterworth && c.bw_cutoff > 0.f && (c.bw_cutoff < bw_fps * 0.5f);
 
     auto init_person_filters = [&](PersonFilters& pf)
     {

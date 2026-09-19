@@ -547,6 +547,7 @@ struct OrtSession
         }
         delete session;
         session = nullptr;
+        profiling_enabled = on_gpu = on_trt = false;
     }
 };
 
@@ -642,18 +643,6 @@ struct Pipeline::Impl
     int                    kp_subset_n   = 0;
     std::vector<KpEntry>   kp_mapping_sub;
 
-    // Regress the pose token / MHR / camera heads from a decoder token.
-    //
-    // decoder_*_head.onnx (built by tools/build_decoder_heads.py) is
-    // decoder_*_normfinal.onnx with the two Linear/ReLU/Linear regression heads
-    // appended, so the token never leaves the GPU and only the 519+3 result
-    // floats come back.  The heads used to run on the CPU here — two
-    // 1024x1024->N GEMVs streaming ~10 MB of weights per call, ~9 ms per person
-    // per frame, more than the six transformer layers they sit between.
-    //
-    // Falls back to norm_final + the CPU FFNs when the fused graph is absent, so
-    // an older onnx/ directory still works.  Pass nullptr for outputs you do not
-    // need; only the requested graph outputs are computed.
     // Per-frame derived constants.  CROP_SIZE and FEAT_HW come from
     // preprocess.hpp; these were recomputed as locals inside process_mat (one of
     // them, FEAT_HW, redundantly shadowing the global with the same value).
@@ -786,28 +775,13 @@ struct Pipeline::Impl
         float g_rot[3]; rot6d_to_euler(praw, g_rot);
         std::array<float,133> b_euler{};
         compact_cont_to_body_params(praw + MhrOut::BODY, b_euler.data());
-        ModelParams204 mpi = build_model_params(g_rot, b_euler.data(), nullptr, true);
-        apply_hand_pose(mpi.data, praw + MhrOut::HAND,
-                        lbs_data->hand_pose_mean, lbs_data->hand_pose_comps,
-                        lbs_data->hand_joint_idxs_left, lbs_data->hand_joint_idxs_right);
-        if (lbs_data->scale_mean && lbs_data->scale_comps)
-        {
-            int ns = lbs_data->n_scale_out, npc = lbs_data->n_scale_pc;
-            for (int j = 0; j < ns; ++j) mpi.data[136+j] = lbs_data->scale_mean[j];
-            for (int k = 0; k < npc; ++k)
-                for (int j = 0; j < ns; ++j)
-                    mpi.data[136+j] += praw[MhrOut::SCALE + k] * lbs_data->scale_comps[k*ns+j];
-        }
+        ModelParams204 mpi = make_model_params(g_rot, b_euler.data(),
+                                               praw + MhrOut::HAND, praw + MhrOut::SCALE);
         if (!kp3d_from_model(mpi.data, praw + MhrOut::SHAPE, zero_face72, kp3d_out))
             return false;
 
-        float s_val = -pcam[0], t_x = pcam[1], t_y = -pcam[2];
-        float bw = ctx.bx2 - ctx.bx1, bh = ctx.by2 - ctx.by1;
-        float bbox_cx = (ctx.bx1 + ctx.bx2) * 0.5f, bbox_cy = (ctx.by1 + ctx.by2) * 0.5f;
-        float bs = fixed_aspect_bbox_size(bw, bh) * s_val + 1e-8f;
-        float cam_t[3] = { t_x + 2.f*(bbox_cx - ctx.cx)/bs,
-                           t_y + 2.f*(bbox_cy - ctx.cy)/bs,
-                           2.f*ctx.fx/bs };
+        const std::array<float,3> cam_t = body_cam_t(pcam, ctx.bx1, ctx.by1, ctx.bx2, ctx.by2,
+                                                     ctx.fx, ctx.cx, ctx.cy);
         kp2d_cropped_out.assign(70*2, 0.f);
         kp2d_depth_out.assign(70, 0.f);
         for (int k = 0; k < 70; ++k)
@@ -938,6 +912,18 @@ struct Pipeline::Impl
         }
     }
 
+    // Regress the pose token / MHR / camera heads from a decoder token.
+    //
+    // decoder_*_head.onnx (built by tools/build_decoder_heads.py) is
+    // decoder_*_normfinal.onnx with the two Linear/ReLU/Linear regression heads
+    // appended, so the token never leaves the GPU and only the 519+3 result
+    // floats come back.  The heads used to run on the CPU here — two
+    // 1024x1024->N GEMVs streaming ~10 MB of weights per call, ~9 ms per person
+    // per frame, more than the six transformer layers they sit between.
+    //
+    // Falls back to norm_final + the CPU FFNs when the fused graph is absent, so
+    // an older onnx/ directory still works.  Pass nullptr for outputs you do not
+    // need; only the requested graph outputs are computed.
     bool decode_head(OrtSession& head, OrtSession& nf,
                      const CFFN& mhr_head, const CFFN& cam_head,
                      const Ort::Value& token,
@@ -997,15 +983,108 @@ struct Pipeline::Impl
                 return false;
         }
 
-        const std::vector<KpEntry>& kpm = lbs_kp_subset ? kp_mapping_sub : kp_mapping;
+        // kp_mapping_sub rewrites vertex columns to subset slots but leaves
+        // joint columns at >= n_verts, so the split point is nv either way.
+        apply_kp_mapping(lbs_kp_subset ? kp_mapping_sub : kp_mapping,
+                         iv.data(), ij.data(), nv, kp3d_out);
+        return true;
+    }
+
+    // Sparse [vertices + joints] -> 70 keypoints.  Columns below nv address
+    // mesh vertices, columns at or above it address joints.
+    static void apply_kp_mapping(const std::vector<KpEntry>& kpm, const float* verts,
+                                 const float* joints, int nv, std::vector<float>& kp3d_out)
+    {
         kp3d_out.assign(70*3, 0.f);
         for (const auto& e : kpm)
             for (int c = 0; c < 3; ++c)
             {
-                float src = (e.col < nv) ? iv[e.col*3+c] : ij[(e.col-nv)*3+c];
+                float src = (e.col < nv) ? verts[e.col*3+c] : joints[(e.col-nv)*3+c];
                 kp3d_out[e.row*3+c] += src * e.val;
             }
-        return true;
+    }
+
+    // Perspective projection of 70 camera-space keypoints (translated by
+    // cam_t) to image pixels.
+    static std::vector<float> project_kps(const std::vector<float>& kp3d, const float cam_t[3],
+                                          float fx, float fy, float cx, float cy)
+    {
+        std::vector<float> kp2d(70*2);
+        for (int k = 0; k < 70; ++k)
+        {
+            float dz = kp3d[k*3+2] + cam_t[2];
+            float dx = kp3d[k*3+0] + cam_t[0];
+            float dy = kp3d[k*3+1] + cam_t[1];
+            if (dz < 1e-4f) dz = 1e-4f;
+            kp2d[k*2+0] = dx/dz*fx + cx;
+            kp2d[k*2+1] = dy/dz*fy + cy;
+        }
+        return kp2d;
+    }
+
+    // Body camera head output [s, tx, ty] -> camera translation, for a person
+    // box (x1,y1,x2,y2).  Mirrors Python's perspective_projection.
+    static std::array<float,3> body_cam_t(const float* cam, float x1, float y1, float x2, float y2,
+                                          float fx, float cx, float cy)
+    {
+        float s_val   = -cam[0];           // sign flip (Python: s = -pred_cam[:,0])
+        float tx      =  cam[1];
+        float ty      = -cam[2];           // sign flip (Python: ty = -pred_cam[:,2])
+        float bbox_cx = (x1 + x2) * 0.5f;
+        float bbox_cy = (y1 + y2) * 0.5f;
+        float bs      = fixed_aspect_bbox_size(x2 - x1, y2 - y1) * s_val + 1e-8f;
+        return { tx + 2.f*(bbox_cx - cx)/bs, ty + 2.f*(bbox_cy - cy)/bs, 2.f*fx/bs };
+    }
+
+    // model_params[204] with the hand pose PCA-decoded into it and the scales
+    // decoded from their PCA codes.  Either decode is skipped when the LBS
+    // tables it needs are not loaded, leaving those slots as
+    // build_model_params() set them.
+    //   global_rot_rxryrz: rot6d_to_euler order     body_euler: [133]
+    //   hand108: raw hand PCA codes [108]            scale28: raw scale codes [28]
+    ModelParams204 make_model_params(const float* global_rot_rxryrz, const float* body_euler,
+                                     const float* hand108, const float* scale28) const
+    {
+        ModelParams204 mp = build_model_params(global_rot_rxryrz, body_euler, nullptr, true);
+        if (!lbs_data) return mp;
+        apply_hand_pose(mp.data, hand108,
+                        lbs_data->hand_pose_mean, lbs_data->hand_pose_comps,
+                        lbs_data->hand_joint_idxs_left, lbs_data->hand_joint_idxs_right);
+        if (lbs_data->scale_mean && lbs_data->scale_comps)
+        {
+            const int ns = lbs_data->n_scale_out, npc = lbs_data->n_scale_pc;
+            for (int j = 0; j < ns; ++j) mp.data[136+j] = lbs_data->scale_mean[j];
+            for (int k = 0; k < npc; ++k)
+                for (int j = 0; j < ns; ++j)
+                    mp.data[136+j] += scale28[k] * lbs_data->scale_comps[k*ns+j];
+        }
+        return mp;
+    }
+
+    // Wrist-centric -> body-rooted transform that head_pose_hand always applies
+    // (mhr_head.py's enable_hand_model branch) — see preprocess.hpp's
+    // mp_rot_to_mat3 doc comment / PLAN.md for the derivation+verification.
+    // mp[3:6] is already in the (rz,ry,rx) order this needs (build_model_params
+    // put it there); global_trans_ori is always 0 (single-view inference).
+    static void to_hand_root_frame(float* mp)
+    {
+        float R_ori[9]; mp_rot_to_mat3(mp + 3, R_ori);
+        float R_new[9]; mat3_mul(R_ori, HAND_LOCAL_TO_WORLD_WRIST, R_new);
+        float mp_rot_new[3]; mat3_to_mp_rot(R_new, mp_rot_new);
+
+        float diff[3] = {
+            HAND_RIGHT_WRIST_COORDS[0] - HAND_ROOT_COORDS[0],
+            HAND_RIGHT_WRIST_COORDS[1] - HAND_ROOT_COORDS[1],
+            HAND_RIGHT_WRIST_COORDS[2] - HAND_ROOT_COORDS[2]
+        };
+        float rotated[3]; mat3_vec3(R_new, diff, rotated);
+        mp[0] = -(rotated[0] + HAND_ROOT_COORDS[0]) * 10.f;
+        mp[1] = -(rotated[1] + HAND_ROOT_COORDS[1]) * 10.f;
+        mp[2] = -(rotated[2] + HAND_ROOT_COORDS[2]) * 10.f;
+        mp[3] = mp_rot_new[0];
+        mp[4] = mp_rot_new[1];
+        mp[5] = mp_rot_new[2];
+        for (int idx : HAND_NONHAND_PARAM_IDXS) mp[idx] = 0.f;
     }
 
     // ── per-stage timing accumulators ──────────────────────────────────────────
@@ -1034,9 +1113,58 @@ struct Pipeline::Impl
     void add_time (double&   f, double   v) { std::lock_guard<std::mutex> lk(timers_mu); f += v; }
     void add_count(uint64_t& f, uint64_t v) { std::lock_guard<std::mutex> lk(timers_mu); f += v; }
 
+    // keypoint_mapping.bin: u32 rows, u32 cols, u32 nnz, then nnz x
+    // (i32 row, i32 col, f32 val).  Every consumer indexes kp3d[row*3+c] and
+    // verts/joints by col with no bounds check, so reject a truncated or
+    // mismatched file here rather than let it write out of bounds per frame.
+    // Leaves kp_mapping empty (keypoints disabled) on any failure.
+    bool load_kp_mapping(const std::string& path, int n_verts, int n_joints)
+    {
+        kp_mapping.clear();
+        std::ifstream f(path, std::ios::binary);
+        if (!f.is_open())
+        {
+            printf("[FSB] keypoint_mapping.bin not found – 2D keypoint output disabled\n");
+            return false;
+        }
+        uint32_t num_rows = 0, num_cols = 0, nnz = 0;
+        f.read(reinterpret_cast<char*>(&num_rows), 4);
+        f.read(reinterpret_cast<char*>(&num_cols), 4);
+        f.read(reinterpret_cast<char*>(&nnz), 4);
+        std::vector<KpEntry> entries;
+        entries.reserve(f ? nnz : 0);
+        for (uint32_t i = 0; f && i < nnz; ++i)
+        {
+            KpEntry e;
+            f.read(reinterpret_cast<char*>(&e.row), 4);
+            f.read(reinterpret_cast<char*>(&e.col), 4);
+            f.read(reinterpret_cast<char*>(&e.val), 4);
+            if (!f) break;
+            if (e.row < 0 || e.row >= 70 || e.col < 0 || e.col >= n_verts + n_joints)
+            {
+                fprintf(stderr, "[FSB] %s: entry %u (row %d, col %d) out of range "
+                                "– 2D keypoint output disabled\n", path.c_str(), i, e.row, e.col);
+                return false;
+            }
+            entries.push_back(e);
+        }
+        if (!f)
+        {
+            fprintf(stderr, "[FSB] %s: truncated – 2D keypoint output disabled\n", path.c_str());
+            return false;
+        }
+        kp_mapping = std::move(entries);
+        printf("[FSB] keypoint_mapping: %ux%u, %u non-zero entries\n", num_rows, num_cols, nnz);
+        return true;
+    }
+
     // ── load ──────────────────────────────────────────────────────────────────
     bool load(const PipelineConfig& c)
     {
+        // Loading again on a used Pipeline must start from nothing: the
+        // sessions would otherwise leak, and kp_mapping would be appended to a
+        // second time, doubling every keypoint.
+        free_all();
         cfg = c;
 
         // --ort-verbose: raise both the Env's default log severity and the
@@ -1090,31 +1218,7 @@ struct Pipeline::Impl
                 printf("OK\n");
 
                 // Load keypoint mapping for 70 MHR keypoints
-                std::string kp_path = opath("keypoint_mapping.bin");
-                std::ifstream kp_f(kp_path, std::ios::binary);
-                if (kp_f.is_open())
-                {
-                    uint32_t num_rows, num_cols, nnz;
-                    kp_f.read(reinterpret_cast<char*>(&num_rows), 4);
-                    kp_f.read(reinterpret_cast<char*>(&num_cols), 4);
-                    kp_f.read(reinterpret_cast<char*>(&nnz), 4);
-                    kp_mapping.reserve(nnz);
-                    for (uint32_t i = 0; i < nnz; ++i)
-                    {
-                        KpEntry e;
-                        kp_f.read(reinterpret_cast<char*>(&e.row), 4);
-                        kp_f.read(reinterpret_cast<char*>(&e.col), 4);
-                        kp_f.read(reinterpret_cast<char*>(&e.val), 4);
-                        kp_mapping.push_back(e);
-                    }
-                    kp_f.close();
-                    printf("[FSB] keypoint_mapping: %ux%u, %u non-zero entries\n",
-                           num_rows, num_cols, nnz);
-                }
-                else
-                {
-                    printf("[FSB] keypoint_mapping.bin not found – 2D keypoint output disabled\n");
-                }
+                load_kp_mapping(opath("keypoint_mapping.bin"), (int)meta.num_vertices, 127);
             }
             else
             {
@@ -1141,27 +1245,9 @@ struct Pipeline::Impl
 #endif
 
                     // Load keypoint mapping even with LBS
-                    std::string kp_path = opath("keypoint_mapping.bin");
-                    std::ifstream kp_f(kp_path, std::ios::binary);
-                    if (kp_f.is_open())
+                    if (load_kp_mapping(opath("keypoint_mapping.bin"),
+                                        lbs_data->n_verts, lbs_data->n_joints))
                     {
-                        uint32_t num_rows, num_cols, nnz;
-                        kp_f.read(reinterpret_cast<char*>(&num_rows), 4);
-                        kp_f.read(reinterpret_cast<char*>(&num_cols), 4);
-                        kp_f.read(reinterpret_cast<char*>(&nnz), 4);
-                        kp_mapping.reserve(nnz);
-                        for (uint32_t i = 0; i < nnz; ++i)
-                        {
-                            KpEntry e;
-                            kp_f.read(reinterpret_cast<char*>(&e.row), 4);
-                            kp_f.read(reinterpret_cast<char*>(&e.col), 4);
-                            kp_f.read(reinterpret_cast<char*>(&e.val), 4);
-                            kp_mapping.push_back(e);
-                        }
-                        kp_f.close();
-                        printf("[FSB] keypoint_mapping: %ux%u, %u non-zero entries\n",
-                               num_rows, num_cols, nnz);
-
                         // Pack the LBS basis rows for just the vertices the 70
                         // keypoints reference, so the refined-pose intermediate
                         // decodes skin ~2.5% of the mesh instead of all of it.
@@ -1184,10 +1270,6 @@ struct Pipeline::Impl
                             printf("[FSB] keypoint LBS subset: %d of %d vertices\n",
                                    kp_subset_n, lbs_data->n_verts);
                         }
-                    }
-                    else
-                    {
-                        printf("[FSB] keypoint_mapping.bin not found – 2D keypoint output disabled\n");
                     }
                 }
                 else
@@ -1814,7 +1896,7 @@ struct Pipeline::Impl
                     break;
                 case PipelineConfig::DET_YOLO_POSE:
                 default:
-                    dets = parse_yolo_output(row_major.data(), nd,
+                    dets = parse_yolo_output(row_major.data(), nd, C,
                                              cfg.person_thresh, cfg.person_nms_iou);
                     break;
                 }
@@ -2378,34 +2460,9 @@ struct Pipeline::Impl
                     float g_rot[3]; rot6d_to_euler(praw, g_rot);
                     std::array<float,133> b_euler{};
                     compact_cont_to_body_params(praw + MhrOut::BODY, b_euler.data());
-                    ModelParams204 mpi = build_model_params(g_rot, b_euler.data(), nullptr, true);
-                    apply_hand_pose(mpi.data, praw + MhrOut::HAND,
-                                     lbs_data->hand_pose_mean, lbs_data->hand_pose_comps,
-                                     lbs_data->hand_joint_idxs_left, lbs_data->hand_joint_idxs_right);
-                    if (lbs_data->scale_mean && lbs_data->scale_comps)
-                    {
-                        int ns = lbs_data->n_scale_out, npc = lbs_data->n_scale_pc;
-                        for (int j = 0; j < ns; ++j) mpi.data[136+j] = lbs_data->scale_mean[j];
-                        for (int k = 0; k < npc; ++k)
-                            for (int j = 0; j < ns; ++j)
-                                mpi.data[136+j] += praw[MhrOut::SCALE + k] * lbs_data->scale_comps[k*ns+j];
-                    }
-                    {
-                        float R_ori[9]; mp_rot_to_mat3(mpi.data + 3, R_ori);
-                        float R_new[9]; mat3_mul(R_ori, HAND_LOCAL_TO_WORLD_WRIST, R_new);
-                        float mp_rot_new[3]; mat3_to_mp_rot(R_new, mp_rot_new);
-                        float diff[3] = {
-                            HAND_RIGHT_WRIST_COORDS[0] - HAND_ROOT_COORDS[0],
-                            HAND_RIGHT_WRIST_COORDS[1] - HAND_ROOT_COORDS[1],
-                            HAND_RIGHT_WRIST_COORDS[2] - HAND_ROOT_COORDS[2]
-                        };
-                        float rotated[3]; mat3_vec3(R_new, diff, rotated);
-                        mpi.data[0] = -(rotated[0] + HAND_ROOT_COORDS[0]) * 10.f;
-                        mpi.data[1] = -(rotated[1] + HAND_ROOT_COORDS[1]) * 10.f;
-                        mpi.data[2] = -(rotated[2] + HAND_ROOT_COORDS[2]) * 10.f;
-                        mpi.data[3] = mp_rot_new[0]; mpi.data[4] = mp_rot_new[1]; mpi.data[5] = mp_rot_new[2];
-                        for (int idx : HAND_NONHAND_PARAM_IDXS) mpi.data[idx] = 0.f;
-                    }
+                    ModelParams204 mpi = make_model_params(g_rot, b_euler.data(),
+                                                           praw + MhrOut::HAND, praw + MhrOut::SCALE);
+                    to_hand_root_frame(mpi.data);
                     if (!kp3d_from_model(mpi.data, praw + MhrOut::SHAPE, hand_zero_face72, kp3d_out))
                         return false;
                     static constexpr float HAND_CAM_SCALE_FACTOR = 10.f;
@@ -2571,25 +2628,11 @@ struct Pipeline::Impl
                 float body_euler[133] = {};
                 compact_cont_to_body_params(body_cont, body_euler);
 
-                ModelParams204 mp = build_model_params(global_rot_euler, body_euler, nullptr, true);
-
-                // Apply hand pose PCA decode (mirrors render binary + Python replace_hands_in_pose)
-                const float* hand_pose = raw_i + MhrOut::HAND;
-                apply_hand_pose(mp.data, hand_pose,
-                                lbs_data->hand_pose_mean, lbs_data->hand_pose_comps,
-                                lbs_data->hand_joint_idxs_left, lbs_data->hand_joint_idxs_right);
-
-                // Apply scale decode: scales = scale_mean + scale_params @ scale_comps
-                const float* scale_params = raw_i + MhrOut::SCALE;
-                if (lbs_data->scale_mean && lbs_data->scale_comps)
-                {
-                    const int ns = lbs_data->n_scale_out;  // 68
-                    const int np = lbs_data->n_scale_pc;   // 28
-                    for (int j = 0; j < ns; ++j) mp.data[136+j] = lbs_data->scale_mean[j];
-                    for (int k = 0; k < np; ++k)
-                        for (int j = 0; j < ns; ++j)
-                            mp.data[136+j] += scale_params[k] * lbs_data->scale_comps[k * ns + j];
-                }
+                // Hand pose PCA decode (mirrors render binary + Python
+                // replace_hands_in_pose) and scale decode
+                // (scales = scale_mean + scale_params @ scale_comps).
+                ModelParams204 mp = make_model_params(global_rot_euler, body_euler,
+                                                      raw_i + MhrOut::HAND, raw_i + MhrOut::SCALE);
 
                 float* verts_out  = all_verts.data() + (size_t)i * meta.num_vertices * 3;
                 float* joints_out = all_skel.data() + (size_t)i * 127 * 3;
@@ -2684,20 +2727,7 @@ struct Pipeline::Impl
             // Also store cam_raw before conversion (needed for prev_estimate when
             // the Python model has init_camera — appended as extra 3 floats).
             std::memcpy(r.pred_cam_raw.data(), cam, 3 * sizeof(float));
-            {
-                float s_val   = -cam[0];           // sign flip (Python: s = -pred_cam[:,0])
-                float tx      =  cam[1];
-                float ty      = -cam[2];           // sign flip (Python: ty = -pred_cam[:,2])
-                float bw      = d.x2 - d.x1;
-                float bh      = d.y2 - d.y1;
-                float bbox_cx = (d.x1 + d.x2) * 0.5f;
-                float bbox_cy = (d.y1 + d.y2) * 0.5f;
-                float bs      = fixed_aspect_bbox_size(bw, bh) * s_val + 1e-8f;
-                float tz      = 2.0f * fx / bs;
-                float cx_off  = 2.0f * (bbox_cx - cx) / bs;
-                float cy_off  = 2.0f * (bbox_cy - cy) / bs;
-                r.pred_cam_t  = { tx + cx_off, ty + cy_off, tz };
-            }
+            r.pred_cam_t = body_cam_t(cam, d.x1, d.y1, d.x2, d.y2, fx, cx, cy);
             r.focal_length = fx;
 
             // Global rotation 6D → Euler
@@ -2728,27 +2758,7 @@ struct Pipeline::Impl
 
             // Model params [204] for native C LBS – includes hand pose + scale decode
             {
-                float ge[3];
-                rot6d_to_euler(p, ge);
-                float be[133] = {};
-                compact_cont_to_body_params(p + MhrOut::BODY, be);
-                ModelParams204 mp = build_model_params(ge, be, nullptr, true);
-                // Hand pose PCA decode (mirrors Python replace_hands_in_pose)
-                apply_hand_pose(mp.data, p + MhrOut::HAND,
-                                lbs_data ? lbs_data->hand_pose_mean   : nullptr,
-                                lbs_data ? lbs_data->hand_pose_comps  : nullptr,
-                                lbs_data ? lbs_data->hand_joint_idxs_left  : nullptr,
-                                lbs_data ? lbs_data->hand_joint_idxs_right : nullptr);
-                // Scale decode: scales = scale_mean + scale_params @ scale_comps
-                if (lbs_data && lbs_data->scale_mean && lbs_data->scale_comps)
-                {
-                    const int ns = lbs_data->n_scale_out;
-                    const int np = lbs_data->n_scale_pc;
-                    for (int j = 0; j < ns; ++j) mp.data[136+j] = lbs_data->scale_mean[j];
-                    for (int k = 0; k < np; ++k)
-                        for (int j = 0; j < ns; ++j)
-                            mp.data[136+j] += p[MhrOut::SCALE + k] * lbs_data->scale_comps[k * ns + j];
-                }
+                ModelParams204 mp = make_model_params(ge, be, p + MhrOut::HAND, p + MhrOut::SCALE);
                 std::memcpy(r.mhr_model_params.data(), mp.data, 204 * sizeof(float));
             }
 
@@ -2793,48 +2803,14 @@ struct Pipeline::Impl
                     r.skeleton_3d = joint_coords;
 
                     // Apply keypoint_mapping: sparse matrix-vector multiply
-                    // [vertices + joints] → keypoints_3d[70*3].  Columns below
-                    // nv address mesh vertices, columns at or above it address
-                    // joints; KpEntry::col is signed, hence the signed copy.
-                    const int nv = (int)meta.num_vertices;
-                    const float* verts_ptr = r.pred_vertices.data();
-                    const float* joints_ptr = joint_coords.data();
-                    std::vector<float> kps_3d(70 * 3, 0.f);
-
-                    for (const auto& entry : kp_mapping)
-                    {
-                        // Each keypoint has 3 consecutive rows (x,y,z)
-                        float coord_val = entry.val;
-                        for (int c = 0; c < 3; ++c)
-                        {
-                            int row = entry.row * 3 + c;
-                            int col = entry.col;
-                            float src_val = 0.f;
-                            if (col < nv)
-                                src_val = verts_ptr[col * 3 + c];
-                            else
-                                src_val = joints_ptr[(col - nv) * 3 + c];
-                            kps_3d[row] += src_val * coord_val;
-                        }
-                    }
-
-                    // kps_3d is already in the camera coordinate system (y,z negated)
-                    // because both verts_ptr and joints_ptr are post-flip inputs.
-                    // No additional flip is needed here.
-                    r.keypoints_3d = std::move(kps_3d);
+                    // [vertices + joints] → keypoints_3d[70*3].  The result is
+                    // already in the camera coordinate system (y,z negated)
+                    // because both inputs are post-flip; no extra flip needed.
+                    apply_kp_mapping(kp_mapping, r.pred_vertices.data(), joint_coords.data(),
+                                     (int)meta.num_vertices, r.keypoints_3d);
 
                     // Project to 2D: kps_cam = kps_3d + pred_cam_t, then perspective divide
-                    std::vector<float> kps_2d(70 * 2);
-                    for (int k = 0; k < 70; ++k)
-                    {
-                        float dz = r.keypoints_3d[k*3 + 2] + r.pred_cam_t[2];
-                        float dx = r.keypoints_3d[k*3 + 0] + r.pred_cam_t[0];
-                        float dy = r.keypoints_3d[k*3 + 1] + r.pred_cam_t[1];
-                        if (dz < 1e-4f) dz = 1e-4f;
-                        kps_2d[k*2 + 0] = dx / dz * fx + cx;
-                        kps_2d[k*2 + 1] = dy / dz * fy + cy;
-                    }
-                    r.keypoints_2d = std::move(kps_2d);
+                    r.keypoints_2d = project_kps(r.keypoints_3d, r.pred_cam_t.data(), fx, fy, cx, cy);
                 }
             }
         }
@@ -2997,43 +2973,10 @@ struct Pipeline::Impl
                        ref.orig_cx, ref.orig_cy, ref.orig_sz, fx, geom_cam_cx, cy, s_val, bs,
                        pred_cam_t[0], pred_cam_t[1], pred_cam_t[2]);
 
-                ModelParams204 mp = build_model_params(F.global_rot_euler.data(), F.body_euler.data(), nullptr, true);
-                apply_hand_pose(mp.data, F.hand108.data(),
-                                lbs_data->hand_pose_mean, lbs_data->hand_pose_comps,
-                                lbs_data->hand_joint_idxs_left, lbs_data->hand_joint_idxs_right);
-                if (lbs_data->scale_mean && lbs_data->scale_comps)
-                {
-                    int ns = lbs_data->n_scale_out, npc = lbs_data->n_scale_pc;
-                    for (int j = 0; j < ns; ++j) mp.data[136+j] = lbs_data->scale_mean[j];
-                    for (int k = 0; k < npc; ++k)
-                        for (int j = 0; j < ns; ++j)
-                            mp.data[136+j] += F.scale28[k] * lbs_data->scale_comps[k*ns+j];
-                }
-
-                // Wrist-centric → body-rooted transform (mhr_head.py's enable_hand_model
-                // branch, only used by head_pose_hand) — see preprocess.hpp's
-                // mp_rot_to_mat3 doc comment / PLAN.md for the derivation+verification.
-                // mp.data[3:6] is ALREADY in the (rz,ry,rx) order this needs (build_model_params
-                // put it there); global_trans_ori is always 0 (single-view inference).
-                {
-                    float R_ori[9]; mp_rot_to_mat3(mp.data + 3, R_ori);
-                    float R_new[9]; mat3_mul(R_ori, HAND_LOCAL_TO_WORLD_WRIST, R_new);
-                    float mp_rot_new[3]; mat3_to_mp_rot(R_new, mp_rot_new);
-
-                    float diff[3] = {
-                        HAND_RIGHT_WRIST_COORDS[0] - HAND_ROOT_COORDS[0],
-                        HAND_RIGHT_WRIST_COORDS[1] - HAND_ROOT_COORDS[1],
-                        HAND_RIGHT_WRIST_COORDS[2] - HAND_ROOT_COORDS[2]
-                    };
-                    float rotated[3]; mat3_vec3(R_new, diff, rotated);
-                    mp.data[0] = -(rotated[0] + HAND_ROOT_COORDS[0]) * 10.f;
-                    mp.data[1] = -(rotated[1] + HAND_ROOT_COORDS[1]) * 10.f;
-                    mp.data[2] = -(rotated[2] + HAND_ROOT_COORDS[2]) * 10.f;
-                    mp.data[3] = mp_rot_new[0];
-                    mp.data[4] = mp_rot_new[1];
-                    mp.data[5] = mp_rot_new[2];
-                    for (int idx : HAND_NONHAND_PARAM_IDXS) mp.data[idx] = 0.f;
-                }
+                ModelParams204 mp = make_model_params(F.global_rot_euler.data(), F.body_euler.data(),
+                                                      F.hand108.data(), F.scale28.data());
+                // Wrist-centric → body-rooted transform (only used by head_pose_hand).
+                to_hand_root_frame(mp.data);
 
                 // Only hq_scratch is read below (joint 42's global quaternion, and
                 // joint 78 under FSB_DUMP_HAND_JOINT78), so ask for the skeleton
@@ -3412,11 +3355,8 @@ struct Pipeline::Impl
                 r.face_params.assign(p2 + MhrOut::FACE, p2 + MhrOut::FACE + MhrOut::FACE_N);
                 {
                     std::array<float,3> pass1_cam_t = r.pred_cam_t;
-                    float s_val = -p2_cam[0], t_x = p2_cam[1], t_y = -p2_cam[2];
-                    float bw = r.bbox[2]-r.bbox[0], bh = r.bbox[3]-r.bbox[1];
-                    float bbox_cx = (r.bbox[0]+r.bbox[2])*0.5f, bbox_cy = (r.bbox[1]+r.bbox[3])*0.5f;
-                    float bs = fixed_aspect_bbox_size(bw,bh)*s_val + 1e-8f;
-                    r.pred_cam_t = { t_x + 2.f*(bbox_cx-cx)/bs, t_y + 2.f*(bbox_cy-cy)/bs, 2.f*fx/bs };
+                    r.pred_cam_t = body_cam_t(p2_cam.data(), r.bbox[0], r.bbox[1], r.bbox[2], r.bbox[3],
+                                              fx, cx, cy);
                     if (g_diag.debug) printf("[FSB]   camv2dbg person=%d pass1_cam_t=(%.3f,%.3f,%.3f) pass2_cam_t=(%.3f,%.3f,%.3f)\n",
                            i, pass1_cam_t[0], pass1_cam_t[1], pass1_cam_t[2],
                            r.pred_cam_t[0], r.pred_cam_t[1], r.pred_cam_t[2]);
@@ -3533,7 +3473,7 @@ struct Pipeline::Impl
                             {
                                 const float* ori_e = pass1_wrist_euler[i].data() + (lr==0 ? 3 : 0);  // [left, right] layout
                                 float ori_R[9]; euler_xzy_to_mat3(ori_e[0], ori_e[1], ori_e[2], ori_R);
-                                if (mat3_angle_diff(ori_R, fused_R) >= 1.4f) continue;
+                                if (mat3_angle_diff(ori_R, fused_R) >= HAND_WRIST_ANGLE_THRESH) continue;
                             }
 
                             float wx, wz, wy;
@@ -3616,18 +3556,8 @@ struct Pipeline::Impl
 
                 // Rebuild derived fields (mhr_model_params, vertices/keypoints) from
                 // the final spliced pose, mirroring the existing result-assembly code.
-                ModelParams204 mp_final = build_model_params(p2_global_rot_euler, p2_body_euler.data(), nullptr, true);
-                apply_hand_pose(mp_final.data, r.hand_pose.data(),
-                                lbs_data->hand_pose_mean, lbs_data->hand_pose_comps,
-                                lbs_data->hand_joint_idxs_left, lbs_data->hand_joint_idxs_right);
-                if (lbs_data->scale_mean && lbs_data->scale_comps)
-                {
-                    int ns = lbs_data->n_scale_out, npc = lbs_data->n_scale_pc;
-                    for (int j = 0; j < ns; ++j) mp_final.data[136+j] = lbs_data->scale_mean[j];
-                    for (int k = 0; k < npc; ++k)
-                        for (int j = 0; j < ns; ++j)
-                            mp_final.data[136+j] += r.scale[k] * lbs_data->scale_comps[k*ns+j];
-                }
+                ModelParams204 mp_final = make_model_params(p2_global_rot_euler, p2_body_euler.data(),
+                                                            r.hand_pose.data(), r.scale.data());
                 std::memcpy(r.mhr_model_params.data(), mp_final.data, 204*sizeof(float));
                 if (const char* dump_path = g_diag.dump_mhr_model_params)
                 {
@@ -3681,28 +3611,10 @@ struct Pipeline::Impl
                                    vmax[0]-vmin[0], vmax[1]-vmin[1], vmax[2]-vmin[2]);
                         }
 
-                        std::vector<float> kps3d(70*3, 0.f);
-                        const int nv = (int)meta.num_vertices;
-                        for (const auto& e : kp_mapping)
-                        {
-                            for (int c = 0; c < 3; ++c)
-                            {
-                                float src = (e.col < nv) ? fverts[e.col*3+c] : fjoints[(e.col-nv)*3+c];
-                                kps3d[e.row*3+c] += src * e.val;
-                            }
-                        }
-                        r.keypoints_3d = kps3d;
-                        std::vector<float> kps2d(70*2);
-                        for (int k = 0; k < 70; ++k)
-                        {
-                            float dz = kps3d[k*3+2] + r.pred_cam_t[2];
-                            float dx = kps3d[k*3+0] + r.pred_cam_t[0];
-                            float dy = kps3d[k*3+1] + r.pred_cam_t[1];
-                            if (dz < 1e-4f) dz = 1e-4f;
-                            kps2d[k*2+0] = dx/dz*fx + cx;
-                            kps2d[k*2+1] = dy/dz*fy + cy;
-                        }
-                        r.keypoints_2d = kps2d;
+                        apply_kp_mapping(kp_mapping, fverts.data(), fjoints.data(),
+                                         (int)meta.num_vertices, r.keypoints_3d);
+                        r.keypoints_2d = project_kps(r.keypoints_3d, r.pred_cam_t.data(), fx, fy, cx, cy);
+                        const std::vector<float>& kps2d = r.keypoints_2d;
                         if (g_diag.debug) printf("[FSB]   kp2ddbg person=%d l_sh=(%.1f,%.1f) r_sh=(%.1f,%.1f) "
                                "l_elb=(%.1f,%.1f) r_elb=(%.1f,%.1f) l_hip=(%.1f,%.1f) r_hip=(%.1f,%.1f) "
                                "r_wrist=(%.1f,%.1f) l_wrist=(%.1f,%.1f) scale8=%.4f scale9=%.4f\n",
@@ -3824,19 +3736,8 @@ struct Pipeline::Impl
         Ort::MemoryInfo mi = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
 
         std::vector<float> chw((size_t)3 * CROP_PLANE);
-        for (int y = 0; y < CROP_SIZE; ++y) {
-            const uchar* row = resized.ptr<uchar>(y);
-            for (int x = 0; x < CROP_SIZE; ++x) {
-                float b = row[3*x + 0] / 255.f;
-                float g = row[3*x + 1] / 255.f;
-                float r = row[3*x + 2] / 255.f;
-                chw[0 * CROP_PLANE + y * CROP_SIZE + x] = (r - IMAGE_MEAN[0]) / IMAGE_STD[0];
-                chw[1 * CROP_PLANE + y * CROP_SIZE + x] = (g - IMAGE_MEAN[1]) / IMAGE_STD[1];
-                chw[2 * CROP_PLANE + y * CROP_SIZE + x] = (b - IMAGE_MEAN[2]) / IMAGE_STD[2];
-            }
-        }
+        normalise_bgr_to_chw(resized, chw.data());
 
-        const int BACKBONE_DIM = 1280;
         const int HW = FEAT_HW * FEAT_HW;   // 32×32 spatial grid
         std::vector<int64_t> img_shape{1, 3, CROP_SIZE, CROP_SIZE};
         Ort::Value img_t = Ort::Value::CreateTensor<float>(
@@ -3869,6 +3770,11 @@ struct Pipeline::Impl
         // CFFN weights are plain vectors – cleaned up automatically
         mhr_ffn = CFFN{};
         cam_ffn = CFFN{};
+        mhr_ffn_hand = CFFN{};
+        cam_ffn_hand = CFFN{};
+        kp_mapping.clear();
+        kp_mapping_sub.clear();
+        kp_subset_n = 0;
         sess_backbone.free();
         sess_decoder.free();
         sess_body.free();

@@ -4,6 +4,7 @@
 //                    CLIFF condition, YOLO NMS helpers
 // ============================================================================
 #include <opencv2/imgproc.hpp>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -55,6 +56,39 @@ inline float fixed_aspect_bbox_size(float bw, float bh, float scale_factor = BBO
     return std::max(w1, h1);
 }
 
+// ─── BGR uint8 [CROP_SIZE x CROP_SIZE] → normalised RGB CHW float32 ─────────────
+//
+// (v/255 - mean) / std has only 256 possible results per channel, so they are
+// tabulated once instead of paying a divide per channel per pixel (786k per
+// crop).  Each table entry is computed with the exact expression the per-pixel
+// loop used, so the output is bit-identical.
+inline void normalise_bgr_to_chw(const cv::Mat& bgr, float* out_chw)
+{
+    struct Lut {
+        float v[3][256];   // [RGB channel][uint8 value]
+        Lut() {
+            for (int c = 0; c < 3; ++c)
+                for (int i = 0; i < 256; ++i)
+                    v[c][i] = (i / 255.f - IMAGE_MEAN[c]) / IMAGE_STD[c];
+        }
+    };
+    static const Lut lut;
+
+    const int plane = CROP_SIZE * CROP_SIZE;
+    for (int y = 0; y < CROP_SIZE; ++y) {
+        const uchar* row = bgr.ptr<uchar>(y);
+        float* r_out = out_chw + 0 * plane + y * CROP_SIZE;
+        float* g_out = out_chw + 1 * plane + y * CROP_SIZE;
+        float* b_out = out_chw + 2 * plane + y * CROP_SIZE;
+        for (int x = 0; x < CROP_SIZE; ++x) {
+            // OpenCV is BGR; the model wants RGB
+            b_out[x] = lut.v[2][row[3*x + 0]];
+            g_out[x] = lut.v[1][row[3*x + 1]];
+            r_out[x] = lut.v[0][row[3*x + 2]];
+        }
+    }
+}
+
 // ─── Crop one person out of a BGR image and return normalised CHW float32 ─────
 //
 // bbox_x1/y1/x2/y2 : person bounding box in original image (float, unclamped)
@@ -88,7 +122,9 @@ inline void crop_and_normalise(
     float cy   = (bbox_y1 + bbox_y2) * 0.5f;
     float bw   = bbox_x2 - bbox_x1;
     float bh   = bbox_y2 - bbox_y1;
-    float side = fixed_aspect_bbox_size(bw, bh, scale_factor);
+    // A degenerate box (zero or inverted, e.g. from --boxes) would otherwise
+    // give a non-positive side, and cv::Mat below throws on a negative size.
+    float side = std::max(1.f, fixed_aspect_bbox_size(bw, bh, scale_factor));
 
     crop_cx      = cx;
     crop_cy      = cy;
@@ -125,20 +161,7 @@ inline void crop_and_normalise(
     cv::resize(padded, resized, {CROP_SIZE, CROP_SIZE}, 0, 0, cv::INTER_LINEAR);
 
     // BGR→RGB, uint8→float32 normalised, interleaved→CHW
-    const int plane = CROP_SIZE * CROP_SIZE;
-    for (int y = 0; y < CROP_SIZE; ++y) {
-        const uchar* row = resized.ptr<uchar>(y);
-        for (int x = 0; x < CROP_SIZE; ++x) {
-            // OpenCV is BGR
-            float b = row[3*x + 0] / 255.f;
-            float g = row[3*x + 1] / 255.f;
-            float r = row[3*x + 2] / 255.f;
-            // normalise (RGB order matches PyTorch model)
-            out_chw[0 * plane + y * CROP_SIZE + x] = (r - IMAGE_MEAN[0]) / IMAGE_STD[0];
-            out_chw[1 * plane + y * CROP_SIZE + x] = (g - IMAGE_MEAN[1]) / IMAGE_STD[1];
-            out_chw[2 * plane + y * CROP_SIZE + x] = (b - IMAGE_MEAN[2]) / IMAGE_STD[2];
-        }
-    }
+    normalise_bgr_to_chw(resized, out_chw);
 }
 
 // ─── Compute CLIFF condition info ─────────────────────────────────────────────
@@ -225,12 +248,16 @@ static inline float iou(const PersonDet& a, const PersonDet& b) {
     return inter / (ua + 1e-6f);
 }
 
-// Parse YOLO Pose output tensor [num_dets, 56] (already transposed to row-major).
+// Parse YOLO Pose output tensor [num_dets, num_feat] (already transposed to
+// row-major).  num_feat is 56 for YOLO-pose; anything narrower is not a pose
+// model (e.g. a detection-only export picked with the wrong --detector) and
+// would be read past its end, so it yields no detections.
 // Ultralytics ONNX export outputs cx,cy,w,h in YOLO input pixel coords (0-640).
 // Caller scales to original image space via sx/sy after this call.
 inline std::vector<PersonDet> parse_yolo_output(
-    const float*  data,          // [num_dets × 56]
+    const float*  data,          // [num_dets × num_feat]
     int           num_dets,
+    int           num_feat,
     float         conf_thresh,
     float         nms_iou_thresh
 )
@@ -238,8 +265,10 @@ inline std::vector<PersonDet> parse_yolo_output(
     std::vector<PersonDet> raw;
     raw.reserve(64);
 
+    if (num_feat < 56) return raw;   // 4 bbox + 1 conf + 17×3 keypoints
+
     for (int i = 0; i < num_dets; ++i) {
-        const float* row = data + i * 56;
+        const float* row = data + (size_t)i * num_feat;
         float cx   = row[0], cy = row[1], w = row[2], h = row[3];
         float conf = row[4];
         if (conf < conf_thresh) continue;
@@ -250,10 +279,8 @@ inline std::vector<PersonDet> parse_yolo_output(
         d.y2   = cy + h * 0.5f;
         d.conf = conf;
         // Keypoints: columns 5..55 → 17 × (x, y, visibility)
-        if (num_dets > 0 && 56 > 5) {
-            std::memcpy(d.kps, row + 5, 51 * sizeof(float));
-            d.has_kps = true;
-        }
+        std::memcpy(d.kps, row + 5, 51 * sizeof(float));
+        d.has_kps = true;
         raw.push_back(d);
     }
 
