@@ -75,6 +75,8 @@ class FsbResult(ctypes.Structure):
         # Layout: [0:3]=global_trans*10, [3:6]=global_rot ZYX, [6:136]=body_pose[:130],
         #         [136:204]=scale_out.  Mirrors Python mhr_forward(return_model_params=True).
         ("mhr_model_params", ctypes.c_float * 204),
+        ("skel_3d",          ctypes.c_float * 381),   # [127 × 3]
+        ("has_skel",         ctypes.c_int),
     ]
 
 
@@ -89,6 +91,13 @@ def load_library(lib_dir: str) -> ctypes.CDLL:
     os.environ["LD_LIBRARY_PATH"] = ":".join(filter(None, [lib_dir, ort_lib, prev]))
 
     lib = ctypes.CDLL(lib_path)
+    lib.fsb_result_size.restype  = ctypes.c_int
+    lib.fsb_result_size.argtypes = []
+    if lib.fsb_result_size() != ctypes.sizeof(FsbResult):
+        raise RuntimeError(
+            f"FsbResult layout mismatch: C library has {lib.fsb_result_size()} bytes, "
+            f"this script {ctypes.sizeof(FsbResult)} — update the ctypes mirror "
+            f"to match src/core/fast_sam_3dbody_capi.h")
 
     lib.fsb_create.restype  = ctypes.c_void_p
     lib.fsb_create.argtypes = []

@@ -22,6 +22,21 @@ struct MHR_LBS_Data;
 struct BVH_MotionCapture;
 namespace fsb { struct MHRResult; }
 
+// BVHWriter::open() switches.  Namespace scope rather than nested so it can
+// be a defaulted argument of open() (GCC rejects a nested type whose default
+// member initialisers are needed before the enclosing class is complete).
+struct BVHWriterOptions
+{
+    bool rewrite_body_offsets       = true;
+    bool rewrite_hand_offsets       = true;
+    bool compensate_finger_endsites = true;
+    bool enforce_hand_limits        = false;
+    bool zero_hand_pose             = false;
+    bool sticky_hand_pose           = false;
+    bool rest_align                 = true;
+    bool dump_rest_dirs             = false;
+};
+
 class BVHWriter
 {
 public:
@@ -29,18 +44,11 @@ public:
     // with its kind, and the table lives in an anonymous namespace.
     enum class SlotKind : char { Other, Body, Hand };
 
-    bool open(const std::string& template_path,
-              const std::string& out_path,
-              float              frame_time = 1.0f / 30.0f,
-              const std::string& lbs_path   = "",
-              bool               rewrite_body_offsets       = true,
-              bool               rewrite_hand_offsets       = true,
-              bool               compensate_finger_endsites = true,
-              bool               enforce_hand_limits        = false,
-              bool               zero_hand_pose             = false,
-              bool               sticky_hand_pose           = false,
-              bool               rest_align                 = true,
-              bool               dump_rest_dirs             = false);
+    bool open(const std::string&      template_path,
+              const std::string&      out_path,
+              float                   frame_time = 1.0f / 30.0f,
+              const std::string&      lbs_path   = "",
+              const BVHWriterOptions& opt        = BVHWriterOptions());
 
     void write_frame(const std::vector<fsb::MHRResult>& results);
 
@@ -239,5 +247,4 @@ private:
 
     // Tracker
     std::vector<int>  assign_tracks(const std::vector<fsb::MHRResult>& results);
-    static float bbox_iou(const float a[4], const float b[4]);
 };

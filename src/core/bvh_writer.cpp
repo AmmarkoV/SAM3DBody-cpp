@@ -27,6 +27,7 @@
 #include "fast_sam_3dbody.h"
 #include "mhr_joint_table.h"
 #include "mhr_fk.h"
+#include "bbox_iou.h"
 
 extern "C" {
 #include "ModelLoader/model_loader_transform_joints.h"
@@ -562,22 +563,6 @@ static inline float clampf(float v, float lo, float hi)
 
 // ─── Tracker ────────────────────────────────────────────────────────────────
 
-float BVHWriter::bbox_iou(const float a[4], const float b[4])
-{
-    float ix1 = std::max(a[0], b[0]);
-    float iy1 = std::max(a[1], b[1]);
-    float ix2 = std::min(a[2], b[2]);
-    float iy2 = std::min(a[3], b[3]);
-    float iw = std::max(0.f, ix2 - ix1);
-    float ih = std::max(0.f, iy2 - iy1);
-    float inter = iw * ih;
-    if (inter <= 0.f) return 0.f;
-    float aa = std::max(0.f, a[2]-a[0]) * std::max(0.f, a[3]-a[1]);
-    float bb = std::max(0.f, b[2]-b[0]) * std::max(0.f, b[3]-b[1]);
-    float u  = aa + bb - inter;
-    return u > 0.f ? inter / u : 0.f;
-}
-
 // Greedy IoU assignment.  Returns parallel vector of track_ids matched to each
 // detection (creating new tracks as needed).  Tracks expired this frame are
 // removed from tracks_.
@@ -602,7 +587,7 @@ std::vector<int> BVHWriter::assign_tracks(const std::vector<fsb::MHRResult>& res
                       };
         for (size_t t = 0; t < tracks_.size(); ++t)
         {
-            float v = bbox_iou(db, tracks_[t].bbox);
+            float v = fsb::bbox_iou(db, tracks_[t].bbox);
             if (v >= TRACK_IOU_THRESH) pairs.push_back({(int)d, (int)t, v});
         }
     }
@@ -762,27 +747,20 @@ bool BVHWriter::build_slots()
     return n_mapped > 0;
 }
 
-bool BVHWriter::open(const std::string& template_path,
-                     const std::string& out_path,
-                     float              frame_time,
-                     const std::string& lbs_path,
-                     bool               rewrite_body_offsets,
-                     bool               rewrite_hand_offsets,
-                     bool               compensate_finger_endsites,
-                     bool               enforce_hand_limits,
-                     bool               zero_hand_pose,
-                     bool               sticky_hand_pose,
-                     bool               rest_align,
-                     bool               dump_rest_dirs)
+bool BVHWriter::open(const std::string&      template_path,
+                     const std::string&      out_path,
+                     float                   frame_time,
+                     const std::string&      lbs_path,
+                     const BVHWriterOptions& opt)
 {
     out_path_                    = out_path;
-    rewrite_body_offsets_        = rewrite_body_offsets;
-    rewrite_hand_offsets_        = rewrite_hand_offsets;
-    compensate_finger_endsites_  = compensate_finger_endsites;
-    enforce_hand_limits_         = enforce_hand_limits;
-    zero_hand_pose_              = zero_hand_pose;
-    sticky_hand_pose_            = sticky_hand_pose;
-    rest_align_                  = rest_align;
+    rewrite_body_offsets_        = opt.rewrite_body_offsets;
+    rewrite_hand_offsets_        = opt.rewrite_hand_offsets;
+    compensate_finger_endsites_  = opt.compensate_finger_endsites;
+    enforce_hand_limits_         = opt.enforce_hand_limits;
+    zero_hand_pose_              = opt.zero_hand_pose;
+    sticky_hand_pose_            = opt.sticky_hand_pose;
+    rest_align_                  = opt.rest_align;
 
     // Idiot-proofing: a wrong/missing template path is by far the most common
     // mistake, so check it up front and explain exactly what went wrong (cwd,
@@ -908,7 +886,7 @@ bool BVHWriter::open(const std::string& template_path,
         // re-aiming the swing onto the template's bone.  Identity where the rest
         // directions already agree (torso, head, lower legs) → no-op there.
         // CLI flags drive this; the env vars remain as convenience overrides.
-        const bool dump = dump_rest_dirs || (getenv("FSB_DUMP_REST_DIRS") != nullptr);
+        const bool dump = opt.dump_rest_dirs || (getenv("FSB_DUMP_REST_DIRS") != nullptr);
         if (getenv("FSB_NO_REST_ALIGN")) rest_align_ = false;
         q_bone_align_.assign(slots_.size() * 4, 0.f);
         {

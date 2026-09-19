@@ -11,6 +11,7 @@
 #include "bvh_writer.h"
 #include "arf_writer.h"
 #include "outputFiltering.h"
+#include "bbox_iou.h"
 #include "preprocess.hpp"           // fsb::apply_hand_pose
 
 extern "C" {
@@ -42,21 +43,6 @@ static double ms_since(Clock::time_point t0)
 }
 
 // ─── Geometry helpers (used by both SceneDetector and the tracker) ──────────
-
-static float bbox_iou(const std::array<float,4>& a, const std::array<float,4>& b)
-{
-    float ix1 = std::max(a[0], b[0]);
-    float iy1 = std::max(a[1], b[1]);
-    float ix2 = std::min(a[2], b[2]);
-    float iy2 = std::min(a[3], b[3]);
-    float iw  = std::max(0.f, ix2 - ix1);
-    float ih  = std::max(0.f, iy2 - iy1);
-    float inter = iw * ih;
-    if (inter <= 0.f) return 0.f;
-    float aa = std::max(0.f, a[2]-a[0]) * std::max(0.f, a[3]-a[1]);
-    float bb = std::max(0.f, b[2]-b[0]) * std::max(0.f, b[3]-b[1]);
-    return inter / (aa + bb - inter + 1e-6f);
-}
 
 static float vec3_dist(const std::array<float,3>& a, const std::array<float,3>& b)
 {
@@ -499,7 +485,7 @@ build_global_tracks(std::vector<FrameRecord>& frames, const Config& cfg)
 
         for (size_t t = 0; t < live.size(); ++t) {
             for (size_t d = 0; d < N; ++d) {
-                float iou = bbox_iou(live[t].last_bbox, fr.detections[d].bbox);
+                float iou = fsb::bbox_iou(live[t].last_bbox, fr.detections[d].bbox);
                 if (iou < cfg.track_iou_thresh) continue;
                 // pred_cam_t is in metres; cost contribution is metres * λ.
                 float dist = vec3_dist(live[t].last_cam_t, fr.detections[d].pred_cam_t);
@@ -1201,14 +1187,16 @@ static void export_range(const std::vector<FrameRecord>& frames,
                          const std::map<int,int>* id_remap)
 {
     BVHWriter w;
-    if (!w.open(cfg.bvh_template, cfg.bvh_path, 1.0f / (float)fps, cfg.lbs_path,
-                cfg.bvh_body_shape_change, cfg.bvh_hand_shape_change,
-                cfg.bvh_compensate_finger_endsites,
-                cfg.bvh_enforce_hand_limits,
-                cfg.bvh_zero_hand_pose,
-                cfg.bvh_sticky_hand_pose,
-                cfg.bvh_rest_align,
-                cfg.bvh_dump_rest_dirs))
+    BVHWriterOptions bo;
+    bo.rewrite_body_offsets       = cfg.bvh_body_shape_change;
+    bo.rewrite_hand_offsets       = cfg.bvh_hand_shape_change;
+    bo.compensate_finger_endsites = cfg.bvh_compensate_finger_endsites;
+    bo.enforce_hand_limits        = cfg.bvh_enforce_hand_limits;
+    bo.zero_hand_pose             = cfg.bvh_zero_hand_pose;
+    bo.sticky_hand_pose           = cfg.bvh_sticky_hand_pose;
+    bo.rest_align                 = cfg.bvh_rest_align;
+    bo.dump_rest_dirs             = cfg.bvh_dump_rest_dirs;
+    if (!w.open(cfg.bvh_template, cfg.bvh_path, 1.0f / (float)fps, cfg.lbs_path, bo))
     {
         fprintf(stderr, "[pass6] BVHWriter::open failed — aborting export\n");
         return;

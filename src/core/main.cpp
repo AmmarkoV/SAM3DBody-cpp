@@ -647,17 +647,18 @@ int main(int argc, char** argv)
         // --bvh is unset (write_frame is gated below).  Pass bvh_path as-is.
         const std::string out_path = c.bvh_path;
 
+        BVHWriterOptions bo;
+        bo.rewrite_body_offsets       = c.bvh_body_shape_change;
+        bo.rewrite_hand_offsets       = c.bvh_hand_shape_change;
+        bo.compensate_finger_endsites = c.bvh_compensate_finger_endsites;
+        bo.enforce_hand_limits        = c.bvh_enforce_hand_limits;
+        bo.zero_hand_pose             = c.bvh_zero_hand_pose;
+        bo.sticky_hand_pose           = c.bvh_sticky_hand_pose;
+        bo.rest_align                 = c.bvh_rest_align;
+        bo.dump_rest_dirs             = c.bvh_dump_rest_dirs;
         if (!bvh_writer.open(c.bvh_template, out_path,
                              1.0f / (float)source_fps,
-                             lbs_path,
-                             c.bvh_body_shape_change,
-                             c.bvh_hand_shape_change,
-                             c.bvh_compensate_finger_endsites,
-                             c.bvh_enforce_hand_limits,
-                             c.bvh_zero_hand_pose,
-                             c.bvh_sticky_hand_pose,
-                             c.bvh_rest_align,
-                             c.bvh_dump_rest_dirs))
+                             lbs_path, bo))
         {
             fprintf(stderr, "[main] BVH writer failed to open (continuing without BVH output).\n");
             if (bvh_stream_fp && bvh_stream_fp != stdout) fclose(bvh_stream_fp);

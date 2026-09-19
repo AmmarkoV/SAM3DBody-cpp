@@ -15,6 +15,7 @@
 #include "preprocess.hpp"
 #include "pthreadWorkerPool.h"
 #include "focus.h"
+#include "cffn.h"
 
 // ── ggml headers ─────────────────────────────────────────────────────────────
 #if __has_include(<ggml/ggml.h>)
@@ -113,12 +114,13 @@ static uint32_t gguf_u32(gguf_context* c, const char* k, uint32_t def=0)
 //   {prefix}.fc0.{weight,bias}   –  shape [hid, in] / [hid]
 //   {prefix}.fc1.{weight,bias}   –  shape [out, hid] / [out]
 //
-// Row-major storage: w0[i * in_dim + j] = weight from input j to hidden i.
-// Inference: y = relu(x @ w0.T + b0) @ w1.T + b1
+// Weights are transposed on load to [in, out] (w0[j * hid_dim + i] = weight
+// from input j to hidden i) — see cffn.h for why.
+// Inference: y = relu(x @ w0 + b0) @ w1 + b1
 // ─────────────────────────────────────────────────────────────────────────────
 struct CFFN
 {
-    std::vector<float> w0, b0, w1, b1;
+    std::vector<float> w0, b0, w1, b1;   // w0 [in, hid], w1 [hid, out]
     int in_dim=0, hid_dim=0, out_dim=0;
 };
 
@@ -184,24 +186,9 @@ static bool cffn_load(CFFN& ffn,
     ffn.in_dim  = (int)w0t->ne[0];
     ffn.hid_dim = (int)w0t->ne[1];
     ffn.out_dim = (int)w1t->ne[1];
+    ffn.w0 = transpose_rows(ffn.w0, ffn.hid_dim, ffn.in_dim);
+    ffn.w1 = transpose_rows(ffn.w1, ffn.out_dim, ffn.hid_dim);
     return true;
-}
-
-// y = relu(x @ w.T + b)   x:[B,K]  w:[N,K]  b:[N]  → out:[B,N]
-static void linear_relu(const float* x, const float* w, const float* b,
-                        float* y, int B, int K, int N, bool relu)
-{
-    for (int bi = 0; bi < B; ++bi)
-    {
-        for (int n = 0; n < N; ++n)
-        {
-            float s = b[n];
-            const float* xr = x + bi * K;
-            const float* wr = w + n * K;
-            for (int k = 0; k < K; ++k) s += xr[k] * wr[k];
-            y[bi * N + n] = relu ? std::max(0.f, s) : s;
-        }
-    }
 }
 
 static std::vector<float> cffn_run(const CFFN& ffn, const float* x, int B)
@@ -363,7 +350,8 @@ static size_t trt_workspace_bytes(int device)
 struct OrtSession
 {
     Ort::Env*             env     = nullptr;
-    Ort::Session*         session = nullptr;
+    std::unique_ptr<Ort::Session> session;
+    std::string           path;     // model file, for diagnostics
     Ort::MemoryInfo       mem_info{ nullptr };
     std::vector<std::string>       input_names_s,  output_names_s;
     std::vector<const char*>       input_names,    output_names;
@@ -476,7 +464,7 @@ struct OrtSession
                 }
                 // EP_CPU: append nothing — the default CPU EP runs.
 
-                session = new Ort::Session(e, path.c_str(), opts);
+                session = std::make_unique<Ort::Session>(e, path.c_str(), opts);
                 if (ep == EP_CPU && cuda)
                     fprintf(stderr, "[ORT] WARNING: '%s' running on CPU (GPU EPs unavailable)\n",
                             path.c_str());
@@ -500,6 +488,7 @@ struct OrtSession
         }
         if (!session) return false;
         env = &e;
+        this->path = path;
 
         Ort::AllocatorWithDefaultOptions alloc;
         size_t n_in  = session->GetInputCount();
@@ -545,8 +534,7 @@ struct OrtSession
             auto prof_file = session->EndProfilingAllocated(alloc);
             fprintf(stderr, "[ORT] profile written: %s\n", prof_file.get());
         }
-        delete session;
-        session = nullptr;
+        session.reset();
         profiling_enabled = on_gpu = on_trt = false;
     }
 };
@@ -1045,7 +1033,7 @@ struct Pipeline::Impl
     ModelParams204 make_model_params(const float* global_rot_rxryrz, const float* body_euler,
                                      const float* hand108, const float* scale28) const
     {
-        ModelParams204 mp = build_model_params(global_rot_rxryrz, body_euler, nullptr, true);
+        ModelParams204 mp = build_model_params(global_rot_rxryrz, body_euler);
         if (!lbs_data) return mp;
         apply_hand_pose(mp.data, hand108,
                         lbs_data->hand_pose_mean, lbs_data->hand_pose_comps,
@@ -1552,6 +1540,25 @@ struct Pipeline::Impl
         return true;
     }
 
+    // Every ONNX session this Pipeline can own, loaded or not.  One list, so
+    // teardown and the --pipeline EP check cannot drift apart.
+    std::vector<OrtSession*> all_sessions()
+    {
+        std::vector<OrtSession*> v{ &sess_yolo, &sess_backbone, &sess_decoder, &sess_body,
+                                    &sess_decoder_pass1_pre,     &sess_decoder_pass1_normfinal,
+                                    &sess_decoder_pass1_update,  &sess_decoder_pass1_handbox,
+                                    &sess_decoder_pass1_head,
+                                    &sess_decoder_hand_pre,      &sess_decoder_hand_normfinal,
+                                    &sess_decoder_hand_update,   &sess_decoder_hand_head,
+                                    &sess_decoder_prompted_pre,  &sess_decoder_prompted_normfinal,
+                                    &sess_decoder_prompted_update, &sess_decoder_prompted_head };
+        for (std::array<OrtSession,6>* g : { &sess_decoder_pass1_layers,
+                                             &sess_decoder_hand_layers,
+                                             &sess_decoder_prompted_layers })
+            for (OrtSession& layer : *g) v.push_back(&layer);
+        return v;
+    }
+
     // ── process_bgr ───────────────────────────────────────────────────────────
     std::vector<MHRResult> process_bgr(const uint8_t* bgr, int W, int H)
     {
@@ -1625,16 +1632,19 @@ struct Pipeline::Impl
         // in 6 runs of 25 frames at depth 2, each aborting in a DIFFERENT
         // backbone node (Concat_2 / Expand_2 / qkv/MatMul / qkv/Cast) with
         // nonsense allocation sizes — the signature of arena corruption, not one
-        // bad operator.  The backbone is the graph that matters: it is the
-        // largest, and every path runs it.  Refuse rather than hand the user a
-        // race, and say why.
-        if (!sess_backbone.on_trt)
+        // bad operator.  That holds for every graph a frame runs, not just the
+        // backbone: the refined-pose pre/update/normfinal/handbox graphs are
+        // always CUDA EP, and any --trt session can fall back to CUDA at load.
+        // Refuse rather than hand the user a race, and say which graph.
+        for (const OrtSession* s : all_sessions())
         {
+            if (!s->session || s->on_trt) continue;
             fprintf(stderr,
-                "[FSB] --pipeline %d ignored: frame pipelining needs the TensorRT EP\n"
-                "      for the backbone (add --trt).  Running several frames through a\n"
+                "[FSB] --pipeline %d ignored: frame pipelining needs every graph on the\n"
+                "      TensorRT EP, and '%s' is not (add --trt; --refined-pose always\n"
+                "      keeps some graphs on CUDA).  Running several frames through a\n"
                 "      CUDA-EP session concurrently corrupts ONNX Runtime's arena in\n"
-                "      this build.  Continuing single-threaded.\n", n);
+                "      this build.  Continuing single-threaded.\n", n, s->path.c_str());
             return false;
         }
         pipe_bank[0].resize(n);
@@ -1785,7 +1795,6 @@ struct Pipeline::Impl
         const cv::Mat& bgr = *ctx.bgr;
         const int W = ctx.W;
         const int H = ctx.H;
-        const int B = ctx.B;
         const Ort::MemoryInfo& mi = ctx.mi;
 
         // ── person detection ──────────────────────────────────────────────────
@@ -1958,7 +1967,6 @@ struct Pipeline::Impl
     // one normalised crop + conditioning per person
     void build_person_crops(FrameContext& ctx)
     {
-        auto t0 = Clock::now();
         const cv::Mat& bgr = *ctx.bgr;
         const float fx = ctx.fx;
         const float fy = ctx.fy;
@@ -1979,7 +1987,7 @@ struct Pipeline::Impl
         auto& crop_cy_v = ctx.crop_cy_v; crop_cy_v.assign(B, 0.f);
         auto& crop_sz_v = ctx.crop_sz_v; crop_sz_v.assign(B, 0.f);
 
-        t0 = Clock::now();
+        auto t0 = Clock::now();
         for (int i = 0; i < B; ++i)
         {
             const auto& d = dets[i];
@@ -2005,13 +2013,12 @@ struct Pipeline::Impl
     // ViT-H features for every person crop
     void run_backbone(FrameContext& ctx)
     {
-        auto t0 = Clock::now();
         const int B = ctx.B;
         auto& batch_crops = ctx.batch_crops;
         const Ort::MemoryInfo& mi = ctx.mi;
 
         // ── backbone ─────────────────────────────────────────────────────────
-        t0 = Clock::now();
+        auto t0 = Clock::now();
 
         std::vector<int64_t> img_shape{B, 3, CROP_SIZE, CROP_SIZE};
 
@@ -2024,7 +2031,7 @@ struct Pipeline::Impl
         // backbone_out owns this buffer and stays in scope for the whole frame
         // (pass 1 at the decoder below, pass 2 further down), so point at it
         // directly rather than memcpy'ing 5.2 MB per person into a vector.
-        float* features = ctx.features = ctx.backbone_out[0].GetTensorMutableData<float>();
+        ctx.features = ctx.backbone_out[0].GetTensorMutableData<float>();
         double dt_bb = ms(t0);
         add_time(timers.backbone, dt_bb);
         printf("[FSB] backbone:   %.1f ms\n", dt_bb);
@@ -2033,7 +2040,6 @@ struct Pipeline::Impl
     // pass 1: pose tokens, and hand boxes when refining
     void run_pass1_decoder(FrameContext& ctx)
     {
-        auto t0 = Clock::now();
         const float fx = ctx.fx;
         const float fy = ctx.fy;
         const float cx = ctx.cx;
@@ -2046,11 +2052,10 @@ struct Pipeline::Impl
         auto& crop_cy_v = ctx.crop_cy_v;
         auto& crop_sz_v = ctx.crop_sz_v;
         float* features = ctx.features;
-        auto& results = ctx.results;
         const Ort::MemoryInfo& mi = ctx.mi;
 
         // ── decoder (pass 1) ─────────────────────────────────────────────────
-        t0 = Clock::now();
+        auto t0 = Clock::now();
         const int DECODER_DIM = (int)meta.decoder_dim;
         const size_t token_elems = (size_t)B * DECODER_DIM;
         const size_t feat_elems  = (size_t)B * BACKBONE_DIM * FEAT_HW * FEAT_HW;
@@ -2184,14 +2189,13 @@ struct Pipeline::Impl
     // pose tokens -> raw MHR/camera regression
     void run_mhr_head(FrameContext& ctx)
     {
-        auto t0 = Clock::now();
         const int B = ctx.B;
         auto& pose_tokens = ctx.pose_tokens;
         auto& mhr_raw = ctx.mhr_raw;
         auto& cam_raw = ctx.cam_raw;
 
         // ── MHR head (CPU FFN) ────────────────────────────────────────────────
-        t0 = Clock::now();
+        auto t0 = Clock::now();
         if (mhr_raw.empty())
         {
             mhr_raw = cffn_run(mhr_ffn, pose_tokens.data(), B);
@@ -2208,7 +2212,6 @@ struct Pipeline::Impl
         auto t0 = Clock::now();
         const cv::Mat& bgr = *ctx.bgr;
         const int W = ctx.W;
-        const int H = ctx.H;
         const float fx = ctx.fx;
         const float fy = ctx.fy;
         const float cx = ctx.cx;
@@ -2217,11 +2220,7 @@ struct Pipeline::Impl
         auto& crop_cx_v = ctx.crop_cx_v;
         auto& crop_cy_v = ctx.crop_cy_v;
         auto& crop_sz_v = ctx.crop_sz_v;
-        float* features = ctx.features;
-        auto& cam_raw = ctx.cam_raw;
         auto& hand_box_out = ctx.hand_box_out;
-        auto& hand_cls_out = ctx.hand_cls_out;
-        auto& results = ctx.results;
         const Ort::MemoryInfo& mi = ctx.mi;
 
         // ── Refined pose: hand-crop decoder passes ──────────────────────────
@@ -2560,7 +2559,7 @@ struct Pipeline::Impl
                 compact_cont_to_body_params(body_cont, body_euler);
 
                 // Build model_params [204]
-                ModelParams204 mp = build_model_params(global_rot_euler, body_euler, nullptr, true);
+                ModelParams204 mp = build_model_params(global_rot_euler, body_euler);
 
                 // Copy into batch buffers
                 std::memcpy(batch_shape.data()   + i * 45,  shape, 45  * sizeof(float));
@@ -2859,7 +2858,7 @@ struct Pipeline::Impl
                 MHRResult& pr = results[pi];
                 if (pr.body_pose.size() < 133 || pr.global_rot.size() < 3) continue;
                 float g_rxryrz[3] = { pr.global_rot[2], pr.global_rot[1], pr.global_rot[0] };
-                ModelParams204 mp1 = build_model_params(g_rxryrz, pr.body_pose.data(), nullptr, true);
+                ModelParams204 mp1 = build_model_params(g_rxryrz, pr.body_pose.data());
                 // Only q1 (per-joint global quats) is read below — the 18439 vertices
                 // and 127 joint positions this used to compute were never touched.
                 // The zero shape vector it passed is gone with them: the skeleton
@@ -3382,8 +3381,8 @@ struct Pipeline::Impl
                     // for comparison/debugging.
                     bool use_pass1_for_zero_rot = g_diag.zero_rot_pass1;
                     ModelParams204 mp2 = use_pass1_for_zero_rot
-                        ? build_model_params(pass1_global_rot_rxryrz, pass1_body_euler_snapshot.data(), nullptr, true)
-                        : build_model_params(p2_global_rot_euler, p2_body_euler.data(), nullptr, true);
+                        ? build_model_params(pass1_global_rot_rxryrz, pass1_body_euler_snapshot.data())
+                        : build_model_params(p2_global_rot_euler, p2_body_euler.data());
                     // hand/scale not needed for FK (arms only) — only joint rotations
                     // are used, not vertices.  The zero-shape vector and the
                     // FSB_Q2_REAL_SHAPE diagnostic that toggled it against the real
@@ -3775,28 +3774,12 @@ struct Pipeline::Impl
         kp_mapping.clear();
         kp_mapping_sub.clear();
         kp_subset_n = 0;
-        sess_backbone.free();
-        sess_decoder.free();
-        sess_body.free();
-        sess_yolo.free();
-
-        // The refined-pose graphs — 31 further sessions across three groups —
-        // used to be left dangling here, so only 4 of ~35 were released.  Under
-        // --trt each one owns a deserialised TensorRT engine, so leaking them
-        // costs device memory every time a Pipeline is reloaded in a long-lived
-        // process (the ROS node and sam_3dbody_net both do that).
-        for (OrtSession* s : { &sess_decoder_pass1_pre,     &sess_decoder_pass1_normfinal,
-                               &sess_decoder_pass1_update,  &sess_decoder_pass1_handbox,
-                               &sess_decoder_pass1_head,
-                               &sess_decoder_hand_pre,      &sess_decoder_hand_normfinal,
-                               &sess_decoder_hand_update,   &sess_decoder_hand_head,
-                               &sess_decoder_prompted_pre,  &sess_decoder_prompted_normfinal,
-                               &sess_decoder_prompted_update, &sess_decoder_prompted_head })
+        // Every session, including the ~31 refined-pose graphs: under --trt
+        // each owns a deserialised TensorRT engine, so leaking one costs device
+        // memory every time a Pipeline is reloaded in a long-lived process (the
+        // ROS node and sam_3dbody_net both do that).
+        for (OrtSession* s : all_sessions())
             s->free();
-        for (std::array<OrtSession,6>* g : { &sess_decoder_pass1_layers,
-                                             &sess_decoder_hand_layers,
-                                             &sess_decoder_prompted_layers })
-            for (OrtSession& layer : *g) layer.free();
         if (lbs_cuda) { mhr_lbs_cuda_free(lbs_cuda); lbs_cuda = nullptr; }
         if (lbs_kp_subset) { mhr_lbs_subset_free(lbs_kp_subset); lbs_kp_subset = nullptr; }
         if (lbs_data)
@@ -3839,11 +3822,20 @@ struct Pipeline::Impl
 // ─────────────────────────────────────────────────────────────────────────────
 // Pipeline  (public interface)
 // ─────────────────────────────────────────────────────────────────────────────
-Pipeline::Pipeline()  : impl_(new Impl) {}
+Pipeline::Pipeline()  : impl_(std::make_unique<Impl>()) {}
 Pipeline::~Pipeline()
 {
     free();
-    delete impl_;
+}
+Pipeline::Pipeline(Pipeline&&) noexcept            = default;
+Pipeline& Pipeline::operator=(Pipeline&& o) noexcept
+{
+    if (this != &o)
+    {
+        free();                 // release the models we are about to drop
+        impl_ = std::move(o.impl_);
+    }
+    return *this;
 }
 
 bool Pipeline::load(const PipelineConfig& cfg)

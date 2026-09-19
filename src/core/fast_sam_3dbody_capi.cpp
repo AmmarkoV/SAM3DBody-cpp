@@ -6,7 +6,9 @@
 #include "fast_sam_3dbody.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
+#include <exception>
 
 extern "C" {
 
@@ -47,7 +49,22 @@ extern "C" {
         pc.zero_face_params = cfg->zero_face_params != 0;
         pc.refined_pose     = cfg->refined_pose != 0;
 
-        return p->load(pc) ? 1 : 0;
+        // Nothing may unwind out of an extern "C" function: ctypes callers
+        // would hit std::terminate instead of seeing a failed load.
+        try
+        {
+            return p->load(pc) ? 1 : 0;
+        }
+        catch (const std::exception& e)
+        {
+            fprintf(stderr, "[CAPI] fsb_load failed: %s\n", e.what());
+            return 0;
+        }
+    }
+
+    int fsb_result_size(void)
+    {
+        return (int)sizeof(FsbResult);
     }
 
     int fsb_process_bgr(FsbHandle      h,
@@ -60,7 +77,16 @@ extern "C" {
         if (!h || !bgr || !results || max_results <= 0) return 0;
         auto* p = static_cast<fsb::Pipeline*>(h);
 
-        std::vector<fsb::MHRResult> res = p->process_bgr(bgr, width, height);
+        std::vector<fsb::MHRResult> res;
+        try
+        {
+            res = p->process_bgr(bgr, width, height);
+        }
+        catch (const std::exception& e)
+        {
+            fprintf(stderr, "[CAPI] fsb_process_bgr failed: %s\n", e.what());
+            return 0;
+        }
         int n = std::min((int)res.size(), max_results);
         printf("[CAPI] process_bgr returned %d results\n", n);
 

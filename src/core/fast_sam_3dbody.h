@@ -16,6 +16,7 @@
 
 #include <array>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -203,11 +204,11 @@ public:
     Pipeline();
     ~Pipeline();
 
-    // Non-copyable, moveable
+    // Non-copyable, moveable (defined in the .cpp, where Impl is complete)
     Pipeline(const Pipeline&)            = delete;
     Pipeline& operator=(const Pipeline&) = delete;
-    Pipeline(Pipeline&&)                 = default;
-    Pipeline& operator=(Pipeline&&)      = default;
+    Pipeline(Pipeline&&) noexcept;
+    Pipeline& operator=(Pipeline&&) noexcept;
 
     // Load all models.  Returns false on failure.
     bool load(const PipelineConfig& cfg);
@@ -267,7 +268,7 @@ public:
 
 private:
     struct Impl;
-    Impl* impl_ = nullptr;
+    std::unique_ptr<Impl> impl_;
 };
 
 } // namespace fsb

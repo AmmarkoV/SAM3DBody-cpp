@@ -3,6 +3,7 @@
 
 #include "arf_writer.h"
 #include "arf_json.h"
+#include "bbox_iou.h"
 #include "fast_sam_3dbody.h"
 #include "mhr_joint_table.h"
 
@@ -355,22 +356,6 @@ std::string per_person_path(const std::string& base, const std::string& prefix, 
 // ─── tracker (greedy IoU — identical algorithm to BVHWriter's; unrelated to
 // BVH, so this is a pure bbox-tracking duplicate, not a second FK) ─────────
 
-float ARFWriter::bbox_iou(const float a[4], const float b[4])
-{
-    float ix1 = std::max(a[0], b[0]);
-    float iy1 = std::max(a[1], b[1]);
-    float ix2 = std::min(a[2], b[2]);
-    float iy2 = std::min(a[3], b[3]);
-    float iw = std::max(0.f, ix2 - ix1);
-    float ih = std::max(0.f, iy2 - iy1);
-    float inter = iw * ih;
-    if (inter <= 0.f) return 0.f;
-    float aa = std::max(0.f, a[2]-a[0]) * std::max(0.f, a[3]-a[1]);
-    float bb = std::max(0.f, b[2]-b[0]) * std::max(0.f, b[3]-b[1]);
-    float u  = aa + bb - inter;
-    return u > 0.f ? inter / u : 0.f;
-}
-
 std::vector<int> ARFWriter::assign_tracks(const std::vector<fsb::MHRResult>& results)
 {
     const int F = session_frames_;
@@ -384,7 +369,7 @@ std::vector<int> ARFWriter::assign_tracks(const std::vector<fsb::MHRResult>& res
         const float* db = results[d].bbox.data();
         for (size_t t = 0; t < tracks_.size(); ++t)
         {
-            float v = bbox_iou(db, tracks_[t].bbox);
+            float v = fsb::bbox_iou(db, tracks_[t].bbox);
             if (v >= TRACK_IOU_THRESH) pairs.push_back({(int)d, (int)t, v});
         }
     }

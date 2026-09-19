@@ -77,6 +77,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <exception>
 #include <string>
 #include <vector>
 
@@ -182,8 +183,14 @@ static bool parse_args(int argc, char** argv, Config& c)
         // flag falls through to the offline-specific dispatch below.
         if (parse_common_arg(argc, argv, i, c)) continue;
 
+        // std::stoi/stof throw on a non-number; report the flag instead of
+        // letting the exception abort the run.
 #define A1(flag, field, conv) \
-        if (!strcmp(argv[i], flag) && i+1 < argc) { c.field = conv(argv[++i]); continue; }
+        if (!strcmp(argv[i], flag) && i+1 < argc) { \
+            try { c.field = conv(argv[++i]); } \
+            catch (const std::exception&) { \
+                fprintf(stderr, "bad value for %s: '%s'\n", flag, argv[i]); return false; } \
+            continue; }
         A1("--lbs",                     lbs_path,            std::string)
         A1("--track-merge-frames",      track_merge_frames,  std::stoi)
         A1("--track-merge-cm",          track_merge_cm,      std::stof)

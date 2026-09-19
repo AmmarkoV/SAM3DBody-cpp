@@ -174,6 +174,13 @@ class FsbResult(ctypes.Structure):
         ("kps_3d",       ctypes.c_float * 210),
         ("kps_2d",       ctypes.c_float * 140),
         ("has_kps",      ctypes.c_int),
+        # ── fields appended after the v1 ABI — must match FsbResult in
+        # src/core/fast_sam_3dbody_capi.h exactly (checked at load time) ──
+        ("pred_pose_raw",    ctypes.c_float * 266),
+        ("pred_cam_raw",     ctypes.c_float * 3),
+        ("mhr_model_params", ctypes.c_float * 204),
+        ("skel_3d",          ctypes.c_float * 381),   # [127 × 3]
+        ("has_skel",         ctypes.c_int),
     ]
 
 
@@ -187,6 +194,13 @@ def load_library(lib_dir: str) -> ctypes.CDLL:
     os.environ["LD_LIBRARY_PATH"] = ":".join(filter(None, [lib_dir, ort_lib, prev]))
 
     lib = ctypes.CDLL(lib_path)
+    lib.fsb_result_size.restype  = ctypes.c_int
+    lib.fsb_result_size.argtypes = []
+    if lib.fsb_result_size() != ctypes.sizeof(FsbResult):
+        raise RuntimeError(
+            f"FsbResult layout mismatch: C library has {lib.fsb_result_size()} bytes, "
+            f"this script {ctypes.sizeof(FsbResult)} — update the ctypes mirror "
+            f"to match src/core/fast_sam_3dbody_capi.h")
     lib.fsb_create.restype  = ctypes.c_void_p
     lib.fsb_create.argtypes = []
     lib.fsb_destroy.restype  = None

@@ -248,6 +248,13 @@ def _load_library(lib_dir):
         p for p in (lib_dir, ort_lib, previous) if p)
 
     lib = ctypes.CDLL(lib_path)
+    lib.fsb_result_size.restype  = ctypes.c_int
+    lib.fsb_result_size.argtypes = []
+    if lib.fsb_result_size() != ctypes.sizeof(FsbResult):
+        raise RuntimeError(
+            f"FsbResult layout mismatch: C library has {lib.fsb_result_size()} bytes, "
+            f"this script {ctypes.sizeof(FsbResult)} — update the ctypes mirror "
+            f"to match src/core/fast_sam_3dbody_capi.h")
     lib.fsb_create.restype = ctypes.c_void_p
     lib.fsb_create.argtypes = []
     lib.fsb_destroy.restype = None

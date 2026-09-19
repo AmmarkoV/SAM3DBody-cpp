@@ -9,6 +9,8 @@
 #include <cstring>
 #include <vector>
 
+#include "bbox_iou.h"
+
 namespace fsb {
 
 // ─── image normalisation constants (from model_config.yaml) ──────────────────
@@ -238,14 +240,9 @@ struct PersonDet {
 };
 
 static inline float iou(const PersonDet& a, const PersonDet& b) {
-    float ix1 = std::max(a.x1, b.x1);
-    float iy1 = std::max(a.y1, b.y1);
-    float ix2 = std::min(a.x2, b.x2);
-    float iy2 = std::min(a.y2, b.y2);
-    float inter = std::max(0.f, ix2 - ix1) * std::max(0.f, iy2 - iy1);
-    if (inter == 0.f) return 0.f;
-    float ua = (a.x2-a.x1)*(a.y2-a.y1) + (b.x2-b.x1)*(b.y2-b.y1) - inter;
-    return inter / (ua + 1e-6f);
+    const float ab[4] = { a.x1, a.y1, a.x2, a.y2 };
+    const float bb[4] = { b.x1, b.y1, b.x2, b.y2 };
+    return bbox_iou(ab, bb);
 }
 
 // Parse YOLO Pose output tensor [num_dets, num_feat] (already transposed to
@@ -766,53 +763,26 @@ inline void apply_hand_pose(
     decode_one(hand_pose_params + 54, hand_joint_idxs_right);  // right hand: cont[54:108]
 }
 
-// ─── Assemble model_params [204] for the torch.jit body model ─────────────────
+// ─── Assemble model_params [204] for the MHR body model ─────────────────────
 //
-// body_model.onnx expects:
-//   shape      [45]   identity blend shape betas
-//   body_params[204]  = full_pose_params [136] + scales [68]
-//   face       [72]
-//
-// Actually: the MHR model is called with (shape_params, model_params, expr_params).
-// model_params=[204] = cat([full_pose_params, scales], dim=1)
-// where full_pose_params=[136] = global_trans[3]+global_rot_euler[3]+body_pose[133]???
-// The exact layout depends on the jit model.  We pass scale zeros for body_params[136:].
-//
-// From the code: model_params = torch.cat([full_pose_params, scales], dim=1)
-//   full_pose_params [B,136] is assembled in _mhr_forward_core
-//   scales           [B,68]  comes from scale_comps PCA decode
-//
-// For inference we zero-fill scales and set full_pose_params from predictions.
-// Caller uses build_model_params_from_prediction() below.
-//
-// BUG (2026-04-27): The correct layout from the Python reference code
-// (mhr_head.py _mhr_forward_core line 574-576) is:
-//   full_pose_params = torch.cat([global_trans * 10, global_rot, body_pose_params], dim=1)
-//   model_params     = torch.cat([full_pose_params, scales], dim=1)
-// So model_params layout is:
-//   [0:3]   = global_trans (scaled by 10, zeroed in single-view)
-//   [3:6]   = global_rot_euler
-//   [6:136] = body_pose_params (first 130 of 133 joints)
-//   [136:204] = scales (zeroed)
-// The current C++ implementation below puts global_rot at [0:2] and body_pose at [3:135],
-// which is WRONG — it shifts everything by 3 positions into the wrong PT matrix columns.
-// This causes garbage joint parameters and a deformed mesh.
-//
-// Additionally, hand joints should be zeroed (mhr_head.py line 433):
-//   pred_pose_euler[:, mhr_param_hand_idxs] = 0
-// And global_trans is zeroed (mhr_head.py line 427):
-//   global_trans = torch.zeros_like(global_rot_euler)
+// The body model is called with (shape[45], model_params[204], face[72]).
+// Layout, from mhr_head.py _mhr_forward_core:
+//   full_pose_params = cat([global_trans * 10, global_rot, body_pose_params])
+//   model_params     = cat([full_pose_params, scales])
+//   [0:3]     global_trans (zeroed: single-view inference, mhr_head.py:427)
+//   [3:6]     global_rot_euler, in Python's (rz, ry, rx) order
+//   [6:136]   body_pose_params, the first 130 of 133, with the hand joints
+//             zeroed (mhr_head.py:433, pred_pose_euler[:, hand_idxs] = 0)
+//   [136:204] scales — left zero here; make_model_params() in
+//             fast_sam_3dbody.cpp decodes them (and the hand pose) when the
+//             LBS tables are loaded.
 struct ModelParams204 {
     float data[204] = {};
 };
 
 inline ModelParams204 build_model_params(
     const float* global_rot_euler,  // [3]  (ZYX Euler from rot6d_to_euler)
-    const float* body_euler,        // [133]
-    const float* scale_params,      // [28]  raw scale params (PCA codes)
-    // scale_comps [28×68] and scale_mean [68] from the body model are not
-    // available here – set scales to zero for a reasonable result
-    bool         zero_scales = true
+    const float* body_euler         // [133]
 )
 {
     ModelParams204 out{};
@@ -852,9 +822,7 @@ inline ModelParams204 build_model_params(
     for (int i = 68; i <= 121; ++i)
         out.data[i] = 0.0f;
 
-    // [136:204] = scales (zeroed)
-    // Already zeroed by default initialization
-    (void)scale_params; (void)zero_scales;
+    // [136:204] = scales: left zero by the initialiser
     return out;
 }
 

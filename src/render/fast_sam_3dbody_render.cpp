@@ -1213,14 +1213,16 @@ int main(int argc, const char** argv) {
     BVHWriter bvh_writer;
     if (!bvh_path.empty()) {
         if (bvh_template.empty()) bvh_template = "./bvh/body_mhr.bvh";
-        if (!bvh_writer.open(bvh_template, bvh_path, 1.f / video_fps, lbs_path,
-                             bvh_body_shape_change, bvh_hand_shape_change,
-                             bvh_compensate_finger_endsites,
-                             bvh_enforce_hand_limits,
-                             bvh_zero_hand_pose,
-                             bvh_sticky_hand_pose,
-                             bvh_rest_align,
-                             bvh_dump_rest_dirs))
+        BVHWriterOptions bo;
+        bo.rewrite_body_offsets       = bvh_body_shape_change;
+        bo.rewrite_hand_offsets       = bvh_hand_shape_change;
+        bo.compensate_finger_endsites = bvh_compensate_finger_endsites;
+        bo.enforce_hand_limits        = bvh_enforce_hand_limits;
+        bo.zero_hand_pose             = bvh_zero_hand_pose;
+        bo.sticky_hand_pose           = bvh_sticky_hand_pose;
+        bo.rest_align                 = bvh_rest_align;
+        bo.dump_rest_dirs             = bvh_dump_rest_dirs;
+        if (!bvh_writer.open(bvh_template, bvh_path, 1.f / video_fps, lbs_path, bo))
             fprintf(stderr, "[BVH] Warning: could not open BVH writer\n");
         else {
             bvh_writer.set_foot_contact(bvh_foot_contact);

@@ -565,6 +565,18 @@ enable_testing()
 add_subdirectory(src/multiview)
 
 # ---------------------------------------------------------------------------
+# core_test — deterministic checks for the pure helpers in src/core (FFN
+# kernel, bbox IoU, model_params layout).  No models or GPU needed.
+# ---------------------------------------------------------------------------
+add_executable(core_test src/core/core_test.cpp)
+target_include_directories(core_test PRIVATE ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(core_test PRIVATE ${OpenCV_LIBS})
+target_compile_options(core_test PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang>:-O2 -Wall -Wextra -march=native>
+)
+add_test(NAME core_test COMMAND core_test)
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 if(WIN32)

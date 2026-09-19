@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -35,6 +36,7 @@
 
 #include "fast_sam_3dbody.h"
 #include "bvh_writer.h"
+#include "bbox_iou.h"
 
 extern "C" {
 #include "AmmServerlib.h"
@@ -247,17 +249,6 @@ static int g_frame_idx = 0;
 static const int RETIRE_FRAMES = 90;   // ~3 s @ 30 fps
 static const float IOU_THRESH  = 0.10f;
 
-static float iou(const float a[4], const float b[4])
-{
-    float x1 = std::max(a[0], b[0]), y1 = std::max(a[1], b[1]);
-    float x2 = std::min(a[2], b[2]), y2 = std::min(a[3], b[3]);
-    float iw = x2 - x1, ih = y2 - y1;
-    if (iw <= 0 || ih <= 0) return 0.f;
-    float inter = iw * ih;
-    float ua = (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter;
-    return ua > 0 ? inter / ua : 0.f;
-}
-
 // Assign stable ids to this frame's detections; also report which existing
 // (still-alive) tracks were NOT detected this frame so the BVH writer can pad
 // them and keep all per-person frame counts in lock-step.
@@ -273,7 +264,7 @@ static std::vector<int> assign_tracks(const std::vector<fsb::MHRResult>& res,
     std::vector<Cand> cand;
     for (int d = 0; d < n; ++d)
         for (int t = 0; t < (int)g_tracks.size(); ++t) {
-            float v = iou(res[d].bbox.data(), g_tracks[t].bbox);
+            float v = fsb::bbox_iou(res[d].bbox.data(), g_tracks[t].bbox);
             if (v >= IOU_THRESH) cand.push_back({v, d, t});
         }
     std::sort(cand.begin(), cand.end(),
@@ -377,8 +368,19 @@ static void* infer_callback(AmmServer_DynamicRequest* rqst)
             return 0;
         }
 
-        std::vector<fsb::MHRResult> res =
-            g_pipeline.process_bgr(bgr.data, bgr.cols, bgr.rows);
+        // This runs inside an AmmarServer C callback; an exception unwinding
+        // out of it would terminate the server, so turn it into an error reply.
+        std::vector<fsb::MHRResult> res;
+        try {
+            res = g_pipeline.process_bgr(bgr.data, bgr.cols, bgr.rows);
+        } catch (const std::exception& e) {
+            fprintf(stderr, "[server] inference failed: %s\n", e.what());
+            const char* msg = "SAM3D error inference-failed\n";
+            size_t m = std::min((size_t)rqst->MAXcontentSize, strlen(msg));
+            std::memcpy(rqst->content, msg, m);
+            rqst->contentSize = m;
+            return 0;
+        }
 
         std::vector<int> pad_ids;
         std::vector<int> ids = assign_tracks(res, pad_ids);

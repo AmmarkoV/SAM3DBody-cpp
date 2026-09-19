@@ -127,7 +127,6 @@ private:
     std::unordered_map<int, std::vector<float>> colors_;   // set_person_colors
 
     std::vector<int> assign_tracks(const std::vector<fsb::MHRResult>& results);
-    static float bbox_iou(const float a[4], const float b[4]);
 
     void append_frame_for(PerPerson& p, const fsb::MHRResult& r);
     void pad_continuation_frame(PerPerson& p);

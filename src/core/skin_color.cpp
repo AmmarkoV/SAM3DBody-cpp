@@ -1,5 +1,6 @@
 // skin_color.cpp  –  see skin_color.h
 #include "skin_color.h"
+#include "bbox_iou.h"
 
 #include <algorithm>
 #include <cmath>
@@ -278,15 +279,6 @@ float SkinColorAccumulator::coverage() const
 
 // ── PersonSlots ──────────────────────────────────────────────────────────────
 
-static float box_iou(const std::array<float, 4>& a, const std::array<float, 4>& b)
-{
-    float ix = std::max(0.f, std::min(a[2], b[2]) - std::max(a[0], b[0]));
-    float iy = std::max(0.f, std::min(a[3], b[3]) - std::max(a[1], b[1]));
-    float inter = ix * iy;
-    float uni = (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter;
-    return uni > 0.f ? inter / uni : 0.f;
-}
-
 std::vector<int> PersonSlots::assign(const std::vector<std::array<float, 4>>& boxes,
                                      const std::vector<float>& discrepancy)
 {
@@ -306,7 +298,7 @@ std::vector<int> PersonSlots::assign(const std::vector<std::array<float, 4>>& bo
     std::vector<Pair> pairs;
     for (size_t b = 0; b < boxes.size(); ++b)
         for (size_t s = 0; s < S; ++s) {
-            float iou = box_iou(boxes[b], last_box_[s]);
+            float iou = fsb::bbox_iou(boxes[b], last_box_[s]);
             float d   = have_app ? discrepancy[b * S + s] : -1.f;
             if (d < 0.f) {
                 if (iou >= MIN_IOU) pairs.push_back({iou, (int)b, (int)s});

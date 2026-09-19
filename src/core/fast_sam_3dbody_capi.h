@@ -100,11 +100,17 @@ void      fsb_destroy(FsbHandle h);
 // Returns 1 on success, 0 on failure.
 int fsb_load(FsbHandle h, const FsbConfig* cfg);
 
+// sizeof(FsbResult) as compiled into this library.  ctypes/cffi mirrors must
+// compare it against their own struct size before calling fsb_process_bgr():
+// a shorter mirror makes the library write past the caller's buffer.
+int fsb_result_size(void);
+
 // ── Inference ─────────────────────────────────────────────────────────────────
 // Process a BGR uint8 image.
 // results    : pre-allocated array of FsbResult with at least max_results entries.
 // max_results: capacity of results[].
-// Returns number of persons written (≤ max_results).
+// Returns number of persons written (≤ max_results); 0 also on an inference
+// error, which is reported on stderr.
 int fsb_process_bgr(FsbHandle        h,
                     const uint8_t*   bgr,
                     int              width,
