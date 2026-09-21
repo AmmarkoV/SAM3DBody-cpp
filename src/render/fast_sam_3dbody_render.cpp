@@ -527,7 +527,7 @@ static void save_depth_buffer(const std::string& path, int w, int h) {
 
 // ── Save GL framebuffer to file ──────────────────────────────────────────────
 
-static void save_framebuffer(const std::string& path, int w, int h) {
+static bool save_framebuffer(const std::string& path, int w, int h) {
     std::vector<uint8_t> px(w * h * 3);
     // Default GL_PACK_ALIGNMENT is 4 — for widths whose row byte-count (w*3)
     // is not divisible by 4 (e.g. 2250×3 = 6750 → 2 pad bytes/row) glReadPixels
@@ -541,8 +541,16 @@ static void save_framebuffer(const std::string& path, int w, int h) {
     cv::Mat img(h, w, CV_8UC3, px.data());
     cv::flip(img, img, 0);
     cv::cvtColor(img, img, cv::COLOR_RGB2BGR);
-    cv::imwrite(path, img);
+    // imwrite's return MUST be checked: when the filesystem holding the frame
+    // directory fills up it just returns false, and an unchecked call turns a
+    // full disk into a silent no-op that still looks like a successful render
+    // (video.sh then counts the missing JPEGs and blames a mid-run kill).
+    bool ok = false;
+    try { ok = cv::imwrite(path, img); }
+    catch (const cv::Exception& e) { fprintf(stderr, "[save-frames] %s\n", e.what()); }
+    if (!ok) return false;
     printf("Saved: %s\n", path.c_str());
+    return true;
 }
 
 // ── Export the deformed body mesh to a Wavefront .obj ─────────────────────────
@@ -1863,7 +1871,10 @@ int main(int argc, const char** argv) {
             char path[4096];
             snprintf(path, sizeof(path), "%s%05d.jpg",
                      save_frames_prefix.c_str(), ++save_frame_idx);
-            save_framebuffer(path, W, H);
+            if (!save_framebuffer(path, W, H)) {
+                fprintf(stderr, "Cannot write %s (disk full?)\n", path);
+                return 1;
+            }
         }
         // --skin-turntable: the rotating coloured-mesh view, one image per frame
         // (people absent = empty frame, so it stays in step with the main video),
