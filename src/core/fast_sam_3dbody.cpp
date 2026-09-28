@@ -209,6 +209,16 @@ static std::vector<float> cffn_run(const CFFN& ffn, const float* x, int B)
 // severity (see UpdateEnvWithCustomLogLevel() above) is not enough on its own.
 static bool g_ort_verbose = false;
 
+// Set once by Pipeline::Impl::load() when a CUDA allocator has been registered on
+// the Ort::Env, before any OrtSession::load() below.  Each CUDA session otherwise
+// gets its OWN BFC arena, and --refined-pose opens ~30 extra sessions (3 decoder
+// groups x pre/6 layers/normfinal/update/head) on top of backbone+decoder+yolo.
+// Thirty private arenas, each rounding its reservation up to the next power of two
+// and never giving memory back, exhausted a 6 GB laptop card: 3.0 GB without
+// --refined-pose, 5.8 GB of 6.1 GB with it, then OOM on a 5 MB Cast.  Sharing one
+// env-level arena keeps the whole set in a single pool.
+static bool g_ort_env_allocators = false;
+
 // ─── layout of the MHR regression output ─────────────────────────────────────
 // The decoder heads emit one flat 519-float vector per person.  Every consumer
 // used to index it with bare integer literals, repeated ~35 times across three
@@ -460,7 +470,16 @@ struct OrtSession
                 {
                     OrtCUDAProviderOptions cp{};
                     cp.device_id = device;
+                    // kSameAsRequested (1), not the kNextPowerOfTwo default: with
+                    // this many concurrent sessions the power-of-two overshoot is
+                    // pure waste, and none of these graphs grows its working set
+                    // over time, so the incremental strategy costs nothing.
+                    cp.arena_extend_strategy = 1;
                     opts.AppendExecutionProvider_CUDA(cp);
+                    // Draw device memory from the arena registered on the Env
+                    // instead of creating a private one per session.
+                    if (g_ort_env_allocators)
+                        opts.AddConfigEntry("session.use_env_allocators", "1");
                 }
                 // EP_CPU: append nothing — the default CPU EP runs.
 
@@ -1169,6 +1188,27 @@ struct Pipeline::Impl
 
         bool cuda = cfg.cuda_device >= 0;
         int  dev  = cfg.cuda_device;
+
+        // One CUDA arena shared by every session (see g_ort_env_allocators).
+        // Registered before the first OrtSession::load() so all of them opt in.
+        if (cuda)
+        {
+            try
+            {
+                Ort::MemoryInfo cuda_mem("Cuda", OrtArenaAllocator, dev, OrtMemTypeDefault);
+                Ort::ArenaCfg   arena(/*max_mem*/0, /*extend_strategy*/1,
+                                      /*initial_chunk_size*/-1, /*max_dead_bytes*/-1);
+                ort_env.CreateAndRegisterAllocator(cuda_mem, arena);
+                g_ort_env_allocators = true;
+            }
+            catch (const Ort::Exception& ex)
+            {
+                // Not fatal: sessions just fall back to their own arenas, which is
+                // exactly the old behaviour.
+                fprintf(stderr, "[ORT] shared CUDA allocator unavailable (%s); "
+                                "using per-session arenas\n", ex.what());
+            }
+        }
 
         // ── ONNX sessions ─────────────────────────────────────────────────────
         auto opath = [&](const char* f)
