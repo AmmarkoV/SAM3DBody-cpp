@@ -111,7 +111,10 @@ fi
 # MHR-derived skeleton does not reproduce; retargeting by joint POSITION (our
 # positions are correct) sidesteps that. The driver also grounds the feet each
 # frame (our data is camera-space). See GMR.md for the full rationale.
-POS_CONFIG="$REPO/scripts/gmr_configs/bvh_lafan1pos_to_g1.json"
+# Per-robot position config (scripts/gmr_configs/bvh_lafan1pos_to_<robot>.json,
+# "unitree_" prefix dropped); robots without one keep using the G1 config.
+POS_CONFIG="$REPO/scripts/gmr_configs/bvh_lafan1pos_to_${ROBOT#unitree_}.json"
+[ -f "$POS_CONFIG" ] || POS_CONFIG="$REPO/scripts/gmr_configs/bvh_lafan1pos_to_g1.json"
 for bvh in "${bvhs[@]}"; do
     id="$(basename "$bvh" .bvh)"        # e.g. football_0
     echo "[video_gmr]   retargeting $id -> $ROBOT"

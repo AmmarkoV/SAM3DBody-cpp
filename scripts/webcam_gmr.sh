@@ -22,6 +22,7 @@
 #  Examples:
 #       scripts/webcam_gmr.sh                       # webcam 0 -> unitree_g1 viewer
 #       scripts/webcam_gmr.sh 2 unitree_g1          # webcam 2
+#       scripts/webcam_gmr.sh 0 unitree_h1_2        # webcam 0 -> Unitree H1-2 viewer
 #       scripts/webcam_gmr.sh clean_sample.mp4      # a file, as if it were live
 #       SINK=dds scripts/webcam_gmr.sh 0 unitree_g1 # DDS sink (stub; see gmr_stream.py)
 #       HEADLESS=1 scripts/webcam_gmr.sh 0          # no input overlay window (robot only)
@@ -71,7 +72,10 @@ source "$REPO/tools/trt_env.sh"     2>/dev/null || true
 BIN="$REPO/build/fast_sam_3dbody_run"
 GMR_PY="$REPO/GMR/venv/bin/python"
 TEMPLATE="$REPO/bvh/lafan_mhr.bvh"
-POS_CONFIG="$REPO/scripts/gmr_configs/bvh_lafan1pos_to_g1.json"
+# Per-robot position config (scripts/gmr_configs/bvh_lafan1pos_to_<robot>.json,
+# "unitree_" prefix dropped); robots without one keep using the G1 config.
+POS_CONFIG="$REPO/scripts/gmr_configs/bvh_lafan1pos_to_${ROBOT#unitree_}.json"
+[ -f "$POS_CONFIG" ] || POS_CONFIG="$REPO/scripts/gmr_configs/bvh_lafan1pos_to_g1.json"
 
 # ── TensorRT fast path (auto-detected, graceful fallback) ─────────────────────
 # The webcam is backbone-bound; the TRT EP (fp16) is ~1.6x faster than the CUDA
