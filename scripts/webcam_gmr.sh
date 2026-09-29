@@ -7,6 +7,7 @@
 #       webcam ─► fast_sam_3dbody_run --bvh-stream -   (one BVH line / frame)
 #              ─► tools/gmr_stream.py                  (per-frame GMR retarget)
 #              ─► sink: live MuJoCo viewer (default) | Unitree DDS (stub)
+#                       | teleop (viewer + /dev/shm/h1_teleop for robot/h1_bridge)
 #
 #  Unlike video_gmr.sh (offline: whole clip -> multi-pass BVH -> batch retarget),
 #  this is causal and never touches disk: the live binary streams one LAFAN BVH
@@ -25,6 +26,7 @@
 #       scripts/webcam_gmr.sh 0 unitree_h1_2        # webcam 0 -> Unitree H1-2 viewer
 #       scripts/webcam_gmr.sh clean_sample.mp4      # a file, as if it were live
 #       SINK=dds scripts/webcam_gmr.sh 0 unitree_g1 # DDS sink (stub; see gmr_stream.py)
+#       SINK=teleop scripts/webcam_gmr.sh 0 unitree_h1_2  # feed robot/h1_bridge (run it separately)
 #       HEADLESS=1 scripts/webcam_gmr.sh 0          # no input overlay window (robot only)
 #
 #  Two windows open by default: the input RGB frame with the 2D skeleton overlaid

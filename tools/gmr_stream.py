@@ -36,8 +36,11 @@ ap.add_argument("--robot", default="unitree_g1")
 ap.add_argument("--config", required=True, help="custom GMR ik_config json (position-based)")
 ap.add_argument("--template", default=str(REPO / "bvh/lafan_mhr.bvh"),
                 help="BVH template whose HIERARCHY header the streamed lines are appended to")
-ap.add_argument("--sink", choices=["viewer", "dds"], default="viewer",
-                help="viewer = live MuJoCo RobotMotionViewer; dds = Unitree DDS (unitree_mujoco / real G1) [stub]")
+ap.add_argument("--sink", choices=["viewer", "dds", "teleop"], default="viewer",
+                help="viewer = live MuJoCo RobotMotionViewer; dds = Unitree DDS (unitree_mujoco / real G1) [stub]; "
+                     "teleop = viewer + publish to --teleop-shm for robot/h1_bridge")
+ap.add_argument("--teleop-shm", default="h1_teleop",
+                help="POSIX shm name (/dev/shm/<name>) the teleop sink writes; must match h1_bridge --shm")
 ap.add_argument("--fps", type=int, default=30)
 # Live shared-memory transport (SharedMemoryVideoBuffers).  When --bvh-shm names
 # a POSIX shm descriptor, frames are read from it instead of "@F" lines on stdin
@@ -198,7 +201,7 @@ class ViewerSink:
     def __init__(self, robot, fps, key_callback=None):
         self.v = RobotMotionViewer(robot_type=robot, motion_fps=fps,
                                    keyboard_callback=key_callback)
-    def step(self, q, overlay):
+    def step(self, q, overlay, tracking=True):
         self.v.step(root_pos=q[:3], root_rot=q[3:7], dof_pos=q[7:],
                     human_motion_data=overlay, rate_limit=True, follow_camera=True)
     def close(self):
@@ -225,8 +228,31 @@ class DDSSink:
             "DDSSink is a stub. It publishes over Unitree's DDS interface "
             "(unitree_sdk2_python / unitree_mujoco), but needs a whole-body tracking "
             "policy + safety layer first -- see the class docstring and GMR.md.")
-    def step(self, q, overlay): ...
+    def step(self, q, overlay, tracking=True): ...
     def close(self): ...
+
+class TeleopSink(ViewerSink):
+    """Viewer + the retargeted joint angles published to robot/teleop_shm.h for the
+    C++ safety bridge (robot/h1_bridge), which alone decides what reaches the motors.
+    Joints go by NAME (the MuJoCo model's hinge order == q[7:]); frames the idle
+    watchdog eases home are sent WITHOUT F_TRACKING, so the bridge ignores them and
+    runs its own target-lost handling instead."""
+    def __init__(self, robot, fps, model, shm_name, key_callback=None):
+        import mujoco as mj
+        from teleop_shm import TeleopShmWriter
+        names = [mj.mj_id2name(model, mj.mjtObj.mjOBJ_JOINT, j) for j in range(model.njnt)
+                 if model.jnt_type[j] != mj.mjtJoint.mjJNT_FREE]
+        self.shm = TeleopShmWriter(shm_name, robot, names)
+        print(f"[gmr_stream] teleop: publishing {len(names)} joints to /dev/shm/{shm_name}",
+              file=sys.stderr)
+        super().__init__(robot, fps, key_callback)
+    def step(self, q, overlay, tracking=True):
+        from teleop_shm import F_TRACKING
+        self.shm.publish(q[7:], root=q[:7], flags=F_TRACKING if tracking else 0)
+        super().step(q, overlay)
+    def close(self):
+        self.shm.close()            # SHUTDOWN frame first: the bridge ramps out on it
+        super().close()
 
 
 # ── disk-free frame decode ───────────────────────────────────────────────────
@@ -241,9 +267,11 @@ def channels_from_line(motion_line):
 
 
 # ── main streaming loop ──────────────────────────────────────────────────────
-def make_sink():
+def make_sink(model):
     if a.sink == "dds":
         return DDSSink(a.robot, a.fps)          # no viewer, hence no reset key
+    if a.sink == "teleop":
+        return TeleopSink(a.robot, a.fps, model, a.teleop_shm, _on_key)
     return ViewerSink(a.robot, a.fps, _on_key)
 
 # ── frame sources: shared memory (fast path) or @F lines on stdin (fallback) ──
@@ -322,7 +350,7 @@ def main():
                     nidle += 1
                     print(f"[gmr_stream] {why} -> easing to the neutral pose", file=sys.stderr)
                 prev_q = q_home.copy() if prev_q is None else ease_step(prev_q, q_home)
-                sink.step(prev_q, {})         # {} (not None) clears the stale human overlay
+                sink.step(prev_q, {}, tracking=False)   # {} (not None) clears the stale human overlay
                 continue
 
             t_last_frame = time.monotonic()
@@ -341,7 +369,7 @@ def main():
                 # mink.Configuration is built from the model's default qpos0, and
                 # nothing has integrated into it yet, so this IS the neutral pose.
                 q_home = rt.configuration.q.copy()
-                sink = make_sink()
+                sink = make_sink(rt.model)
                 if a.sink != "dds":
                     print(f"[gmr_stream] press {RESET_KEY} in the robot window to reset the pose",
                           file=sys.stderr)
