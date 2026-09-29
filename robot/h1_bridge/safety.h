@@ -113,6 +113,7 @@ public:
     // Joint limits actually enforced (URDF shrunk by limit_margin, waist capped).
     double lo(int j) const { return lo_[j]; }
     double hi(int j) const { return hi_[j]; }
+    double vmax(int j) const { return vmax_[j]; }   // rad/s, speed_scale applied
 
 private:
     void fault(FaultCode f, const char* note);

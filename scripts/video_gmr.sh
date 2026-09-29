@@ -112,9 +112,11 @@ fi
 # positions are correct) sidesteps that. The driver also grounds the feet each
 # frame (our data is camera-space). See GMR.md for the full rationale.
 # Per-robot position config (scripts/gmr_configs/bvh_lafan1pos_to_<robot>.json,
-# "unitree_" prefix dropped); robots without one keep using the G1 config.
+# "unitree_" prefix dropped).  Only G1 variants (e.g. unitree_g1_with_hands) may fall
+# back to the G1 config: another robot's body names would crash GMR on frame 1.
 POS_CONFIG="$REPO/scripts/gmr_configs/bvh_lafan1pos_to_${ROBOT#unitree_}.json"
-[ -f "$POS_CONFIG" ] || POS_CONFIG="$REPO/scripts/gmr_configs/bvh_lafan1pos_to_g1.json"
+case "$ROBOT" in unitree_g1*) [ -f "$POS_CONFIG" ] || POS_CONFIG="$REPO/scripts/gmr_configs/bvh_lafan1pos_to_g1.json" ;; esac
+[ -f "$POS_CONFIG" ] || { echo "ERROR: no GMR position config for $ROBOT ($POS_CONFIG)" >&2; exit 1; }
 for bvh in "${bvhs[@]}"; do
     id="$(basename "$bvh" .bvh)"        # e.g. football_0
     echo "[video_gmr]   retargeting $id -> $ROBOT"

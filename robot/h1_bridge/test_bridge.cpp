@@ -10,6 +10,7 @@
 #include "../teleop_shm.h"
 #include "h1_2_fk_golden.h"
 #include "kinematics.h"
+#include "manual.h"
 #include "safety.h"
 #include "shm_reader.h"
 
@@ -366,6 +367,117 @@ static void test_crc_matches_zlib() {
     CHECK(teleop_crc32("123456789", 9) == 0xCBF43926u, "CRC-32 check value");
 }
 
+// ── manual (slider) mode ────────────────────────────────────────────────────
+static JointVec random_pose(std::mt19937& rng, const Supervisor& sup) {
+    JointVec q;
+    for (int j = 0; j < kNumJoints; ++j) {
+        std::uniform_real_distribution<double> u(sup.lo(j), sup.hi(j));
+        q[j] = u(rng);
+    }
+    return q;
+}
+
+static void test_manual_check_blocks_bad_poses() {
+    Supervisor sup{Config()};
+    JointVec q = kHome;
+    q[kL0 + 3] = sup.hi(kL0 + 3) + 0.01;                  // beyond the enforced range
+    PoseCheck c = check_manual_pose(sup, kHome, q);
+    CHECK(!c.ok, "out-of-range accepted: %s", c.verdict.c_str());
+    q = kHome;
+    q[kR0] = std::nan("");
+    CHECK(!check_manual_pose(sup, kHome, q).ok, "NaN accepted");
+    const JointVec clap = pose(-1.2, 0.05, -1.3, 1.2, -1.2, -0.05, 1.3, 1.2);
+    c = check_manual_pose(sup, kHome, clap);
+    CHECK(!c.ok && c.verdict.find("target pose self-collides") != std::string::npos,
+          "colliding target: %s", c.verdict.c_str());
+    c = check_manual_pose(sup, kHome, kHome);
+    CHECK(c.ok && c.n_changed == 0, "no-op: %s", c.verdict.c_str());
+    q = kHome;
+    q[kL0 + 3] = 1.0;                                     // bend the left elbow: harmless
+    c = check_manual_pose(sup, kHome, q);
+    CHECK(c.ok && c.n_changed == 1 && c.max_joint == kL0 + 3, "elbow bend: %s", c.verdict.c_str());
+    CHECK(std::fabs(c.eta_s - 1.0 / (kManualSpeedFrac * sup.vmax(kL0 + 3))) < 1e-9, "eta %.3f", c.eta_s);
+}
+
+// Property: whenever the check says OK, a 10x finer sampling of the straight path is
+// collision-free too; and paths that collide between two free endpoints do get blocked.
+static void test_manual_check_path_property() {
+    std::mt19937 rng(11);
+    Supervisor sup{Config()};
+    const CollisionGeometry& g = sup.config().collision;
+    int ok = 0, path_blocked = 0;
+    double worst_all = 0;
+    for (int k = 0; k < 2000; ++k) {
+        JointVec a, b;
+        do a = random_pose(rng, sup); while (self_collision(a, g).penetration > 0);
+        do b = random_pose(rng, sup); while (self_collision(b, g).penetration > 0);
+        const PoseCheck c = check_manual_pose(sup, a, b);
+        if (!c.ok) { path_blocked += c.verdict.find("path") != std::string::npos; continue; }
+        ++ok;
+        double worst = 0, maxd = 0;
+        for (int j = 0; j < kNumJoints; ++j) maxd = std::max(maxd, std::fabs(b[j] - a[j]));
+        const int n = std::max(1, int(std::ceil(maxd / 0.002)));
+        for (int i = 0; i <= n; ++i) {
+            JointVec q;
+            for (int j = 0; j < kNumJoints; ++j) q[j] = a[j] + (b[j] - a[j]) * i / n;
+            worst = std::max(worst, self_collision(q, g).penetration);
+        }
+        CHECK(worst < 0.005, "accepted path penetrates %.1f mm", worst * 1000);
+        worst_all = std::max(worst_all, worst);
+    }
+    CHECK(ok > 100 && path_blocked > 20, "not exercised: %d ok, %d path-blocked", ok, path_blocked);
+    std::printf("  (manual check: %d/2000 free->free moves accepted, %d blocked on the path, worst "
+                "between-sample penetration %.2f mm)\n", ok, path_blocked, worst_all * 1000);
+}
+
+static void test_manual_source_drives_supervisor() {
+    Config cfg;
+    Rig r(cfg);
+    ManualSource m(r.sup);
+    JointVec start;
+    for (int j = 0; j < kNumJoints; ++j) start[j] = r.st.q[j];
+    m.init(start);
+    const double dt = 0.02;
+    auto step = [&]() { r.tg = m.tick(dt); r.tick(dt); };
+    r.st.buttons = cfg.deadman;
+    step();
+    r.st.buttons = cfg.deadman | cfg.arm; step();
+    r.st.buttons = cfg.deadman; step();
+    CHECK(r.o.mode == Mode::RampIn, "manual target did not allow arming: %s (%s)", mode_name(r.o.mode), r.o.note);
+
+    JointVec goal = kHome;
+    goal[kL0 + 0] = -0.8; goal[kL0 + 3] = 1.2; goal[kR0 + 3] = 0.9; goal[kWaist] = 0.3;
+    const PoseCheck c = m.apply(goal);
+    CHECK(c.ok, "apply refused: %s", c.verdict.c_str());
+    JointVec prev = m.published();
+    double worst_speed = 0, off_line = 0;
+    int ticks = 0;
+    for (; ticks < 2000 && (m.moving() || r.o.mode != Mode::Tracking); ++ticks) {
+        step();
+        const JointVec& p = m.published();
+        for (int j = 0; j < kNumJoints; ++j) {
+            worst_speed = std::max(worst_speed, std::fabs(p[j] - prev[j]) / dt / r.sup.vmax(j));
+            const double sl = (goal[kL0 + 3] - start[kL0 + 3]);
+            const double s = sl != 0 ? (p[kL0 + 3] - start[kL0 + 3]) / sl : 0;
+            if (std::fabs(goal[j] - start[j]) > 1e-9)          // stays on the straight line
+                off_line = std::max(off_line, std::fabs(p[j] - (start[j] + s * (goal[j] - start[j]))));
+        }
+        prev = p;
+        CHECK(r.o.rejected_targets == 0 && r.o.fault == FaultCode::None, "supervisor rejected / faulted: %s", r.o.note);
+    }
+    for (int i = 0; i < 100; ++i) step();                  // let the follower settle
+    double err = 0;
+    for (int j = 0; j < kNumJoints; ++j) err = std::max(err, std::fabs(r.o.q[j] - goal[j]));
+    CHECK(err < 1e-3, "did not reach the applied goal (%.4f rad off)", err);
+    CHECK(worst_speed <= kManualSpeedFrac + 1e-6, "manual target too fast (%.2f of vmax)", worst_speed);
+    CHECK(off_line < 1e-9, "left the straight line by %.2e", off_line);
+    CHECK(ticks * dt <= c.eta_s + 2.0 + 0.2, "took %.1f s, eta %.1f s (+2 s ramp)", ticks * dt, c.eta_s);
+
+    JointVec bad = goal;
+    bad[kL0 + 3] = 99;
+    CHECK(!m.apply(bad).ok && m.goal()[kL0 + 3] == goal[kL0 + 3], "refused apply changed the goal");
+}
+
 int main() {
     struct { const char* name; void (*fn)(); } tests[] = {
         {"fk_matches_mujoco", test_fk_matches_mujoco},
@@ -386,6 +498,9 @@ int main() {
         {"collision_gate_never_enters_collision", test_collision_gate_never_enters_collision},
         {"clap_is_blocked", test_clap_is_blocked},
         {"crc_matches_zlib", test_crc_matches_zlib},
+        {"manual_check_blocks_bad_poses", test_manual_check_blocks_bad_poses},
+        {"manual_check_path_property", test_manual_check_path_property},
+        {"manual_source_drives_supervisor", test_manual_source_drives_supervisor},
     };
     for (auto& t : tests) {
         const int before = g_fail;
