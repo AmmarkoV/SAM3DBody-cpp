@@ -77,6 +77,34 @@ PoseCheck check_manual_pose(const Supervisor& sup, const JointVec& from, const J
     return r;
 }
 
+PoseCheck check_takeover(const Supervisor& sup, bool driven, const JointVec& cmd, const JointVec& to) {
+    PoseCheck r;
+    for (int j = 0; j < kNumJoints; ++j) {
+        if (!std::isfinite(to[j]) || !std::isfinite(cmd[j])) {
+            r.verdict = std::string("BLOCKED: non-finite value for ") + kJoints[j].name;
+            return r;
+        }
+        // The Supervisor clamps targets into the enforced range: compare what it will drive.
+        const double d = std::fabs(std::clamp(to[j], sup.lo(j), sup.hi(j)) - cmd[j]);
+        if (d > 1e-3) ++r.n_changed;
+        if (d > r.max_delta) { r.max_delta = d; r.max_joint = j; }
+    }
+    if (!driven) {
+        r.ok = true;
+        r.verdict = "OK: arms not driven";
+        return r;
+    }
+    if (r.max_delta > kTakeoverTol) {
+        r.verdict = std::string("BLOCKED while armed: ") + kJoints[r.max_joint].name +
+                    fmt(" is %.2f rad from the arms (pick-up needs <= %.2f). Match the pose, or release R1 first.",
+                        r.max_delta, kTakeoverTol);
+        return r;
+    }
+    r.ok = true;
+    r.verdict = fmt("OK: pick-up within %.2f rad", r.max_delta);
+    return r;
+}
+
 void ManualSource::init(const JointVec& q) {
     for (int j = 0; j < kNumJoints; ++j) pub_[j] = std::clamp(q[j], sup_.lo(j), sup_.hi(j));
     goal_ = pub_;

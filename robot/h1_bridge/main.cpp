@@ -4,7 +4,9 @@
 //             [--speed S [--allow-fast]] [--gain G] [--ui] [--manual]
 //
 //   --ui      OpenCV monitor window (joint states, warnings, E-STOP button)
-//   --manual  sliders instead of the camera stream (implies --ui); see manual.h
+//   --manual  sliders instead of the camera stream (implies --ui); see manual.h.  The
+//             slider window can switch to the camera stream and back at runtime
+//             (FOLLOW CAMERA / BACK TO MANUAL, vetted by check_takeover())
 //
 // All the decisions live in the Supervisor (safety.h); this file is only I/O:
 //   rt/lowstate (DDS)  ─► StateIn ─┐
@@ -227,11 +229,13 @@ void print_checklist(const Supervisor& sup, double rate) {
 "    collision-free, and the arms still move only while armed from the remote.  The\n"
 "    collision model is simplified boxes/spheres: it does not know about the hands' fingers,\n"
 "    tools, cables or anything near the robot.\n"
+"    FOLLOW CAMERA hands the arms to the camera stream: while ARMED only as a pick-up (camera\n"
+"    pose within %.2f rad of the arms on every joint), otherwise release R1 first.\n"
 "    Run --ui on a LOCAL display: if the display connection dies (ssh -X drop, logout, xkill)\n"
 "    the process is killed at once, with no ramp-out (see item 7).\n"
 " 11. Rate %.0f Hz (Unitree's xr_teleoperate uses 250 Hz, their arm_sdk example 50 Hz).\n"
 "==========================================================================================\n",
-        c.vmax * c.speed_scale, c.speed_scale, c.collision.hand_len, rate);
+        c.vmax * c.speed_scale, c.speed_scale, c.collision.hand_len, kTakeoverTol, rate);
 }
 
 // The DDS link to the robot is the 192.168.123.0/24 network (dev PC .162, optional .163).
@@ -304,7 +308,8 @@ void warn_combos(uint16_t buttons, uint16_t prev) {
         "  --allow-fast    required for --speed above 0.25\n"
         "  --gain G        fraction of Unitree's reference kp/kd, <= 1 (default 1)\n"
         "  --ui            OpenCV monitor window (joint states, warnings, E-STOP)\n"
-        "  --manual        per-joint sliders instead of the camera stream (implies --ui)\n",
+        "  --manual        per-joint sliders instead of the camera stream (implies --ui);\n"
+        "                  the slider window can toggle to the camera stream and back\n",
         argv0);
     std::exit(2);
 }
@@ -350,6 +355,7 @@ int main(int argc, char** argv) {
     Supervisor sup(cfg);
     UiShared ui_shared;
     ui_shared.manual = manual;
+    ui_shared.source_manual = manual;
     if (use_ui) g_ui = &ui_shared;
 
     // Nothing is published until the operator has read the checklist.
@@ -382,7 +388,7 @@ int main(int argc, char** argv) {
         "[h1_bridge] target source: %s\n",
         iface.c_str(), domain, shm_name.c_str(), robot.c_str(), rate,
         sup.config().speed_scale, sup.config().gain_scale,
-        manual ? "MANUAL sliders (the shm is ignored)" : "camera stream (shm)");
+        manual ? "MANUAL sliders (FOLLOW CAMERA in the UI switches to the shm)" : "camera stream (shm)");
 
     // The control loop runs on its own thread when the UI (which needs the main thread) is up.
     auto control = [&]() {
@@ -392,6 +398,9 @@ int main(int argc, char** argv) {
         std::string shm_err, last_shm_err;
         int64_t next_connect_ns = 0;
         uint64_t counter_base = 0, last_counter = 0;  // keeps counters monotonic across writer restarts
+        uint64_t fed_counter = 0, cam_fed = 0;        // counters given to the Supervisor; last camera frame fed
+        bool src_manual = manual;                     // the target source; switchable from the UI
+        Out last_o;
 
         LowCmd_ cmd;
         const int64_t period_ns = int64_t(1e9 / rate);
@@ -459,14 +468,66 @@ int main(int argc, char** argv) {
 
             // Read BEFORE the stale check: an exiting writer publishes F_SHUTDOWN and then
             // unlinks, and that last frame is only reachable through the old mapping.
-            TargetIn tgt;
-            if (manual) {
-                if (!manual_src.ready() && st.valid && st.age_s < 0.5) {
-                    JointVec q;
-                    for (int j = 0; j < kNumJoints; ++j) q[j] = st.q[j];
-                    manual_src.init(q);
-                    event("manual: sliders start at the measured pose");
+            // The camera is read even while the sliders drive (UI preview, switching).
+            TargetIn cam;
+            const bool cam_read = reader.read(now, &cam);
+            if (cam_read) {
+                cam.counter += counter_base;
+                last_counter = std::max(last_counter, cam.counter);
+            }
+            bool cam_fresh = cam_read && (cam.flags & TELEOP_F_TRACKING) &&
+                             cam.age_s <= sup.config().target_hold_s;
+            JointVec cam_q{};
+            for (int j = 0; j < kNumJoints; ++j) {
+                cam_fresh = cam_fresh && std::isfinite(cam.q[j]);
+                cam_q[j] = std::isfinite(cam.q[j]) ? std::clamp(cam.q[j], sup.lo(j), sup.hi(j)) : 0.0;
+            }
+
+            if (src_manual && !manual_src.ready() && st.valid && st.age_s < 0.5) {
+                JointVec q;
+                for (int j = 0; j < kNumJoints; ++j) q[j] = st.q[j];
+                manual_src.init(q);
+                event("manual: sliders start at the measured pose");
+            }
+
+            // Source switch requested from the UI (authoritative check here, not in the UI).
+            bool new_stream = false;
+            {
+                bool req = false, to_manual = false;
+                {
+                    std::lock_guard<std::mutex> lk(ui_shared.m);
+                    std::swap(req, ui_shared.switch_request);
+                    to_manual = ui_shared.switch_to_manual;
                 }
+                if (req && to_manual != src_manual) {
+                    const bool driven = last_o.mode == Mode::RampIn || last_o.mode == Mode::Tracking;
+                    JointVec cmd;
+                    for (int j = 0; j < kNumJoints; ++j) cmd[j] = last_o.q[j];
+                    PoseCheck c;
+                    if (!st.valid || st.age_s > 0.5) c.verdict = "BLOCKED: no robot state yet";
+                    else if (!to_manual && driven && !cam_fresh)
+                        c.verdict = "BLOCKED while armed: no fresh camera pose (is the GMR stream tracking?)";
+                    else c = check_takeover(sup, driven, cmd, to_manual ? cmd : cam_q);
+                    if (c.ok) {
+                        src_manual = to_manual;
+                        new_stream = true;
+                        if (to_manual) manual_src.init(cmd);      // sliders start AT the command
+                        c.verdict = std::string(to_manual ? "source -> MANUAL sliders (" : "source -> CAMERA (") +
+                                    c.verdict + ")";
+                    }
+                    {
+                        std::lock_guard<std::mutex> lk(ui_shared.m);
+                        ui_shared.apply_result = c.verdict;
+                        ui_shared.apply_ok = c.ok;
+                        ++ui_shared.apply_seq;
+                    }
+                    event("switch: " + c.verdict);
+                }
+            }
+
+            // Counters handed to the Supervisor are ours, monotonic across both sources.
+            TargetIn tgt;
+            if (src_manual) {
                 bool req = false;
                 JointVec pose{};
                 {
@@ -485,11 +546,23 @@ int main(int argc, char** argv) {
                     event(std::string("apply: ") + c.verdict);
                 }
                 tgt = manual_src.tick(dt);
-            } else if (reader.read(now, &tgt)) {
-                tgt.counter += counter_base;
-                last_counter = std::max(last_counter, tgt.counter);
+                if (tgt.have) tgt.counter = ++fed_counter;
+            } else {
+                std::lock_guard<std::mutex> lk(ui_shared.m);
+                ui_shared.apply_request = false;              // no APPLY while the camera drives
             }
-            if (!manual && (!reader.connected() || reader.stale()) && now >= next_connect_ns) {
+            if (!src_manual && cam_read) {
+                tgt = cam;
+                // A new frame, or the one the switch was checked against (fed even if old).
+                if (cam.counter > cam_fed || new_stream) {
+                    cam_fed = cam.counter;
+                    tgt.counter = ++fed_counter;
+                } else {
+                    tgt.counter = fed_counter;                // nothing new for the Supervisor
+                }
+            }
+            if (new_stream) sup.new_target_stream();
+            if ((!reader.connected() || reader.stale()) && now >= next_connect_ns) {
                 if (reader.connect(shm_name, robot, &shm_err)) {
                     counter_base = last_counter;          // a restarted writer counts from 1 again
                     event("connected to /dev/shm/" + shm_name);
@@ -505,6 +578,7 @@ int main(int argc, char** argv) {
 
             // ── decide ────────────────────────────────────────────────────────────
             const Out o = sup.step(dt, st, tgt, estop);
+            last_o = o;
 
             // ── output ────────────────────────────────────────────────────────────
             cmd.motor_cmd()[kArmSdkWeightIndex].q(o.weight);
@@ -550,6 +624,9 @@ int main(int argc, char** argv) {
                 std::copy(mstate, mstate + kNumJoints, ui_shared.motorstate);
                 ui_shared.mode_machine = mode_machine;
                 ui_shared.crc_fail = crc_fail;
+                ui_shared.source_manual = src_manual;
+                ui_shared.camera_fresh = cam_fresh;
+                ui_shared.camera_q = cam_q;
                 ui_shared.manual_ready = manual_src.ready();
                 ui_shared.published = manual_src.published();
                 ui_shared.goal = manual_src.goal();

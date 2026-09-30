@@ -478,6 +478,84 @@ static void test_manual_source_drives_supervisor() {
     CHECK(!m.apply(bad).ok && m.goal()[kL0 + 3] == goal[kL0 + 3], "refused apply changed the goal");
 }
 
+// ── runtime source switch (sliders <-> camera) ──────────────────────────────
+static void test_takeover_check() {
+    Supervisor sup{Config()};
+    JointVec far = kHome;
+    far[kL0 + 3] += 1.0;
+    CHECK(check_takeover(sup, false, kHome, far).ok, "disarmed switch refused");
+    CHECK(!check_takeover(sup, true, kHome, far).ok, "armed lunge accepted");
+    JointVec near = kHome;
+    near[kL0 + 3] += kTakeoverTol - 0.01;
+    near[kR0] -= 0.1;
+    const PoseCheck c = check_takeover(sup, true, kHome, near);
+    CHECK(c.ok && c.max_joint == kL0 + 3, "pick-up refused: %s", c.verdict.c_str());
+    JointVec out = kHome;                          // beyond the enforced range: judged after clamping
+    out[kWaist] = sup.hi(kWaist) + 5.0;
+    JointVec cmd = kHome;
+    cmd[kWaist] = sup.hi(kWaist) - 0.05;
+    CHECK(check_takeover(sup, true, cmd, out).ok, "clamped target judged unclamped");
+    JointVec nan = kHome;
+    nan[kR0 + 2] = std::nan("");
+    CHECK(!check_takeover(sup, false, kHome, nan).ok, "NaN accepted");
+}
+
+// Switching to a source whose first pose is far from the old stream's must not be
+// jump-rejected into a TargetInvalid fault (new_target_stream), armed or not.
+static void test_source_switch_no_jump_fault() {
+    for (int with_reset = 0; with_reset < 2; ++with_reset) {
+        Rig r;
+        JointVec cam = kHome;
+        cam[kL0 + 3] += 1.2;                       // camera pose far from the measured one
+        r.stream(cam, 0.3);                        // disarmed: accepted, but nothing moves
+        ManualSource m(r.sup);
+        JointVec q;
+        for (int j = 0; j < kNumJoints; ++j) q[j] = r.o.q[j];
+        m.init(q);
+        if (with_reset) r.sup.new_target_stream();
+        for (int i = 0; i < 50; ++i) { r.tg = m.tick(0.01); r.tg.counter = r.ctr += 1; r.tick(); }
+        if (with_reset) CHECK(r.o.mode == Mode::Disarmed && r.o.rejected_targets == 0,
+                              "switch faulted: %s (%s)", mode_name(r.o.mode), r.o.note);
+        else CHECK(r.o.mode == Mode::Fault, "test does not exercise the jump check");
+    }
+
+    // Armed: camera -> manual at the command freezes the arms; manual -> camera pick-up tracks.
+    Config cfg;
+    Rig r(cfg);
+    JointVec cam = kHome;
+    r.stream(cam, 0.1);
+    r.st.buttons = cfg.deadman;
+    r.press(cfg.arm);
+    for (double t = 0; t < 3.0; t += 0.01) {       // ramp in while the camera walks the elbow
+        cam[kL0 + 3] = kHome[kL0 + 3] + 0.5 * t;
+        if (std::fmod(t, 0.033) < 0.01) r.send(cam);
+        r.tick();
+    }
+    CHECK(r.o.mode == Mode::Tracking, "not tracking: %s (%s)", mode_name(r.o.mode), r.o.note);
+    ManualSource m(r.sup);
+    JointVec cmd;
+    for (int j = 0; j < kNumJoints; ++j) cmd[j] = r.o.q[j];
+    CHECK(check_takeover(r.sup, true, cmd, cmd).ok, "camera -> manual refused");
+    m.init(cmd);
+    r.sup.new_target_stream();
+    for (int i = 0; i < 100; ++i) { r.tg = m.tick(0.01); r.tg.counter = r.ctr += 1; r.tick(); }
+    double drift = 0;
+    for (int j = 0; j < kNumJoints; ++j) drift = std::max(drift, std::fabs(r.o.q[j] - cmd[j]));
+    CHECK(r.o.mode == Mode::Tracking && r.o.rejected_targets == 0, "manual takeover: %s (%s)",
+          mode_name(r.o.mode), r.o.note);
+    CHECK(drift < 0.1, "arms did not stop at the switch (%.3f rad on)", drift);
+
+    JointVec pick = m.published();
+    pick[kR0 + 3] += 0.2;
+    for (int j = 0; j < kNumJoints; ++j) cmd[j] = r.o.q[j];
+    CHECK(check_takeover(r.sup, true, cmd, pick).ok, "pick-up refused");
+    r.sup.new_target_stream();
+    r.stream(pick, 1.5);
+    double err = 0;
+    for (int j = 0; j < kNumJoints; ++j) err = std::max(err, std::fabs(r.o.q[j] - pick[j]));
+    CHECK(r.o.mode == Mode::Tracking && err < 1e-3, "camera pick-up: %s, %.3f rad off", mode_name(r.o.mode), err);
+}
+
 int main() {
     struct { const char* name; void (*fn)(); } tests[] = {
         {"fk_matches_mujoco", test_fk_matches_mujoco},
@@ -501,6 +579,8 @@ int main() {
         {"manual_check_blocks_bad_poses", test_manual_check_blocks_bad_poses},
         {"manual_check_path_property", test_manual_check_path_property},
         {"manual_source_drives_supervisor", test_manual_source_drives_supervisor},
+        {"takeover_check", test_takeover_check},
+        {"source_switch_no_jump_fault", test_source_switch_no_jump_fault},
     };
     for (auto& t : tests) {
         const int before = g_fail;
