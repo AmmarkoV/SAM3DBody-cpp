@@ -144,13 +144,18 @@ SHM_DESC=""
 _shm_reason=""
 if [ "$SHM" = "0" ] || [ "$SHM" = "off" ]; then
     _shm_reason="disabled (SHM=$SHM)"
+elif [ "$SHM" = "1" ] || [ "$SHM" = "on" ]; then
+    :                                  # forced on: skip the checks below
 elif [ "$(uname -s)" != "Linux" ]; then
     _shm_reason="not Linux"
 elif [ ! -f "$SHM_LIB" ]; then
     _shm_reason="shm lib missing (run tools/setup_gmr.sh)"
-elif ! "$BIN" --help 2>&1 | grep -q -- "--bvh-shm"; then
+# Not grep -q: it exits at the first match, the still-printing binary gets SIGPIPE, and
+# under pipefail the whole check fails (it did once --help grew past a pipe buffer write).
+elif ! "$BIN" --help 2>&1 | grep -- "--bvh-shm" >/dev/null; then
     _shm_reason="binary built without FSB_SHM (rebuild after tools/setup_gmr.sh)"
-else
+fi
+if [ -z "$_shm_reason" ]; then
     SHM_ACTIVE=1
     SHM_DESC="sam3dbody_bvh_$$.shm"   # per-PID name so parallel runs don't collide
 fi

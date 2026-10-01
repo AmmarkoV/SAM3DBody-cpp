@@ -124,8 +124,10 @@ find_package(CUDAToolkit QUIET)
 # CMAKE_CUDA_COMPILER could be found". So feed it the nvcc that ships with the
 # toolkit we found, then probe with check_language() and only enable CUDA if a
 # working compiler is actually present — otherwise degrade to a CPU-only build.
+# An nvcc chosen by the user (CUDACXX, or -DCMAKE_CUDA_COMPILER) wins: the toolkit's own
+# may reject the host gcc (e.g. CUDA 12.2 with gcc 13).
 include(CheckLanguage)
-if(CUDAToolkit_FOUND AND NOT CMAKE_CUDA_COMPILER AND CUDAToolkit_NVCC_EXECUTABLE)
+if(CUDAToolkit_FOUND AND NOT CMAKE_CUDA_COMPILER AND NOT DEFINED ENV{CUDACXX} AND CUDAToolkit_NVCC_EXECUTABLE)
     set(CMAKE_CUDA_COMPILER "${CUDAToolkit_NVCC_EXECUTABLE}")
 endif()
 check_language(CUDA)
