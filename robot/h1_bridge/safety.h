@@ -110,6 +110,12 @@ public:
     explicit Supervisor(const Config& cfg);
     Out step(double dt, const StateIn& state, const TargetIn& target, bool external_estop);
     const Config& config() const { return cfg_; }
+    // The target SOURCE changed (h1_bridge --manual: sliders <-> camera stream).  The next
+    // frame starts a new stream, so it is not jump-checked against the old one (a pose
+    // change at the switch is the caller's to vet: check_takeover() in manual.h), and a
+    // shutdown seen from the old source is forgotten.  The caller must feed the new
+    // source's first frame in the very next step().
+    void new_target_stream();
     // Joint limits actually enforced (URDF shrunk by limit_margin, waist capped).
     double lo(int j) const { return lo_[j]; }
     double hi(int j) const { return hi_[j]; }

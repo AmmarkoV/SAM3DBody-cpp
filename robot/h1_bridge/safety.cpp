@@ -60,6 +60,12 @@ void Supervisor::fault(FaultCode f, const char* note) {
     vel_.fill(0.0);
 }
 
+void Supervisor::new_target_stream() {
+    have_accepted_ = false;          // no jump check against the previous source
+    rejects_ = 0;
+    shutdown_ = false;
+}
+
 void Supervisor::intake(const TargetIn& t) {
     if (!t.have || t.counter <= last_counter_) return;   // nothing new (or replayed)
     last_counter_ = t.counter;

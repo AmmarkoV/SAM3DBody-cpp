@@ -3,7 +3,8 @@
 //            temperatures and motor status words, the warning log, a big E-STOP;
 //   manual (--manual only): one trackbar per joint editing a PENDING pose, a front and a
 //            side view of current / applied / pending, the safety verdict, and
-//            APPLY / HOLD / HOME / RESET / E-STOP buttons.
+//            APPLY / HOLD / HOME / RESET / E-STOP buttons, and FOLLOW CAMERA / BACK TO
+//            MANUAL (while the camera drives, the sliders mirror its pose, read-only).
 #include "ui.h"
 
 #include <opencv2/highgui.hpp>
@@ -30,7 +31,8 @@ const char* kShort[kNumJoints] = {
     "waist yaw"};
 
 const cv::Scalar kWhite(235, 235, 235), kGrey(120, 120, 120), kDark(45, 45, 45), kBg(28, 28, 28),
-    kGreen(80, 200, 80), kRed(60, 60, 230), kYellow(60, 220, 240), kCyan(230, 210, 60), kOrange(0, 150, 255);
+    kGreen(80, 200, 80), kRed(60, 60, 230), kYellow(60, 220, 240), kCyan(230, 210, 60), kOrange(0, 150, 255),
+    kMagenta(220, 80, 220);
 
 std::string fmt(const char* f, ...) {
     char buf[256];
@@ -46,7 +48,7 @@ void text(cv::Mat& img, const std::string& s, cv::Point p, double scale = 0.45,
     cv::putText(img, s, p, cv::FONT_HERSHEY_SIMPLEX, scale, c, th, cv::LINE_AA);
 }
 
-enum ButtonId { kNone = 0, kBtnEstop, kBtnApply, kBtnHold, kBtnHome, kBtnReset };
+enum ButtonId { kNone = 0, kBtnEstop, kBtnApply, kBtnHold, kBtnHome, kBtnReset, kBtnSource };
 struct Button { cv::Rect r; const char* label; cv::Scalar color; ButtonId id; bool enabled; };
 
 struct Clicks { std::vector<Button> buttons; ButtonId clicked = kNone; };
@@ -111,7 +113,7 @@ cv::Mat render_monitor(UiShared& ui, const Supervisor& sup, Clicks& clicks) {
     {
         std::lock_guard<std::mutex> lk(ui.m);
         st = ui.st; o = ui.out; have = ui.have_state; mm = ui.mode_machine; crc = ui.crc_fail;
-        manual = ui.manual;
+        manual = ui.source_manual;
         std::copy(ui.temp_c, ui.temp_c + kNumJoints, temp);
         std::copy(ui.motorstate, ui.motorstate + kNumJoints, ms);
         log.assign(ui.log.begin(), ui.log.end());
@@ -259,6 +261,7 @@ struct ManualUi {
     JointVec pending{}, checked_from{}, checked_to{};
     PoseCheck check;
     bool have_check = false;
+    bool source_manual = true;        // the source the sliders were last set for
 };
 
 int to_pos(const Supervisor& sup, int j, double q) {
@@ -276,10 +279,10 @@ void set_sliders(const Supervisor& sup, ManualUi& mu, const JointVec& q) {
 }
 
 cv::Mat render_manual(UiShared& ui, const Supervisor& sup, ManualUi& mu, Clicks& clicks) {
-    const int W = 980, H = 470;
+    const int W = 980, H = 540;
     cv::Mat img(H, W, CV_8UC3, kBg);
-    bool ready;
-    JointVec pub, goal, cmd;
+    bool ready, src_manual, cam_fresh;
+    JointVec pub, goal, cmd, cam;
     std::string res;
     bool res_ok;
     Mode mode;
@@ -288,72 +291,120 @@ cv::Mat render_manual(UiShared& ui, const Supervisor& sup, ManualUi& mu, Clicks&
         ready = ui.manual_ready; pub = ui.published; goal = ui.goal;
         for (int j = 0; j < kNumJoints; ++j) cmd[j] = ui.out.q[j];
         res = ui.apply_result; res_ok = ui.apply_ok; mode = ui.out.mode;
+        src_manual = ui.source_manual; cam_fresh = ui.camera_fresh; cam = ui.camera_q;
     }
     clicks.buttons.clear();
-    if (!ready) {
+    if (!ready && src_manual) {
         text(img, "waiting for rt/lowstate (sliders start at the measured pose)...", {20, 40}, 0.6, kYellow);
         return img;
     }
     if (!mu.created) {
         for (int j = 0; j < kNumJoints; ++j) cv::createTrackbar(kShort[j], kMan, nullptr, 1000);
-        set_sliders(sup, mu, pub);
+        set_sliders(sup, mu, src_manual ? pub : cmd);
         mu.created = true;
+        mu.source_manual = src_manual;
     }
-    // A slider nobody has moved keeps its exact angle, so quantization never shows up as a move.
-    for (int j = 0; j < kNumJoints; ++j) {
-        const int pos = cv::getTrackbarPos(kShort[j], kMan);
-        mu.pending[j] = pos == mu.set_pos[j] ? mu.set_q[j] : from_pos(sup, j, pos);
+    if (src_manual != mu.source_manual) {       // back to manual: the sliders start at the command
+        if (src_manual) set_sliders(sup, mu, pub);
+        mu.source_manual = src_manual;
+        mu.have_check = false;
     }
-    if (!mu.have_check || mu.checked_from != pub || mu.checked_to != mu.pending) {
-        mu.check = check_manual_pose(sup, pub, mu.pending);
-        mu.checked_from = pub;
-        mu.checked_to = mu.pending;
-        mu.have_check = true;
+    if (!src_manual) {
+        // Camera drives: the sliders mirror its pose; dragging them does nothing.
+        if (cam_fresh && cam != mu.set_q) set_sliders(sup, mu, cam);
+        mu.pending = mu.set_q;
+    } else {
+        // A slider nobody has moved keeps its exact angle, so quantization never shows up as a move.
+        for (int j = 0; j < kNumJoints; ++j) {
+            const int pos = cv::getTrackbarPos(kShort[j], kMan);
+            mu.pending[j] = pos == mu.set_pos[j] ? mu.set_q[j] : from_pos(sup, j, pos);
+        }
+        if (!mu.have_check || mu.checked_from != pub || mu.checked_to != mu.pending) {
+            mu.check = check_manual_pose(sup, pub, mu.pending);
+            mu.checked_from = pub;
+            mu.checked_to = mu.pending;
+            mu.have_check = true;
+        }
     }
     const PoseCheck& c = mu.check;
     const CollisionGeometry& g = sup.config().collision;
     bool moving = false;
-    for (int j = 0; j < kNumJoints; ++j) moving |= std::fabs(goal[j] - pub[j]) > 1e-6;
+    if (src_manual)
+        for (int j = 0; j < kNumJoints; ++j) moving |= std::fabs(goal[j] - pub[j]) > 1e-6;
+    const bool driven = mode == Mode::RampIn || mode == Mode::Tracking;
 
-    const Skel s_cmd = skeleton(cmd, g), s_goal = skeleton(goal, g), s_pend = skeleton(mu.pending, g);
+    const Skel s_cmd = skeleton(cmd, g), s_goal = skeleton(goal, g), s_pend = skeleton(mu.pending, g),
+               s_cam = skeleton(cam, g);
     const char* titles[2] = {"FRONT (facing the robot)", "SIDE (from its right)"};
     for (int view = 0; view < 2; ++view) {
         const cv::Rect panel{10 + view * 310, 10, 300, 400};
         cv::rectangle(img, panel, kDark, 1);
         text(img, titles[view], {panel.x + 8, panel.y + 18}, 0.45, kGrey);
         draw_boxes(img, s_cmd, view, panel);
+        if (cam_fresh) draw_skel(img, s_cam, view, panel, kMagenta, 1, nullptr);
         draw_skel(img, s_cmd, view, panel, kWhite, 2, nullptr);
-        if (moving) draw_skel(img, s_goal, view, panel, kYellow, 1, nullptr);
-        draw_skel(img, s_pend, view, panel, c.ok ? kGreen : kRed, 1, &g);
+        if (src_manual) {
+            if (moving) draw_skel(img, s_goal, view, panel, kYellow, 1, nullptr);
+            draw_skel(img, s_pend, view, panel, c.ok ? kGreen : kRed, 1, &g);
+        }
     }
-    text(img, "white = command now   yellow = applied goal   green/red = sliders (pending)", {12, 432}, 0.42, kGrey);
+    text(img, src_manual ? "white = command now   yellow = applied goal   green/red = sliders (pending)"
+                         : "white = command now", {12, 432}, 0.42, kGrey);
+    text(img, cam_fresh ? "magenta = camera (GMR) pose" : "camera: no fresh pose on the shm", {12, 454}, 0.42,
+         cam_fresh ? kMagenta : kGrey);
     text(img, fmt("mode %s: the arms move only while ARMED from the remote (hold R1 + X)", mode_name(mode)),
-         {12, 454}, 0.42, mode == Mode::Tracking ? kGreen : kYellow);
+         {12, 476}, 0.42, mode == Mode::Tracking ? kGreen : kYellow);
+    // What FOLLOW CAMERA would do right now (the control thread re-checks on the click).
+    if (src_manual) {
+        std::string pick;
+        bool pick_ok = false;
+        if (!driven) { pick = "FOLLOW CAMERA: allowed (arms not driven)"; pick_ok = true; }
+        else if (!cam_fresh) pick = "FOLLOW CAMERA: blocked, no fresh camera pose";
+        else {
+            const PoseCheck t = check_takeover(sup, true, cmd, cam);
+            pick_ok = t.ok;
+            pick = t.ok ? fmt("FOLLOW CAMERA: pick-up OK (%.2f rad)", t.max_delta)
+                        : fmt("FOLLOW CAMERA: blocked, %s is %.2f rad away (needs <= %.2f)",
+                              kShort[t.max_joint], t.max_delta, kTakeoverTol);
+        }
+        text(img, pick, {12, 498}, 0.42, pick_ok ? kGreen : kOrange);
+    }
 
     // verdict + notes
     const int x0 = 640;
-    text(img, "PENDING POSE CHECK", {x0, 30}, 0.5, kGrey);
     int y = 56;
-    for (const std::string& l : wrap(c.verdict, 34)) { text(img, l, {x0, y}, 0.5, c.ok ? kGreen : kRed, 1); y += 20; }
-    for (const std::string& n : c.notes)
-        for (const std::string& l : wrap("! " + n, 38)) { text(img, l, {x0, y}, 0.45, kYellow); y += 18; }
+    if (src_manual) {
+        text(img, "PENDING POSE CHECK", {x0, 30}, 0.5, kGrey);
+        for (const std::string& l : wrap(c.verdict, 34)) { text(img, l, {x0, y}, 0.5, c.ok ? kGreen : kRed, 1); y += 20; }
+        for (const std::string& n : c.notes)
+            for (const std::string& l : wrap("! " + n, 38)) { text(img, l, {x0, y}, 0.45, kYellow); y += 18; }
+    } else {
+        text(img, "SOURCE: CAMERA (GMR shm)", {x0, 30}, 0.55, kMagenta, 2);
+        for (const std::string& l : wrap("Sliders mirror the camera pose (read-only). BACK TO MANUAL "
+                                         "freezes the arms at the current command.", 38)) {
+            text(img, l, {x0, y}, 0.45, kWhite); y += 18;
+        }
+    }
     y += 8;
     if (!res.empty()) {
-        text(img, "last apply:", {x0, y}, 0.45, kGrey); y += 18;
+        text(img, "last request:", {x0, y}, 0.45, kGrey); y += 18;
         for (const std::string& l : wrap(res, 38)) { text(img, l, {x0, y}, 0.45, res_ok ? kGreen : kRed); y += 18; }
     }
     if (moving) text(img, "moving to the applied goal...", {x0, 250}, 0.5, kYellow);
 
     const bool estop = ui.estop;
+    const bool m = src_manual && !estop;
     std::vector<Button> b = {
-        {{x0, 265, 330, 55}, "APPLY", {40, 140, 40}, kBtnApply, c.ok && c.n_changed > 0 && !estop},
-        {{x0, 330, 105, 40}, "HOLD", {120, 90, 40}, kBtnHold, !estop},
-        {{x0 + 112, 330, 105, 40}, "HOME", {90, 90, 90}, kBtnHome, !estop},
-        {{x0 + 224, 330, 106, 40}, "RESET", {90, 90, 90}, kBtnReset, !estop},
+        {{x0, 265, 330, 55}, "APPLY", {40, 140, 40}, kBtnApply, m && c.ok && c.n_changed > 0},
+        {{x0, 330, 105, 40}, "HOLD", {120, 90, 40}, kBtnHold, m},
+        {{x0 + 112, 330, 105, 40}, "HOME", {90, 90, 90}, kBtnHome, m},
+        {{x0 + 224, 330, 106, 40}, "RESET", {90, 90, 90}, kBtnReset, m},
         {{x0, 380, 330, 60}, estop ? "E-STOP SENT" : "E-STOP", {30, 30, 210}, kBtnEstop, !estop},
+        {{x0, 450, 330, 45}, src_manual ? "FOLLOW CAMERA" : "BACK TO MANUAL",
+         src_manual ? cv::Scalar(150, 50, 150) : cv::Scalar(40, 110, 40), kBtnSource, !estop},
     };
     for (const Button& bt : b) { draw_button(img, bt, bt.id == kBtnEstop || bt.id == kBtnApply ? 0.8 : 0.55); clicks.buttons.push_back(bt); }
-    text(img, "HOLD = stop here.  HOME / RESET only set the sliders.", {x0, 458}, 0.38, kGrey);
+    text(img, "HOLD = stop here.  HOME / RESET only set the sliders.", {x0, 518}, 0.38, kGrey);
     return img;
 }
 
@@ -431,6 +482,17 @@ void run_ui(UiShared& ui, const Supervisor& sup) {
                     }
                     set_sliders(sup, mu, q);
                     ui_event(ui, "RESET clicked (sliders only)");
+                    break;
+                }
+                case kBtnSource: {
+                    bool to_manual;
+                    {
+                        std::lock_guard<std::mutex> lk(ui.m);
+                        to_manual = !ui.source_manual;
+                        ui.switch_request = true;
+                        ui.switch_to_manual = to_manual;
+                    }
+                    ui_event(ui, to_manual ? "BACK TO MANUAL clicked" : "FOLLOW CAMERA clicked");
                     break;
                 }
                 case kNone: break;

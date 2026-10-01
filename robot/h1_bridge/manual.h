@@ -34,6 +34,16 @@ struct PoseCheck {
 // that collides (deeper than `from` already does).
 PoseCheck check_manual_pose(const Supervisor& sup, const JointVec& from, const JointVec& to);
 
+// Switching the target source at runtime (the manual window's FOLLOW CAMERA / BACK TO
+// MANUAL toggle).  While the arms are not driven (disarmed, ramping out, faulted) any
+// switch is fine: nothing moves, and arming later starts from the measured pose as
+// always.  While they ARE driven the switch is a pick-up: the new source's first pose
+// `to` must already be within kTakeoverTol of the command `cmd` on every joint, so a
+// switch never lunges.  (Camera -> manual starts the sliders AT the command: always OK.)
+constexpr double kTakeoverTol = 0.3;   // rad
+
+PoseCheck check_takeover(const Supervisor& sup, bool driven, const JointVec& cmd, const JointVec& to);
+
 class ManualSource {
 public:
     explicit ManualSource(const Supervisor& sup) : sup_(sup) {}
