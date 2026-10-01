@@ -55,6 +55,11 @@ if [ ! -d "$VENV" ]; then
     "$PY" -m venv "$VENV"
 else
     echo "[setup_gmr] reusing existing venv at $VENV"
+    # everything downstream calls venv/bin/python; restore it if only python3 is there
+    if [ ! -x "$VENV/bin/python" ]; then
+        echo "[setup_gmr] venv has no bin/python — repairing (venv --upgrade)"
+        "$PY" -m venv --upgrade "$VENV"
+    fi
 fi
 
 PIP="$VENV/bin/pip"

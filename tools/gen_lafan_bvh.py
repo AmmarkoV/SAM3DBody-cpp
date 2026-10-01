@@ -85,7 +85,7 @@ def mhr_rest_world():
             gq[j]=qmul(gq[p],pq); rt=qrot(gq[p],off)
             gt[j]=[gt[p][i]+rt[i] for i in range(3)]
     names = re.findall(r'"([^"]+)"',
-        open(os.path.join(ROOT,'src','mhr_joint_table.h')).read()
+        open(os.path.join(ROOT,'src','core','mhr_joint_table.h')).read()
         .split('NAMES[N_JOINTS] = {',1)[1].split('};',1)[0])
     n2i = {n:i for i,n in enumerate(names)}
     pelvis = gt[n2i['root']]

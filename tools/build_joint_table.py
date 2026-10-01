@@ -17,7 +17,7 @@ import textwrap
 from pathlib import Path
 
 DEFAULT_PT = "/home/ammar/Documents/3dParty/sam-3d-body/checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt"
-OUT_HEADER = Path(__file__).resolve().parents[1] / "src" / "mhr_joint_table.h"
+OUT_HEADER = Path(__file__).resolve().parents[1] / "src" / "core" / "mhr_joint_table.h"
 
 
 def main() -> int:

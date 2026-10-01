@@ -220,9 +220,9 @@ def load_mhr_joints(path):
 
 def mhr_name_to_idx():
     import re, os
-    # Locate mhr_joint_table.h relative to this tool (../src/).
+    # Locate mhr_joint_table.h relative to this tool (../src/core/).
     here = os.path.dirname(os.path.abspath(__file__))
-    hdr = os.path.join(here, '..', 'src', 'mhr_joint_table.h')
+    hdr = os.path.join(here, '..', 'src', 'core', 'mhr_joint_table.h')
     if not os.path.exists(hdr): return {}
     block = open(hdr).read().split('NAMES[N_JOINTS] = {',1)[1].split('};',1)[0]
     names = re.findall(r'"([^"]+)"', block)

@@ -60,7 +60,7 @@ EQUALS = =
 CMAKE_SOURCE_DIR = /home/ammar/Documents/Programming/SAM3DBody-cpp
 
 # The top-level build directory on which CMake was run.
-CMAKE_BINARY_DIR = /home/ammar/Documents/Programming/SAM3DBody-cpp
+CMAKE_BINARY_DIR = /home/ammar/Documents/Programming/HumanoidController/dependencies/SAM3DBody-cpp
 
 #=============================================================================
 # Targets provided globally by CMake.
@@ -142,14 +142,14 @@ install/strip/fast: preinstall/fast
 
 # The main all target
 all: cmake_check_build_system
-	cd /home/ammar/Documents/Programming/SAM3DBody-cpp && $(CMAKE_COMMAND) -E cmake_progress_start /home/ammar/Documents/Programming/SAM3DBody-cpp/CMakeFiles /home/ammar/Documents/Programming/SAM3DBody-cpp/synchronization//CMakeFiles/progress.marks
-	cd /home/ammar/Documents/Programming/SAM3DBody-cpp && $(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 synchronization/all
-	$(CMAKE_COMMAND) -E cmake_progress_start /home/ammar/Documents/Programming/SAM3DBody-cpp/CMakeFiles 0
+	cd /home/ammar/Documents/Programming/HumanoidController/dependencies/SAM3DBody-cpp && $(CMAKE_COMMAND) -E cmake_progress_start /home/ammar/Documents/Programming/HumanoidController/dependencies/SAM3DBody-cpp/CMakeFiles /home/ammar/Documents/Programming/HumanoidController/dependencies/SAM3DBody-cpp/src/synchronization//CMakeFiles/progress.marks
+	cd /home/ammar/Documents/Programming/HumanoidController/dependencies/SAM3DBody-cpp && $(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 src/synchronization/all
+	$(CMAKE_COMMAND) -E cmake_progress_start /home/ammar/Documents/Programming/HumanoidController/dependencies/SAM3DBody-cpp/CMakeFiles 0
 .PHONY : all
 
 # The main clean target
 clean:
-	cd /home/ammar/Documents/Programming/SAM3DBody-cpp && $(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 synchronization/clean
+	cd /home/ammar/Documents/Programming/HumanoidController/dependencies/SAM3DBody-cpp && $(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 src/synchronization/clean
 .PHONY : clean
 
 # The main clean target
@@ -158,31 +158,31 @@ clean/fast: clean
 
 # Prepare targets for installation.
 preinstall: all
-	cd /home/ammar/Documents/Programming/SAM3DBody-cpp && $(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 synchronization/preinstall
+	cd /home/ammar/Documents/Programming/HumanoidController/dependencies/SAM3DBody-cpp && $(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 src/synchronization/preinstall
 .PHONY : preinstall
 
 # Prepare targets for installation.
 preinstall/fast:
-	cd /home/ammar/Documents/Programming/SAM3DBody-cpp && $(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 synchronization/preinstall
+	cd /home/ammar/Documents/Programming/HumanoidController/dependencies/SAM3DBody-cpp && $(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 src/synchronization/preinstall
 .PHONY : preinstall/fast
 
 # clear depends
 depend:
-	cd /home/ammar/Documents/Programming/SAM3DBody-cpp && $(CMAKE_COMMAND) -S$(CMAKE_SOURCE_DIR) -B$(CMAKE_BINARY_DIR) --check-build-system CMakeFiles/Makefile.cmake 1
+	cd /home/ammar/Documents/Programming/HumanoidController/dependencies/SAM3DBody-cpp && $(CMAKE_COMMAND) -S$(CMAKE_SOURCE_DIR) -B$(CMAKE_BINARY_DIR) --check-build-system CMakeFiles/Makefile.cmake 1
 .PHONY : depend
 
 # Convenience name for target.
-synchronization/CMakeFiles/xqr_time_sync.dir/rule:
-	cd /home/ammar/Documents/Programming/SAM3DBody-cpp && $(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 synchronization/CMakeFiles/xqr_time_sync.dir/rule
-.PHONY : synchronization/CMakeFiles/xqr_time_sync.dir/rule
+src/synchronization/CMakeFiles/xqr_time_sync.dir/rule:
+	cd /home/ammar/Documents/Programming/HumanoidController/dependencies/SAM3DBody-cpp && $(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 src/synchronization/CMakeFiles/xqr_time_sync.dir/rule
+.PHONY : src/synchronization/CMakeFiles/xqr_time_sync.dir/rule
 
 # Convenience name for target.
-xqr_time_sync: synchronization/CMakeFiles/xqr_time_sync.dir/rule
+xqr_time_sync: src/synchronization/CMakeFiles/xqr_time_sync.dir/rule
 .PHONY : xqr_time_sync
 
 # fast build rule for target.
 xqr_time_sync/fast:
-	cd /home/ammar/Documents/Programming/SAM3DBody-cpp && $(MAKE) $(MAKESILENT) -f synchronization/CMakeFiles/xqr_time_sync.dir/build.make synchronization/CMakeFiles/xqr_time_sync.dir/build
+	cd /home/ammar/Documents/Programming/HumanoidController/dependencies/SAM3DBody-cpp && $(MAKE) $(MAKESILENT) -f src/synchronization/CMakeFiles/xqr_time_sync.dir/build.make src/synchronization/CMakeFiles/xqr_time_sync.dir/build
 .PHONY : xqr_time_sync/fast
 
 libQRSync.o: libQRSync.c.o
@@ -190,7 +190,7 @@ libQRSync.o: libQRSync.c.o
 
 # target to build an object file
 libQRSync.c.o:
-	cd /home/ammar/Documents/Programming/SAM3DBody-cpp && $(MAKE) $(MAKESILENT) -f synchronization/CMakeFiles/xqr_time_sync.dir/build.make synchronization/CMakeFiles/xqr_time_sync.dir/libQRSync.c.o
+	cd /home/ammar/Documents/Programming/HumanoidController/dependencies/SAM3DBody-cpp && $(MAKE) $(MAKESILENT) -f src/synchronization/CMakeFiles/xqr_time_sync.dir/build.make src/synchronization/CMakeFiles/xqr_time_sync.dir/libQRSync.c.o
 .PHONY : libQRSync.c.o
 
 libQRSync.i: libQRSync.c.i
@@ -198,7 +198,7 @@ libQRSync.i: libQRSync.c.i
 
 # target to preprocess a source file
 libQRSync.c.i:
-	cd /home/ammar/Documents/Programming/SAM3DBody-cpp && $(MAKE) $(MAKESILENT) -f synchronization/CMakeFiles/xqr_time_sync.dir/build.make synchronization/CMakeFiles/xqr_time_sync.dir/libQRSync.c.i
+	cd /home/ammar/Documents/Programming/HumanoidController/dependencies/SAM3DBody-cpp && $(MAKE) $(MAKESILENT) -f src/synchronization/CMakeFiles/xqr_time_sync.dir/build.make src/synchronization/CMakeFiles/xqr_time_sync.dir/libQRSync.c.i
 .PHONY : libQRSync.c.i
 
 libQRSync.s: libQRSync.c.s
@@ -206,7 +206,7 @@ libQRSync.s: libQRSync.c.s
 
 # target to generate assembly for a file
 libQRSync.c.s:
-	cd /home/ammar/Documents/Programming/SAM3DBody-cpp && $(MAKE) $(MAKESILENT) -f synchronization/CMakeFiles/xqr_time_sync.dir/build.make synchronization/CMakeFiles/xqr_time_sync.dir/libQRSync.c.s
+	cd /home/ammar/Documents/Programming/HumanoidController/dependencies/SAM3DBody-cpp && $(MAKE) $(MAKESILENT) -f src/synchronization/CMakeFiles/xqr_time_sync.dir/build.make src/synchronization/CMakeFiles/xqr_time_sync.dir/libQRSync.c.s
 .PHONY : libQRSync.c.s
 
 # Help Target
@@ -237,6 +237,6 @@ help:
 # No rule that depends on this can have commands that come from listfiles
 # because they might be regenerated.
 cmake_check_build_system:
-	cd /home/ammar/Documents/Programming/SAM3DBody-cpp && $(CMAKE_COMMAND) -S$(CMAKE_SOURCE_DIR) -B$(CMAKE_BINARY_DIR) --check-build-system CMakeFiles/Makefile.cmake 0
+	cd /home/ammar/Documents/Programming/HumanoidController/dependencies/SAM3DBody-cpp && $(CMAKE_COMMAND) -S$(CMAKE_SOURCE_DIR) -B$(CMAKE_BINARY_DIR) --check-build-system CMakeFiles/Makefile.cmake 0
 .PHONY : cmake_check_build_system
 
