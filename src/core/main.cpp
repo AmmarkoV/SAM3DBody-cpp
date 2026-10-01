@@ -46,6 +46,8 @@ struct Config : public CommonConfig
     // Runner-specific pipeline knobs
     bool        skip_body      = false;
     bool        zero_face      = true;
+    bool        refined_pose   = false;  // --refined-pose: see PLAN.md
+    bool        no_pass2       = false;  // --no-pass2: run only pass 1 of --refined-pose
     float       focal_x        = 0.f;
     float       focal_y        = 0.f;
     float       cx             = 0.f;
@@ -101,6 +103,8 @@ static void print_usage(const char* prog)
     printf("  --detector-threshold F  Person confidence (default 0.50; 0.25 for libreyolo). Alias: --thresh\n");
     printf("  --nms T           Detector NMS IoU threshold (default 0.45)\n");
     printf("  --max-persons N   Cap to top-N most-confident people (0 = unlimited)\n");
+    printf("  --refined-pose    Iterative decoder + wrist-IK hand splice (slower, better hands)\n");
+    printf("  --no-pass2        With --refined-pose: run only pass 1 (skip the prompted re-decode)\n");
     printf("  --detector NAME   Bbox provider parsing --yolo output: auto (default; prefers libreyolo*.onnx\n");
     printf("                    in onnx-dir, else yolo-pose) | yolo-pose | libreyolo\n");
     printf("  --fx F            Camera focal length x (0 = image width)\n");
@@ -171,6 +175,8 @@ static Config parse_args(int argc, char** argv)
             continue;
         }
         if (!strcmp(argv[i], "--skip-body"))      { c.skip_body       = true;  continue; }
+        if (!strcmp(argv[i], "--refined-pose"))   { c.refined_pose    = true;  continue; }
+        if (!strcmp(argv[i], "--no-pass2"))       { c.no_pass2        = true;  continue; }
         if (!strcmp(argv[i], "--dev-face"))       { c.zero_face       = false; continue; }
         if (!strcmp(argv[i], "--headless"))       { c.headless        = true;  continue; }
         if (!strcmp(argv[i], "--info"))           { c.info_only       = true;  continue; }
@@ -491,11 +497,18 @@ int main(int argc, char** argv)
     ARFWriter arf_writer;   // opened below alongside bvh_writer, once source_fps is known
 
     fsb::PipelineConfig pcfg;
-    ensure_models(c);                       // fetch the models if onnx/ is empty
+    ensure_models(c, c.refined_pose);       // fetch the models if onnx/ is empty
     resolve_detector_defaults(c);           // "auto" → libreyolo when available
     resolve_backbone_defaults(c);           // CUDA: prefer backbone_fp16.onnx if present
     apply_common_to_pipeline_cfg(c, pcfg);  // all shared pipeline fields
     pcfg.skip_body_model  = c.skip_body;
+    // refined_pose needs the Pipeline's own body model (wrist-IK FK +
+    // keypoint projection), so it overrides --skip-body.
+    if (c.refined_pose && c.skip_body)
+        fprintf(stderr, "[main] --refined-pose needs the body model; ignoring --skip-body.\n");
+    if (c.refined_pose) pcfg.skip_body_model = false;
+    pcfg.refined_pose     = c.refined_pose;
+    pcfg.skip_pass2       = c.no_pass2;
     pcfg.zero_face_params = c.zero_face;
     pcfg.focal_x          = c.focal_x;
     pcfg.focal_y          = c.focal_y;

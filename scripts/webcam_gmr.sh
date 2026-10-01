@@ -15,7 +15,7 @@
 #  arrives.  See GMR.md ("Live webcam -> robot") for the design.
 #
 #  Usage:
-#       scripts/webcam_gmr.sh [SOURCE] [RobotType] [-- extra binary flags]
+#       scripts/webcam_gmr.sh [--refined-pose [--no-pass2]] [SOURCE] [RobotType] [-- extra binary flags]
 #
 #       SOURCE     webcam index / /dev/videoN / a video-file path   (default 0)
 #       RobotType  a robot with a LAFAN IK config in GMR            (default unitree_g1)
@@ -28,6 +28,10 @@
 #       SINK=dds scripts/webcam_gmr.sh 0 unitree_g1 # DDS sink (stub; see gmr_stream.py)
 #       SINK=teleop scripts/webcam_gmr.sh 0 unitree_h1_2  # feed robot/h1_bridge (run it separately)
 #       HEADLESS=1 scripts/webcam_gmr.sh 0          # no input overlay window (robot only)
+#       scripts/webcam_gmr.sh --refined-pose 0 unitree_h1_2  # refined hands (~8 fps)
+#
+#  --refined-pose / --no-pass2 may appear anywhere before "--"; they are pulled
+#  out before SOURCE / RobotType are read and forwarded to the binary.
 #
 #  Two windows open by default: the input RGB frame with the 2D skeleton overlaid
 #  (the binary's own live view), plus the retargeted robot (the sink's viewer).
@@ -52,6 +56,17 @@ REPO="$( cd "$THISDIR/.." && pwd )"
 cd "$REPO"
 
 # ── args ─────────────────────────────────────────────────────────────────────
+# Pull --refined-pose / --no-pass2 out of the positional args (up to "--").
+REFINED_ARG=()
+_pos=()
+while [ $# -gt 0 ] && [ "$1" != "--" ]; do
+    case "$1" in
+        --refined-pose|--no-pass2) REFINED_ARG+=("$1") ;;
+        *) _pos+=("$1") ;;
+    esac
+    shift
+done
+set -- "${_pos[@]+"${_pos[@]}"}" "$@"
 SOURCE="${1:-0}"
 ROBOT="${2:-unitree_g1}"
 EXTRA=()
@@ -141,6 +156,7 @@ else
 fi
 
 echo "[webcam_gmr] source=$SOURCE robot=$ROBOT sink=$SINK headless=$HEADLESS"
+[ "${#REFINED_ARG[@]}" -gt 0 ] && echo "[webcam_gmr] refined pose ON (${REFINED_ARG[*]})"
 if [ "${#TRT_ARG[@]}" -gt 0 ]; then
     echo "[webcam_gmr] TensorRT fast path ON (${TRT_ARG[*]})"
 else
@@ -169,6 +185,7 @@ BIN_ARGS=(
     --butterworth --butterworth-root-rotation
     "${TRT_ARG[@]}"
     "${HEADLESS_ARG[@]}"
+    "${REFINED_ARG[@]}"
     "${EXTRA[@]}"
 )
 PY_ARGS=(
