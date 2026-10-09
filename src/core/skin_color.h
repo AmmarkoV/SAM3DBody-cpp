@@ -48,6 +48,17 @@ struct SkinObservation {
 // few vertices to tell.
 float observation_change(const SkinObservation& a, const SkinObservation& b);
 
+// Where a posed mesh's visible vertices land in the image: pixel position and
+// observation weight per visible vertex.  Depends on geometry only, so one
+// projection can be sampled in many frames (--focus: the same retained pose in
+// the current frame and its keyframe compares the same pixels).
+struct SkinProjection {
+    std::vector<unsigned int> vertex;   // visible vertex indices
+    std::vector<float>        u, v, w;  // pixel position and weight, per entry
+    int                       img_w = 0, img_h = 0;
+    size_t                    n_vertices = 0;
+};
+
 // Projects a posed mesh into the image and samples the visible vertices.
 class SkinObserver {
 public:
@@ -64,6 +75,14 @@ public:
                  const uint8_t* bgr, int w, int h,
                  const float* verts, const float* normals,
                  const float cam_t[3], float focal, float cx, float cy);
+
+    // observe() in two halves: the geometry (visibility, pixel positions,
+    // weights) for a w x h image, then the colours under it in any frame of
+    // that size.  observe() == project() + sample().
+    void project(SkinProjection& out, int w, int h,
+                 const float* verts, const float* normals,
+                 const float cam_t[3], float focal, float cx, float cy);
+    static void sample(SkinObservation& out, const SkinProjection& proj, const uint8_t* bgr);
 
 private:
     size_t                    n_vertices_ = 0;
@@ -91,18 +110,20 @@ public:
     // mirror[v] = v's left/right counterpart.  A never-seen vertex whose
     // mirror was seen takes the mirror's colour, before the default or the
     // neighbour fill (--skin-color-mirror).
-    void set_mirror(const std::vector<unsigned int>& mirror) { mirror_ = mirror; }
+    void set_mirror(const std::vector<unsigned int>& mirror) { mirror_ = mirror; rgba_dirty_ = true; }
 
     // Mean absolute colour difference (0-1) between an observation and the
     // stored colours, over the vertices both have seen.  -1 when they share
-    // too little of the body to tell.
-    float discrepancy(const SkinObservation& obs) const;
+    // too little of the body to tell.  vertex_weight (n_vertices, optional)
+    // scales each vertex's say, e.g. more for the head (--skin-face-weight).
+    float discrepancy(const SkinObservation& obs, const float* vertex_weight = nullptr) const;
 
     // RGB in [0,1] per vertex [n_vertices x 3], unobserved vertices filled.
     // Valid until the next call.
     const std::vector<float>& colors();
     // Same, as RGBA with A = 1 where the vertex has actually been observed
-    // and 0 where it was only filled in.
+    // and 0 where it was only filled in.  Cached until the colours change
+    // (add() or a setter), since every matching pass asks every slot for it.
     const std::vector<float>& colors_rgba();
 
     // Fraction of vertices observed at least once.
@@ -118,6 +139,7 @@ private:
     std::vector<double>       sum_w_;
     std::vector<float>        colors_;
     std::vector<float>        rgba_;
+    bool                      rgba_dirty_ = true;
     bool                      has_default_ = false;   // set_default_color
     float                     default_rgb_[3] = {0.f, 0.f, 0.f};
     std::vector<unsigned int> mirror_;                    // set_mirror
@@ -133,19 +155,61 @@ private:
 // blended with appearance agreement when a discrepancy score is available.
 // An unmatched detection opens a new slot.  Slots keep their last box while
 // their person is missed; a strong appearance match alone can also bring a
-// person back to their slot after they left the view.
+// person back to their slot after they left the view, either at once
+// (confirm = 0) or once it has held for `confirm` consecutive frames: the
+// person first gets a new, tentative slot, which is then merged into the old
+// one and retired.  A confirmed re-entry may use a looser similarity
+// (reid_confirm) if the best absent slot also beats the runner-up by
+// `margin`; a slot seen at any time since the tentative one appeared is never
+// a candidate (two people visible at once are two people).  With `motion`, a
+// slot's box is extrapolated with its recent velocity while its person is missed.
 class PersonSlots {
 public:
+    struct Params {
+        float min_iou    = 0.2f;   // below: a different person, not the same one moved
+        float app_scale  = 0.2f;   // discrepancy that maps to zero similarity
+        float reid_sim   = 0.6f;   // similarity that re-identifies without box overlap
+        float app_weight = 0.5f;   // appearance vs box overlap in a pair's score
+        int   confirm    = 0;      // frames an appearance-only re-entry must hold, 0 = at once
+        float reid_confirm = -1.f; // similarity a confirmed re-entry needs (< 0: reid_sim)
+        float margin     = 0.f;    // ... and by how much it must beat the next absent slot
+        bool  motion     = false;  // extrapolate missed slots' boxes with their velocity
+        // Defaults, overridden by FSB_SLOT_{MIN_IOU,APP_SCALE,REID_SIM,APP_WEIGHT,
+        // CONFIRM,REID_CONFIRM,MARGIN,MOTION} (parameter sweeps, tools/reid_eval).
+        static Params from_env();
+    };
+
+    explicit PersonSlots(const Params& p = Params::from_env()) : p_(p) {}
+
     // boxes      : [x1,y1,x2,y2] per detection.
     // discrepancy: optional [n_boxes x size()] row-major, colour discrepancy
     //              0-1 of detection d vs slot s, < 0 = unknown.  Empty = boxes only.
+    // synthetic  : optional, per box: true for boxes the caller made up (split
+    //              from a merged detection); they move a slot but do not count
+    //              as a real sighting (recent_boxes).
     // Returns the slot of each box.
     std::vector<int> assign(const std::vector<std::array<float, 4>>& boxes,
-                            const std::vector<float>& discrepancy = {});
-    size_t size() const { return last_box_.size(); }
+                            const std::vector<float>& discrepancy = {},
+                            const std::vector<char>& synthetic = {});
+    size_t size() const { return slots_.size(); }
+
+    // Last box of every alive slot really detected within the last max_age
+    // assign() calls (the caller's next frame), with its slot index.
+    std::vector<std::pair<int, std::array<float, 4>>> recent_boxes(long max_age) const;
+    const Params& params() const { return p_; }
 
 private:
-    std::vector<std::array<float, 4>> last_box_;
+    struct Slot {
+        std::array<float, 4> box;          // last box
+        float vx = 0.f, vy = 0.f;          // box centre velocity, px per frame
+        long  seen = 0, created = 0;       // frame numbers
+        long  real_seen = 0;               // last frame matched to a real (not synthetic) box
+        bool  alive = true;                // false once merged into an older slot
+        int   cand = -1, cand_frames = 0;  // re-entry candidate (older slot) and its streak
+    };
+    Params            p_;
+    std::vector<Slot> slots_;
+    long              frame_ = 0;
 };
 
 } // namespace fsb

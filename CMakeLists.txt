@@ -423,6 +423,7 @@ if(NOT WIN32)
         src/core/v4l2_capture.cpp
         src/core/skin_match_gl.cpp
         src/core/skin_turntable_gl.cpp
+        src/core/skin_texture_gl.cpp
         ${GRAPHICS_ENGINE_DIR}/System/glx3.c
         ${GRAPHICS_ENGINE_DIR}/ModelLoader/model_loader_tri.c
         ${GRAPHICS_ENGINE_DIR}/ModelLoader/model_loader_transform_joints.c

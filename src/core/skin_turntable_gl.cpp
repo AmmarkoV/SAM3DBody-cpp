@@ -1,5 +1,6 @@
 // skin_turntable_gl.cpp  –  see skin_turntable_gl.h
 #include "skin_turntable_gl.h"
+#include "skin_texture_gl.h"
 
 #include <GL/glew.h>
 
@@ -10,9 +11,13 @@
 
 namespace fsb {
 
-// Virtual camera distance (metres) from each person's centre; the focal length
-// is then picked so the body fills its column.
+// Virtual camera distance (metres) from each person's centre.
 static constexpr float CAM_DIST = 3.0f;
+// Fixed framing, so a body keeps its size and place whatever it does: room for
+// this much height (metres, arms raised) and this horizontal reach from the
+// centre, with the feet on a fixed line near the bottom.
+static constexpr float FRAME_HEIGHT = 2.4f;
+static constexpr float FRAME_REACH  = 0.6f;
 static constexpr float Z_NEAR   = 0.1f, Z_FAR = 10.f;
 
 // Positions arrive already centred, rotated and pushed CAM_DIST in front of
@@ -34,7 +39,8 @@ void main() {
 }
 )";
 
-// Same wrap lighting as default.frag, with the light fixed to the camera.
+// Same wrap lighting as default.frag (its light --skin-color variant), with the light
+// fixed to the camera.
 static const char* kFrag = R"(
 #version 330 core
 in vec3 vNorm;
@@ -46,6 +52,7 @@ void main() {
     float d = clamp((dot(N, L) + 0.15) / 1.15, 0.0, 1.0);
     d = d * d * (3.0 - 2.0 * d);
     d = d * 0.65 + 0.35;
+    d = mix(1.0, d, 0.3);   // the colours already carry the video's lighting: shade lightly
     fragColor = vec4(vColor * d, 1.0);
 }
 )";
@@ -150,7 +157,8 @@ const std::vector<uint8_t>& SkinTurntableGL::render(const std::vector<const floa
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, w_, h_);
-    glClearColor(0.12f, 0.12f, 0.14f, 1.f);
+    if (transparent_) glClearColor(0.f, 0.f, 0.f, 0.f);
+    else              glClearColor(bg_[0], bg_[1], bg_[2], 1.f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     glDisable(GL_BLEND);
     glEnable(GL_DEPTH_TEST);
@@ -164,32 +172,27 @@ const std::vector<uint8_t>& SkinTurntableGL::render(const std::vector<const floa
     pos_.resize(n_vertices_ * 3);
     norm_.resize(n_vertices_ * 3);
 
-    // Centre, height and horizontal reach (the radius it sweeps turning) per
-    // person; one focal length for everyone so their sizes stay comparable,
-    // the largest one that still fits every body in its column.
-    struct Extent { float c[3], reach, height; };
+    // One fixed metric framing for everyone, so sizes stay true and nobody
+    // shrinks when they raise their arms: the focal length depends only on the
+    // output size and the number of columns.  Each body turns about the
+    // vertical axis through its vertex centroid (which raised arms barely
+    // move), with its lowest point (the feet; Y points down) on a line
+    // FRAME_HEIGHT/2 below the image centre.
+    struct Extent { float c[3]; };
     std::vector<Extent> ext(P);
-    float f = 1e9f;
+    const int   cw_min = std::max(1, (int)(w_ / std::max<size_t>(P, 1)));   // P = 0: nobody, a cleared frame
+    const float near_z = CAM_DIST - FRAME_REACH;
+    const float f = std::min(0.92f * h_ * near_z / FRAME_HEIGHT, 0.9f * cw_min * near_z / (2.f * FRAME_REACH));
     for (size_t p = 0; p < P; ++p) {
         const float* v = verts[p];
-        float lo[3] = { 1e9f,  1e9f,  1e9f}, hi[3] = {-1e9f, -1e9f, -1e9f};
-        for (size_t i = 0; i < n_vertices_; ++i)
-            for (int c = 0; c < 3; ++c) {
-                lo[c] = std::min(lo[c], v[i*3+c]);
-                hi[c] = std::max(hi[c], v[i*3+c]);
-            }
-        const float cx = 0.5f * (lo[0] + hi[0]), cy = 0.5f * (lo[1] + hi[1]), cz = 0.5f * (lo[2] + hi[2]);
-        float r2 = 0.f;
+        double sx = 0.0, sz = 0.0;
+        float feet = -1e9f;
         for (size_t i = 0; i < n_vertices_; ++i) {
-            float dx = v[i*3+0] - cx, dz = v[i*3+2] - cz;
-            r2 = std::max(r2, dx*dx + dz*dz);
+            sx += v[i*3+0];
+            sz += v[i*3+2];
+            feet = std::max(feet, v[i*3+1]);
         }
-        const float reach  = std::max(std::sqrt(r2), 1e-3f);
-        const float height = std::max(hi[1] - lo[1], 1e-3f);
-        ext[p] = {{cx, cy, cz}, reach, height};
-        const int   cw     = (int)((p + 1) * w_ / P) - (int)(p * w_ / P);
-        const float near_z = CAM_DIST - reach;
-        f = std::min(f, std::min(0.85f * h_ * near_z / height, 0.9f * cw * near_z / (2.f * reach)));
+        ext[p] = {{(float)(sx / n_vertices_), feet - 0.5f * FRAME_HEIGHT, (float)(sz / n_vertices_)}};
     }
 
     for (size_t p = 0; p < P; ++p) {
@@ -222,6 +225,19 @@ const std::vector<uint8_t>& SkinTurntableGL::render(const std::vector<const floa
 
         const int x0 = (int)(p * w_ / P), cw = (int)((p + 1) * w_ / P) - x0;
         glViewport(x0, 0, cw, h_);
+        if (tex_ && p < tex_ids_.size() && tex_ids_[p]) {
+            // The same projection as kVert's uProj, as a column-major matrix.
+            const float a = (Z_FAR + Z_NEAR) / (Z_FAR - Z_NEAR), b = -2.f * Z_FAR * Z_NEAR / (Z_FAR - Z_NEAR);
+            const float m[16] = { 2.f * f / cw, 0, 0, 0,   0, -2.f * f / h_, 0, 0,   0, 0, a, 1,   0, 0, b, 0 };
+            static const float nsign[3] = {1.f, -1.f, -1.f}, light[3] = {0.3f, 0.5f, 0.8f};
+            if (transparent_) {   // never-seen parts translucent: blend onto the cleared alpha
+                glEnable(GL_BLEND);
+                glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+            }
+            tex_->draw(tex_ids_[p], pos_.data(), norm_.data(), m, 1.f, nsign, light, transparent_);
+            glDisable(GL_BLEND);
+            continue;
+        }
         glUniform4f(proj_loc_, 2.f * f / cw, 2.f * f / h_,
                     (Z_FAR + Z_NEAR) / (Z_FAR - Z_NEAR), -2.f * Z_FAR * Z_NEAR / (Z_FAR - Z_NEAR));
 
@@ -236,8 +252,16 @@ const std::vector<uint8_t>& SkinTurntableGL::render(const std::vector<const floa
 
     // ── Read back, top row first ─────────────────────────────────────────────
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glReadPixels(0, 0, w_, h_, GL_RGB, GL_UNSIGNED_BYTE, pixels_.data());
-    const size_t stride = (size_t)w_ * 3;
+    const int ch = channels();
+    pixels_.resize((size_t)w_ * h_ * ch);
+    glReadPixels(0, 0, w_, h_, ch == 4 ? GL_RGBA : GL_RGB, GL_UNSIGNED_BYTE, pixels_.data());
+    if (ch == 4)   // blending left premultiplied colour; PNG wants straight alpha
+        for (size_t i = 0; i < pixels_.size(); i += 4) {
+            const int a = pixels_[i + 3];
+            if (a > 0 && a < 255)
+                for (int c = 0; c < 3; ++c) pixels_[i + c] = (uint8_t)std::min(255, pixels_[i + c] * 255 / a);
+        }
+    const size_t stride = (size_t)w_ * ch;
     row_.resize(stride);
     for (int y = 0; y < h_ / 2; ++y) {
         uint8_t* a = &pixels_[(size_t)y * stride];

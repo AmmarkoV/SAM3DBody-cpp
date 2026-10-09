@@ -18,6 +18,8 @@
 
 namespace fsb {
 
+class SkinTextureGL;
+
 class SkinTurntableGL {
 public:
     // Topology + output size; call once with a current GL context.
@@ -32,10 +34,24 @@ public:
                                        const std::vector<const float*>& rgb,
                                        float angle_deg);
 
+    // --skin-texture: draw person p with texture ids[p] (0 = vertex colours)
+    // in the next render() calls.
+    void set_textures(SkinTextureGL* tex, const std::vector<unsigned int>& ids) { tex_ = tex; tex_ids_ = ids; }
+    // Transparent background: render() then returns RGBA (straight alpha, 0 off
+    // the bodies; with textures, never-seen parts keep their texture alpha).
+    void set_transparent(bool t) { transparent_ = t; }
+    int  channels() const { return transparent_ ? 4 : 3; }
+    // Background colour, 0-1 (default dark grey).  A key colour such as
+    // magenta lets tools/reid_eval/make_viz.py cut the people out.
+    void set_background(float r, float g, float b) { bg_[0] = r; bg_[1] = g; bg_[2] = b; }
     int width()  const { return w_; }
     int height() const { return h_; }
 
 private:
+    float                     bg_[3] = {0.12f, 0.12f, 0.14f};
+    SkinTextureGL*            tex_ = nullptr;
+    bool                      transparent_ = false;
+    std::vector<unsigned int> tex_ids_;
     size_t                    n_vertices_ = 0;
     unsigned int              n_indices_  = 0;
     std::vector<unsigned int> indices_;

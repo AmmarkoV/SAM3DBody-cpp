@@ -99,6 +99,7 @@ void FocusTracker::select(const cv::Mat& bgr, float sensitivity, bool debug,
         {
             ++tr.retained;
             retained.emplace_back(i, tr.result);
+            retained.back().second.retained = true;
             ++n_retained_;
             continue;
         }

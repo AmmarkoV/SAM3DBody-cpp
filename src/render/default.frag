@@ -28,6 +28,10 @@ void main() {
     float d = clamp((ndotl + wrap) / (1.0 + wrap), 0.0, 1.0);
     d = d * d * (3.0 - 2.0 * d);   // smoothstep ease, kills the remaining clamp kinks
     d = d * 0.65 + 0.35;           // same overall range as the old 0.3..1.0 ramp
+    // --skin-color: the colours were sampled from the video and already carry its
+    // lighting, so shade them only lightly (0.8..1.0) to keep the shape readable
+    // without darkening them a second time.
+    d = mix(d, mix(1.0, d, 0.3), uVertexColor);
     vec3  tint = mix(uColor, vColor, uVertexColor);
     vec3  base = tint * d;
 

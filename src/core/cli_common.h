@@ -94,6 +94,7 @@ struct CommonConfig
     // `--thresh 0.6` to the renderer simply no-ops rather than erroring.
     float       person_thresh   = 0.50f;
     float       person_nms_iou  = 0.45f;
+    bool        pose_nms        = false;  // --pose-nms
     int         max_persons     = 0;      // --max-persons N: 0 = unlimited; >0 = top-N by conf
     bool        focus           = false;  // --focus: regress only the people who moved (F.ECT)
     float       focus_sensitivity = 2.0f; // --focus [F]: mean |dI| over the box that triggers a regress
@@ -207,6 +208,7 @@ inline bool parse_common_arg(int argc, const char* const* argv, int& i,
          std::strcmp(argv[i], "--thresh") == 0) && i + 1 < argc)
     { c.person_thresh = std::stof(argv[++i]); c.thresh_set = true; return true; }
     CLI_FLT ("--nms",                  person_nms_iou)
+    if (std::strcmp(argv[i], "--pose-nms") == 0) { c.pose_nms = true; return true; }
     CLI_INT ("--max-persons",          max_persons)
     if (std::strcmp(argv[i], "--focus") == 0)
     {
@@ -713,6 +715,7 @@ inline void apply_common_to_pipeline_cfg(const CommonConfig& c,
     pc.pipeline_depth = c.pipeline_depth;
     pc.person_thresh  = c.person_thresh;
     pc.person_nms_iou = c.person_nms_iou;
+    pc.pose_nms       = c.pose_nms;
     pc.max_persons    = c.max_persons;
     pc.focus          = c.focus;
     pc.focus_sensitivity = c.focus_sensitivity;
@@ -765,6 +768,8 @@ inline void print_common_args_help(FILE* fp)
         "  --detector-threshold F         Person confidence threshold (default 0.50; 0.25 for libreyolo,\n"
         "                                 whose tiny model scores people lower).  Alias: --thresh\n"
         "  --nms      F                   Detector NMS IoU (default 0.45)\n"
+        "  --pose-nms                     Keypoint-aware NMS: overlapping boxes with different\n"
+        "                                 skeletons (OKS < 0.5) are both kept (close couples, crowds)\n"
         "  --max-persons N                Cap processing to the top-N most-confident people (0 = unlimited)\n"
         "  --focus [SENSITIVITY]          Spend inference only on the people who are moving; people who\n"
         "                                 are static keep their previous solution instead of being\n"

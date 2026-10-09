@@ -1946,7 +1946,7 @@ struct Pipeline::Impl
                 case PipelineConfig::DET_YOLO_POSE:
                 default:
                     dets = parse_yolo_output(row_major.data(), nd, C,
-                                             cfg.person_thresh, cfg.person_nms_iou);
+                                             cfg.person_thresh, cfg.person_nms_iou, cfg.pose_nms);
                     break;
                 }
                 for (auto& d : dets)
@@ -2744,6 +2744,7 @@ struct Pipeline::Impl
             const float* p = mhr_raw.data() + i * NPOSE;
 
             r.bbox = { d.x1, d.y1, d.x2, d.y2 };
+            r.det_score = d.conf;
 
             if (cfg.refined_pose && !hand_box_out.empty())
             {
@@ -3689,6 +3690,7 @@ struct Pipeline::Impl
     FocusTracker   focus_tracker;     // per person: regress only who moved
     FocusFrameGate focus_gate;        // per frame: skip the detector when nothing moved
     FocusMotionFn  focus_motion;      // optional per-person cue (set_focus_motion)
+    DetectionFilterFn det_filter;     // optional caller correction (set_detection_filter)
 
     std::vector<MHRResult> process_mat(const cv::Mat& bgr, int W, int H)
     {
@@ -3703,6 +3705,23 @@ struct Pipeline::Impl
         set_camera_intrinsics(ctx);
         if (!detect_people(ctx))
             return {};                       // nobody in frame; nothing to regress
+        if (det_filter)
+        {
+            std::vector<std::array<float, 5>> boxes;
+            for (const auto& d : ctx.dets) boxes.push_back({d.x1, d.y1, d.x2, d.y2, d.conf});
+            det_filter(boxes);
+            std::vector<PersonDet> out;
+            for (const auto& b : boxes)
+            {
+                PersonDet nd{};
+                nd.x1 = b[0]; nd.y1 = b[1]; nd.x2 = b[2]; nd.y2 = b[3]; nd.conf = b[4];
+                for (const auto& d : ctx.dets)   // untouched: keep the detector's keypoints
+                    if (d.x1 == b[0] && d.y1 == b[1] && d.x2 == b[2] && d.y2 == b[3]) { nd = d; break; }
+                out.push_back(nd);
+            }
+            ctx.dets = std::move(out);
+            if (ctx.dets.empty()) return {};
+        }
 
         // --focus: drop the people who have not moved out of this frame's batch
         // and keep the answer we already have for them (see FocusTracker in focus.h).
@@ -3926,6 +3945,10 @@ const uint8_t* Pipeline::last_result_bgr(int& w, int& h) const
 void Pipeline::set_focus_motion(FocusMotionFn fn)
 {
     if (impl_) impl_->focus_motion = std::move(fn);
+}
+void Pipeline::set_detection_filter(DetectionFilterFn fn)
+{
+    if (impl_) impl_->det_filter = std::move(fn);
 }
 
 void Pipeline::print_timing_summary() const

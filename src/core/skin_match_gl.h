@@ -43,7 +43,8 @@ public:
     //   det_boxes  : per detection, [x1,y1,x2,y2] pixels
     //   slot_rgba  : per stored person, SkinColorAccumulator::colors_rgba()
     // Returns [n_det x n_slots] row-major, 0-1, -1 = too little overlap to
-    // tell (or more pairs than fit in the framebuffer).
+    // tell.  More pairs than fit in the framebuffer are rendered in several
+    // passes.  The score is a mean weighted by slot_rgba's alpha.
     std::vector<float> score(unsigned int scene_tex, int img_w, int img_h,
                              const std::vector<const float*>&           det_verts,
                              const std::vector<std::array<float, 16>>&  det_mvp,

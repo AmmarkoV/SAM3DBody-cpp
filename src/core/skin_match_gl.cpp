@@ -139,7 +139,8 @@ std::vector<float> SkinMatchGL::score(unsigned int scene_tex, int img_w, int img
     const size_t D = det_verts.size(), S = slot_rgba.size();
     std::vector<float> out(D * S, -1.f);
     if (!prog_ || !D || !S || img_w <= 0 || img_h <= 0) return out;
-    const size_t n_pairs = std::min(D * S, (size_t)(TILES_X * TILES_Y));
+    const size_t n_total = D * S;
+    const size_t cap     = (size_t)(TILES_X * TILES_Y);   // pairs per pass
 
     // ── Save the state we touch ──────────────────────────────────────────────
     GLint prev_fbo = 0, prev_prog = 0, prev_vao = 0, prev_vp[4], prev_active = 0;
@@ -166,13 +167,8 @@ std::vector<float> SkinMatchGL::score(unsigned int scene_tex, int img_w, int img
         glBufferData(GL_ARRAY_BUFFER, n_vertices_ * 4 * sizeof(float), slot_rgba[s], GL_STREAM_DRAW);
     }
 
-    // ── Render one tile per (detection, slot) pair ───────────────────────────
+    // ── Render one tile per (detection, slot) pair, `cap` pairs per pass ─────
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
-    glViewport(0, 0, FB_SIZE, FB_SIZE);
-    glDisable(GL_SCISSOR_TEST);
-    glClearColor(0.f, 0.f, 0.f, 0.f);
-    glClearDepth(1.0);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     glDisable(GL_BLEND);
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_CULL_FACE);
@@ -187,44 +183,54 @@ std::vector<float> SkinMatchGL::score(unsigned int scene_tex, int img_w, int img
     glEnableVertexAttribArray(0);
     glEnableVertexAttribArray(2);
 
-    for (size_t k = 0; k < n_pairs; ++k) {
-        const size_t d = k / S, s = k % S;
-        const int tx = (int)(k % TILES_X) * TILE_W, ty = (int)(k / TILES_X) * TILE_H;
-        glViewport(tx, ty, TILE_W, TILE_H);
-        glScissor (tx, ty, TILE_W, TILE_H);
-
-        // Box (pixels, y down) -> NDC of the full frame -> [-1,1] of the tile.
-        const auto& b = det_boxes[d];
-        float nx1 = 2.f * b[0] / img_w - 1.f, nx2 = 2.f * b[2] / img_w - 1.f;
-        float ny1 = 1.f - 2.f * b[3] / img_h, ny2 = 1.f - 2.f * b[1] / img_h;   // bottom, top
-        if (nx2 - nx1 < 1e-4f || ny2 - ny1 < 1e-4f) continue;
-        glUniform4f(crop_loc_, 2.f / (nx2 - nx1), -(nx1 + nx2) / (nx2 - nx1),
-                               2.f / (ny2 - ny1), -(ny1 + ny2) / (ny2 - ny1));
-        glUniformMatrix4fv(mvp_loc_, 1, GL_FALSE, det_mvp[d].data());
-
-        glBindBuffer(GL_ARRAY_BUFFER, pos_vbo_[d]);
-        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
-        glBindBuffer(GL_ARRAY_BUFFER, col_vbo_[s]);
-        glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, 0, nullptr);
-        glDrawElements(GL_TRIANGLES, (GLsizei)n_indices_, GL_UNSIGNED_INT, nullptr);
-    }
-
-    // ── Reduce: mip level REDUCE_LEVEL holds each tile's averages ───────────
     static std::vector<float> red((size_t)RED_SIZE * RED_SIZE * 4);
-    glBindTexture(GL_TEXTURE_2D, color_tex_);
-    glGenerateMipmap(GL_TEXTURE_2D);
-    glGetTexImage(GL_TEXTURE_2D, REDUCE_LEVEL, GL_RGBA, GL_FLOAT, red.data());
-    glBindTexture(GL_TEXTURE_2D, 0);
+    for (size_t base = 0; base < n_total; base += cap) {
+        const size_t n_pairs = std::min(cap, n_total - base);
+        glDisable(GL_SCISSOR_TEST);
+        glViewport(0, 0, FB_SIZE, FB_SIZE);
+        glClearColor(0.f, 0.f, 0.f, 0.f);
+        glClearDepth(1.0);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glEnable(GL_SCISSOR_TEST);
 
-    for (size_t k = 0; k < n_pairs; ++k) {
-        const int rx = (int)(k % TILES_X), ry = (int)(k / TILES_X) * RED_TILE_H;
-        float diff = 0.f, seen = 0.f;
-        for (int j = 0; j < RED_TILE_H; ++j) {
-            const float* t = &red[((size_t)(ry + j) * RED_SIZE + rx) * 4];
-            diff += t[0];
-            seen += t[1];
+        for (size_t k = 0; k < n_pairs; ++k) {
+            const size_t d = (base + k) / S, s = (base + k) % S;
+            const int tx = (int)(k % TILES_X) * TILE_W, ty = (int)(k / TILES_X) * TILE_H;
+            glViewport(tx, ty, TILE_W, TILE_H);
+            glScissor (tx, ty, TILE_W, TILE_H);
+
+            // Box (pixels, y down) -> NDC of the full frame -> [-1,1] of the tile.
+            const auto& b = det_boxes[d];
+            float nx1 = 2.f * b[0] / img_w - 1.f, nx2 = 2.f * b[2] / img_w - 1.f;
+            float ny1 = 1.f - 2.f * b[3] / img_h, ny2 = 1.f - 2.f * b[1] / img_h;   // bottom, top
+            if (nx2 - nx1 < 1e-4f || ny2 - ny1 < 1e-4f) continue;
+            glUniform4f(crop_loc_, 2.f / (nx2 - nx1), -(nx1 + nx2) / (nx2 - nx1),
+                                   2.f / (ny2 - ny1), -(ny1 + ny2) / (ny2 - ny1));
+            glUniformMatrix4fv(mvp_loc_, 1, GL_FALSE, det_mvp[d].data());
+
+            glBindBuffer(GL_ARRAY_BUFFER, pos_vbo_[d]);
+            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
+            glBindBuffer(GL_ARRAY_BUFFER, col_vbo_[s]);
+            glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, 0, nullptr);
+            glDrawElements(GL_TRIANGLES, (GLsizei)n_indices_, GL_UNSIGNED_INT, nullptr);
         }
-        if (seen / RED_TILE_H >= MIN_SEEN_FRACTION) out[k] = diff / seen;
+
+        // ── Reduce: mip level REDUCE_LEVEL holds each tile's averages ───────────
+        glBindTexture(GL_TEXTURE_2D, color_tex_);
+        glGenerateMipmap(GL_TEXTURE_2D);
+        glGetTexImage(GL_TEXTURE_2D, REDUCE_LEVEL, GL_RGBA, GL_FLOAT, red.data());
+        glBindTexture(GL_TEXTURE_2D, scene_tex);   // unit 2 again holds the frame for the next pass
+
+        for (size_t k = 0; k < n_pairs; ++k) {
+            const int rx = (int)(k % TILES_X), ry = (int)(k / TILES_X) * RED_TILE_H;
+            float diff = 0.f, seen = 0.f;
+            for (int j = 0; j < RED_TILE_H; ++j) {
+                const float* t = &red[((size_t)(ry + j) * RED_SIZE + rx) * 4];
+                diff += t[0];
+                seen += t[1];
+            }
+            if (seen / RED_TILE_H >= MIN_SEEN_FRACTION) out[base + k] = diff / seen;
+        }
     }
 
     // ── Restore ──────────────────────────────────────────────────────────────

@@ -245,6 +245,23 @@ static inline float iou(const PersonDet& a, const PersonDet& b) {
     return bbox_iou(ab, bb);
 }
 
+// Object keypoint similarity (COCO OKS) of two YOLO-pose skeletons, scaled by
+// a's box area; -1 when fewer than 3 keypoints are visible in both.
+static inline float pose_oks(const PersonDet& a, const PersonDet& b) {
+    static const float sigma[17] = {.026f, .025f, .025f, .035f, .035f, .079f, .079f, .072f, .072f,
+                                    .062f, .062f, .107f, .107f, .087f, .087f, .089f, .089f};
+    const float area = std::max(1.f, (a.x2 - a.x1) * (a.y2 - a.y1));
+    float sum = 0.f; int n = 0;
+    for (int k = 0; k < 17; ++k) {
+        if (a.kps[k*3+2] < 0.5f || b.kps[k*3+2] < 0.5f) continue;
+        const float dx = a.kps[k*3] - b.kps[k*3], dy = a.kps[k*3+1] - b.kps[k*3+1];
+        const float kk = 2.f * sigma[k];
+        sum += std::exp(-(dx*dx + dy*dy) / (2.f * area * kk * kk));
+        ++n;
+    }
+    return n >= 3 ? sum / n : -1.f;
+}
+
 // Parse YOLO Pose output tensor [num_dets, num_feat] (already transposed to
 // row-major).  num_feat is 56 for YOLO-pose; anything narrower is not a pose
 // model (e.g. a detection-only export picked with the wrong --detector) and
@@ -256,7 +273,8 @@ inline std::vector<PersonDet> parse_yolo_output(
     int           num_dets,
     int           num_feat,
     float         conf_thresh,
-    float         nms_iou_thresh
+    float         nms_iou_thresh,
+    bool          pose_nms = false   // --pose-nms: overlapping boxes survive when their skeletons differ
 )
 {
     std::vector<PersonDet> raw;
@@ -285,15 +303,24 @@ inline std::vector<PersonDet> parse_yolo_output(
     std::sort(raw.begin(), raw.end(),
         [](const PersonDet& a, const PersonDet& b){ return a.conf > b.conf; });
 
-    // Greedy NMS
+    // Greedy NMS.  With pose_nms, a box overlapping a stronger one is only a
+    // duplicate if their skeletons also agree (OKS > 0.5) or the boxes are
+    // near-identical: two people in a close hold overlap heavily but have
+    // different poses, and box-only NMS keeps just one of them.
     std::vector<bool> suppressed(raw.size(), false);
     std::vector<PersonDet> kept;
     for (size_t i = 0; i < raw.size(); ++i) {
         if (suppressed[i]) continue;
         kept.push_back(raw[i]);
         for (size_t j = i + 1; j < raw.size(); ++j) {
-            if (!suppressed[j] && iou(raw[i], raw[j]) > nms_iou_thresh)
-                suppressed[j] = true;
+            if (suppressed[j]) continue;
+            const float ov = iou(raw[i], raw[j]);
+            if (ov <= nms_iou_thresh) continue;
+            if (pose_nms && ov < 0.85f) {
+                const float oks = pose_oks(raw[i], raw[j]);
+                if (oks >= 0.f && oks < 0.5f) continue;   // a different person
+            }
+            suppressed[j] = true;
         }
     }
     return kept;

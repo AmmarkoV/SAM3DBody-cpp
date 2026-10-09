@@ -27,6 +27,8 @@ namespace fsb {
 struct MHRResult {
     // Bounding box in original image  [x1, y1, x2, y2]
     std::array<float, 4> bbox{};
+    float det_score = 0.f;             // detector confidence of bbox (1 for external boxes)
+    bool  retained  = false;           // --focus: previous solution kept, not regressed this frame
 
     float focal_length = 0.f;          // Estimated / default focal length (pixels)
 
@@ -94,6 +96,13 @@ struct MHRResult {
 using FocusMotionFn = std::function<float(const uint8_t* now_bgr, const uint8_t* key_bgr,
                                           int width, int height, const MHRResult& retained)>;
 
+// ─── caller-side correction of the detections (Pipeline::set_detection_filter) ─
+// Called once per frame after detection and NMS, before regression, with every
+// box as {x1, y1, x2, y2, conf} in original-image pixels.  It may replace, add or
+// remove boxes, e.g. split a box that covers two people the caller is tracking.
+// Boxes it leaves untouched keep their detector keypoints; new ones have none.
+using DetectionFilterFn = std::function<void(std::vector<std::array<float, 5>>& boxes)>;
+
 // ─── Pipeline configuration ───────────────────────────────────────────────────
 struct PipelineConfig {
     // Paths
@@ -126,6 +135,7 @@ struct PipelineConfig {
     bool skip_body_model = false;   // Skip body model – no vertices/keypoints (faster)
     float person_thresh  = 0.50f;  // YOLO confidence threshold
     float person_nms_iou = 0.45f;  // YOLO NMS IoU threshold
+    bool  pose_nms       = false;  // --pose-nms: keypoint-aware NMS (keeps overlapping people)
     int  max_persons     = 0;      // 0 = unlimited; >0 = cap after NMS (top-N by conf)
 
     // --focus: spend inference only on the people who are actually moving, and
@@ -254,6 +264,10 @@ public:
     // The retain/regress rule, timeout and refresh cap stay as they are.  An empty
     // fn restores the box cue.
     void set_focus_motion(FocusMotionFn fn);
+
+    // Correct each frame's detections before regression (DetectionFilterFn).
+    // An empty fn turns it off.
+    void set_detection_filter(DetectionFilterFn fn);
 
     // True after a successful load().
     bool is_loaded() const;
