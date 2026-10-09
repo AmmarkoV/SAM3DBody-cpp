@@ -116,7 +116,11 @@ public:
     // stored colours, over the vertices both have seen.  -1 when they share
     // too little of the body to tell.  vertex_weight (n_vertices, optional)
     // scales each vertex's say, e.g. more for the head (--skin-face-weight).
-    float discrepancy(const SkinObservation& obs, const float* vertex_weight = nullptr) const;
+    // gain_range > 0 first fits a per-channel illumination gain (clamped to
+    // [1/(1+r), 1+r]) between the observation and the stored colours.
+    // shared_out, if given, receives the number of vertices compared.
+    float discrepancy(const SkinObservation& obs, const float* vertex_weight = nullptr,
+                      float gain_range = 0.f, size_t* shared_out = nullptr) const;
 
     // RGB in [0,1] per vertex [n_vertices x 3], unobserved vertices filled.
     // Valid until the next call.

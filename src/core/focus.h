@@ -88,6 +88,10 @@ public:
     // people back in.
     // `keep_key` (a motion cue is set) also stores bgr as those people's
     // keyframe.
+    // Per detection of the last select() (original order): {reason, cue}, with the
+    // codes of MHRResult::focus_reason.
+    const std::vector<std::pair<uint8_t, float>>& decisions() const { return decisions_; }
+
     void commit(const std::vector<PersonDet>& dets,
                 const std::vector<MHRResult>& results,
                 const cv::Mat& bgr, bool keep_key);
@@ -108,6 +112,7 @@ private:
     };
     std::vector<FocusTrack> tracks_;
     cv::Mat                 prev_gray_;  // I_{t-1}, for Eq. 3
+    std::vector<std::pair<uint8_t, float>> decisions_;   // last select(), per detection
     uint64_t                n_regressed_ = 0, n_retained_ = 0;
 
     float box_motion(const cv::Mat& gray, const PersonDet& d,

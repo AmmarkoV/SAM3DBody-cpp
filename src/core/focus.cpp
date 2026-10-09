@@ -47,6 +47,7 @@ void FocusTracker::select(const cv::Mat& bgr, float sensitivity, bool debug,
 
     std::vector<PersonDet> active;
     const int n = (int)dets.size();
+    decisions_.assign(n, {(uint8_t)1, -1.f});   // default: new/unmatched
     for (int i = 0; i < n; ++i)
     {
         const PersonDet& d = dets[i];
@@ -84,9 +85,11 @@ void FocusTracker::select(const cv::Mat& bgr, float sensitivity, bool debug,
         const bool  stale = tr.retained >= FOCUS_MAX_RETAIN;
 
         const char* why = nullptr;
-        if (moved)              { tr.timeout = FOCUS_TIMEOUT; why = "moved";   }
-        else if (stale)         {                             why = "refresh"; }
-        else if (tr.timeout > 0){ --tr.timeout;               why = "timeout"; }
+        uint8_t     code = 5;   // retained
+        if (moved)              { tr.timeout = FOCUS_TIMEOUT; why = "moved";   code = 2; }
+        else if (stale)         {                             why = "refresh"; code = 4; }
+        else if (tr.timeout > 0){ --tr.timeout;               why = "timeout"; code = 3; }
+        decisions_[i] = {code, m_c};
 
         if (debug)
             printf("[FSB]   focus person %d: m_c=%.2f%s (sensitivity=%.2f) t_i=%d r_i=%d -> %s\n",

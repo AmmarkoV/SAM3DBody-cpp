@@ -3741,6 +3741,9 @@ struct Pipeline::Impl
                 add_count(timers.frames, 1);
                 ctx.results.resize(n_detected);
                 for (auto& rt : retained) ctx.results[rt.first] = std::move(rt.second);
+                const auto& dec = focus_tracker.decisions();
+                for (int k = 0; k < n_detected && k < (int)dec.size(); ++k)
+                    { ctx.results[k].focus_reason = dec[k].first; ctx.results[k].focus_cue = dec[k].second; }
                 printf("[FSB] total: %.1f ms  (0 of %d persons regressed)\n",
                        ms(t_total), n_detected);
                 return std::move(ctx.results);
@@ -3770,6 +3773,9 @@ struct Pipeline::Impl
                 for (auto& rt : retained) merged[rt.first] = std::move(rt.second);
                 ctx.results = std::move(merged);
             }
+            const auto& dec = focus_tracker.decisions();   // results are in detection order now
+            for (size_t k = 0; k < ctx.results.size() && k < dec.size(); ++k)
+                { ctx.results[k].focus_reason = dec[k].first; ctx.results[k].focus_cue = dec[k].second; }
             printf("[FSB] total: %.1f ms  (%d of %d persons regressed)\n",
                    ms(t_total), ctx.B, n_detected);
         }

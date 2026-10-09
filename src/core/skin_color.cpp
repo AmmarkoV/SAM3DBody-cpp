@@ -221,9 +221,31 @@ void SkinColorAccumulator::apply_override()
             for (int c = 0; c < 3; ++c) colors_[v*3+c] = override_rgb_[c];
 }
 
-float SkinColorAccumulator::discrepancy(const SkinObservation& obs, const float* vertex_weight) const
+float SkinColorAccumulator::discrepancy(const SkinObservation& obs, const float* vertex_weight,
+                                        float gain_range, size_t* shared_out) const
 {
+    if (shared_out) *shared_out = 0;
     if (obs.w.size() != n_vertices_) return -1.f;
+    // Illumination: the per-channel gain g that best maps the observation onto
+    // the stored colours (least squares, stored ~ g * observed) over the shared
+    // vertices, clamped to [1/(1+r), 1+r] so only lighting, not clothing, is
+    // explained away.  gain_range <= 0: no compensation.
+    double gain[3] = {1.0, 1.0, 1.0};
+    if (gain_range > 0.f) {
+        double so[3] = {0, 0, 0}, oo[3] = {0, 0, 0};
+        for (size_t i = 0; i < n_vertices_; ++i) {
+            const float wt = obs.w[i];
+            if (wt <= 0.f || sum_w_[i] <= 0.0) continue;
+            for (int c = 0; c < 3; ++c) {
+                const double st = sum_rgb_[i*3+c] / sum_w_[i], ob = obs.rgb[i*3+c];
+                so[c] += wt * st * ob;
+                oo[c] += wt * ob * ob;
+            }
+        }
+        const double lo = 1.0 / (1.0 + gain_range), hi = 1.0 + gain_range;
+        for (int c = 0; c < 3; ++c)
+            if (oo[c] > 1e-9) gain[c] = std::min(hi, std::max(lo, so[c] / oo[c]));
+    }
     double diff = 0.0, wsum = 0.0;
     size_t shared = 0;
     for (size_t i = 0; i < n_vertices_; ++i) {
@@ -232,11 +254,12 @@ float SkinColorAccumulator::discrepancy(const SkinObservation& obs, const float*
         if (vertex_weight) wt *= vertex_weight[i];
         double d = 0.0;
         for (int c = 0; c < 3; ++c)
-            d += std::fabs(sum_rgb_[i*3+c] / sum_w_[i] - obs.rgb[i*3+c]);
+            d += std::fabs(sum_rgb_[i*3+c] / sum_w_[i] - gain[c] * obs.rgb[i*3+c]);
         diff += wt * d / 3.0;
         wsum += wt;
         ++shared;
     }
+    if (shared_out) *shared_out = shared;
     if (shared < MIN_SHARED_VERTICES || wsum <= 0.0) return -1.f;
     return (float)(diff / wsum);
 }

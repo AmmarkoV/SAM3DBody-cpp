@@ -29,6 +29,11 @@ struct MHRResult {
     std::array<float, 4> bbox{};
     float det_score = 0.f;             // detector confidence of bbox (1 for external boxes)
     bool  retained  = false;           // --focus: previous solution kept, not regressed this frame
+    // --focus decision for this person this frame: 0 = no --focus, 1 = new/unmatched detection,
+    // 2 = regressed because the cue said it moved, 3 = regressed in the hold after motion,
+    // 4 = regressed by the staleness cap, 5 = retained.  focus_cue = the cue value (-1 = none).
+    uint8_t focus_reason = 0;
+    float   focus_cue    = -1.f;
 
     float focal_length = 0.f;          // Estimated / default focal length (pixels)
 

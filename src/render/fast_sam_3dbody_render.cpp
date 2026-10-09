@@ -68,9 +68,11 @@
 //   regressed from their own crop (close dance holds, hugs).  Split boxes move a
 //   slot but do not count as sightings, so a split cannot keep itself alive.
 // --pose-out PATH writes every person's skeleton per frame, binary: the
-//   header "FSBPOSE1" + int32 joint count, then per person int32 frame (1-based),
-//   slot (-1 without --skin-color), retained (1 = --focus kept the previous
-//   solution), float bbox[4], cam_t[3], focal, joints[n*3] (LBS space, metres).
+//   header "FSBPOSE2" + int32 joint count, then per person int32 frame (1-based),
+//   slot (-1 without --skin-color: then follow people by box), retained (1 =
+//   --focus kept the previous solution; its box/cam/joints are the keyframe's),
+//   focus reason (MHRResult::focus_reason), float focus cue, bbox[4], cam_t[3],
+//   focal, joints[n*3] (LBS space, metres).
 //   tools/reid_eval/focus_eval.py compares a --focus run with a full one.
 // --track-shadow SPEC PATH (repeatable) runs one more, independent set of person
 //   slots in the same pass and writes it to PATH like --track-out: compares
@@ -78,7 +80,8 @@
 //   optionally followed by comma-separated overrides of the PersonSlots
 //   parameters (skin_color.h) and the head weight, e.g.
 //   "gpu,confirm=3,motion=1,face=3" (keys: iou, scale, reid, weight, confirm,
-//   rc = re-entry similarity once confirmed, margin, motion, face).  The main slots take the same settings from FSB_SLOT_* and
+//   rc = re-entry similarity once confirmed, margin, motion, face; cpu only:
+//   gain = illumination gain range, evid = shared vertices for full trust).  The main slots take the same settings from FSB_SLOT_* and
 //   FSB_SKIN_FACE_WEIGHT.
 // FSB_SKIN_FACE_WEIGHT=W (main slots) / face=W (shadows): the head's vertices
 //   (above the neck in the rest pose: face and hair) count W times as much in
@@ -1217,7 +1220,7 @@ int main(int argc, const char** argv) {
             fprintf(stderr, "Cannot open --pose-out file: %s\n", pose_out.c_str());
             return 1;
         }
-        fwrite("FSBPOSE1", 1, 8, pose_fp);
+        fwrite("FSBPOSE2", 1, 8, pose_fp);
     }
     struct ShadowTracker {
         std::string                            mode;
@@ -1225,10 +1228,16 @@ int main(int argc, const char** argv) {
         fsb::PersonSlots                       slots;
         std::vector<fsb::SkinColorAccumulator> acc;
         float                                  face_weight = 1.f;
+        float                                  gain = 0.f;      // illumination gain range (cpu)
+        float                                  evidence = 0.f;  // shared vertices for full trust (cpu)
         std::unique_ptr<fsb::SkinTextureGL>    tex;   // mode gpu_tex: this tracker's own textures
     };
     const float main_face_weight = getenv("FSB_SKIN_FACE_WEIGHT")
                                  ? (float)atof(getenv("FSB_SKIN_FACE_WEIGHT")) : 1.f;
+    // FSB_SKIN_GAIN=r / FSB_SKIN_EVIDENCE=n: cpu matching with illumination
+    // compensation / evidence weighting for the main slots (see ShadowTracker).
+    const float main_gain     = getenv("FSB_SKIN_GAIN") ? (float)atof(getenv("FSB_SKIN_GAIN")) : 0.f;
+    const float main_evidence = getenv("FSB_SKIN_EVIDENCE") ? (float)atof(getenv("FSB_SKIN_EVIDENCE")) : 0.f;
     std::vector<ShadowTracker> shadows(track_shadow.size());
     for (size_t k = 0; k < track_shadow.size(); ++k) {
         // SPEC = mode[,key=value...]
@@ -1252,6 +1261,8 @@ int main(int argc, const char** argv) {
             else if (key == "margin")  sp.margin     = val;
             else if (key == "motion")  sp.motion     = val != 0.f;
             else if (key == "face")    shadows[k].face_weight = val;
+            else if (key == "gain")    shadows[k].gain = val;
+            else if (key == "evid")    shadows[k].evidence = val;
             else { fprintf(stderr, "--track-shadow: unknown key '%s'\n", key.c_str()); return 1; }
             comma = next;
         }
@@ -1862,7 +1873,8 @@ int main(int argc, const char** argv) {
 
             // Appearance discrepancy of every detection vs every stored person.
             auto score_slots = [&](const std::string& mode, std::vector<fsb::SkinColorAccumulator>& accs,
-                                   float face_weight, fsb::SkinTextureGL* tex) {
+                                   float face_weight, fsb::SkinTextureGL* tex,
+                                   float gain = 0.f, float evidence = 0.f) {
                 const size_t S = accs.size();
                 std::vector<float> disc;
                 if (D == 0 || S == 0 || mode == "none") return disc;
@@ -1891,14 +1903,28 @@ int main(int argc, const char** argv) {
                     }
                     disc = skin_matcher.score(bg.id, frame_w, frame_h, dv, mvps, boxes, sc);
                 } else {
+                    // Evidence weighting: a pair that shares only `shared` of the
+                    // `evidence` vertices that earn full trust keeps that fraction of
+                    // its appearance similarity (in discrepancy units, via the slots'
+                    // app_scale), so a sliver-sized slot cannot outscore a well-seen one.
+                    const float scale = skin_slots.params().app_scale;
                     disc.assign(D * S, -1.f);
                     for (size_t d = 0; d < D; ++d)
-                        for (size_t s = 0; s < S; ++s)
-                            disc[d * S + s] = accs[s].discrepancy(skin_obs[d], vw);
+                        for (size_t s = 0; s < S; ++s) {
+                            size_t shared = 0;
+                            float dd = accs[s].discrepancy(skin_obs[d], vw, gain, &shared);
+                            if (dd >= 0.f && evidence > 0.f) {
+                                const float a = std::max(0.f, 1.f - dd / scale);
+                                const float k = std::min(1.f, (float)shared / evidence);
+                                dd = scale * (1.f - a * k);
+                            }
+                            disc[d * S + s] = dd;
+                        }
                 }
                 return disc;
             };
-            std::vector<float> discrepancy = score_slots(skin_match, skin_acc, main_face_weight, &skin_texture);
+            std::vector<float> discrepancy = score_slots(skin_match, skin_acc, main_face_weight, &skin_texture,
+                                                         main_gain, main_evidence);
             if (getenv("FSB_SKIN_MATCH_DEBUG") && !discrepancy.empty()) {
                 const size_t S = skin_acc.size();
                 fprintf(stderr, "\n[skin-match] frame %d:", frame_index);
@@ -1923,7 +1949,8 @@ int main(int argc, const char** argv) {
 
             // --track-shadow: the same detections through independent slots.
             for (ShadowTracker& sh : shadows) {
-                std::vector<float> disc = score_slots(sh.mode, sh.acc, sh.face_weight, sh.tex.get());
+                std::vector<float> disc = score_slots(sh.mode, sh.acc, sh.face_weight, sh.tex.get(),
+                                                      sh.gain, sh.evidence);
                 std::vector<int> slot = sh.slots.assign(boxes, disc, split_flags);
                 if (sh.tex && bg_ok && bg.ready)
                     for (size_t d = 0; d < D; ++d)
@@ -1981,10 +2008,10 @@ int main(int argc, const char** argv) {
                     fwrite(&nj, sizeof nj, 1, pose_fp);
                     header_done = true;
                 }
-                int32_t head[3] = { frame_index + 1,
+                int32_t head[4] = { frame_index + 1,
                                     skin_slot_of.empty() ? -1 : skin_slot_of[person_idx],
-                                    r.retained ? 1 : 0 };
-                float   cam[8]  = { r.bbox[0], r.bbox[1], r.bbox[2], r.bbox[3],
+                                    r.retained ? 1 : 0, (int32_t)r.focus_reason };
+                float   cam[9]  = { r.focus_cue, r.bbox[0], r.bbox[1], r.bbox[2], r.bbox[3],
                                     r.pred_cam_t[0], r.pred_cam_t[1], r.pred_cam_t[2],
                                     r.focal_length };
                 fwrite(head, sizeof head, 1, pose_fp);
