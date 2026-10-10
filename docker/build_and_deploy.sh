@@ -14,7 +14,9 @@ cd "$DIR"
 
 NAME="sam3dbodycpp"
 dockerfile_pth="$DIR"
-mount_pth="$REPOSITORY"
+# Mounted at /home/user/workspace.  Default: this repository.  MOUNT_PTH=/some/parent ./build_and_deploy.sh
+# mounts a parent folder instead (e.g. one holding datasets/SAM3DBody-cpp, to keep existing absolute paths).
+mount_pth="${MOUNT_PTH:-$REPOSITORY}"
 
 export DOCKER_BUILDKIT=1
 
@@ -38,8 +40,13 @@ docker build \
 #--mount type=tmpfs,destination=/home/user/ram,tmpfs-mode=1777,size=140G,mpol=bind,huge=always \
 # was --mount type=tmpfs,destination=/home/user/ram,tmpfs-mode=1777 \
 #--tmpfs /home/user/ram:rw,size=140g,mode=1777 \
+# The renderer opens an X display through GLX, so for GPU OpenGL the container uses the host's X
+# server (which must run on the NVIDIA driver); allow local clients first.
+xhost +local: > /dev/null 2>&1 || echo "xhost failed: no host X server? OpenGL will not work in the container"
 docker run -d \
 	--gpus all \
+	-e DISPLAY=${DISPLAY:-:0} \
+	-v /tmp/.X11-unix:/tmp/.X11-unix:ro \
 	--shm-size 32G \
     --cap-add=SYS_NICE \
     --mount type=tmpfs,destination=/home/user/ram,tmpfs-mode=1777 \
@@ -57,7 +64,7 @@ OUR_DOCKER_ID=`docker ps -a | grep $NAME | cut -f1 -d' '`
 echo "Our docker ID is : $OUR_DOCKER_ID"
 
 echo "To monitor resource-consumption use: docker stats $NAME-container"
-echo "Attaching it using : docker attach $OUD_DOCKER_ID"
+echo "Attaching it using : docker attach $OUR_DOCKER_ID"
 docker attach $OUR_DOCKER_ID
 
 

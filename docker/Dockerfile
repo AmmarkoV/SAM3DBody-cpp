@@ -29,6 +29,8 @@ RUN \
 			rsync \
             python3-venv \
             python3-pip \
+            mesa-utils \
+            x11-xserver-utils \
 	&& echo "**** python pip update ****" \
 		&& /usr/bin/python3 -m pip install --upgrade pip \
 	&& echo "**** aliases for l and ll commands creation ****" \
@@ -51,6 +53,8 @@ USER ${user_name}
 WORKDIR /home/${user_name}/
  
 
-RUN /home/${user_name}/workspace/scripts/setup.sh
-RUN echo "source /home/${user_name}/workspace/venv/bin/activate" >> /home/${user_name}/.bashrc
+# The repository is bind-mounted at run time (build_and_deploy.sh), so it is not in the image yet:
+# run "bash scripts/setup.sh" inside the container once (it installs, downloads the models, builds
+# and creates the venv).  The venv is activated on login once it exists.
+RUN echo '[ -f "$HOME/workspace/venv/bin/activate" ] && source "$HOME/workspace/venv/bin/activate"' >> /home/${user_name}/.bashrc
 
