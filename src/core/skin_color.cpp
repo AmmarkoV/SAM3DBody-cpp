@@ -221,8 +221,19 @@ void SkinColorAccumulator::apply_override()
             for (int c = 0; c < 3; ++c) colors_[v*3+c] = override_rgb_[c];
 }
 
+// Orthonormal opponent colour space: O1 = (R-G)/sqrt2, O2 = (R+G-2B)/sqrt6 (chroma),
+// O3 = (R+G+B)/sqrt3 (luminance).  Orthonormal, so lum_weight = 1 keeps distances
+// as in RGB (up to L1 vs rotation); smaller weights discount brightness changes.
+static inline double opponent_l1(const double a[3], const double b[3], double lum_weight)
+{
+    const double dr = a[0] - b[0], dg = a[1] - b[1], db = a[2] - b[2];
+    const double o1 = (dr - dg) * 0.70710678, o2 = (dr + dg - 2.0 * db) * 0.40824829;
+    const double o3 = (dr + dg + db) * 0.57735027;
+    return std::fabs(o1) + std::fabs(o2) + lum_weight * std::fabs(o3);
+}
+
 float SkinColorAccumulator::discrepancy(const SkinObservation& obs, const float* vertex_weight,
-                                        float gain_range, size_t* shared_out) const
+                                        float gain_range, size_t* shared_out, float lum_weight) const
 {
     if (shared_out) *shared_out = 0;
     if (obs.w.size() != n_vertices_) return -1.f;
@@ -253,8 +264,52 @@ float SkinColorAccumulator::discrepancy(const SkinObservation& obs, const float*
         if (wt <= 0.f || sum_w_[i] <= 0.0) continue;
         if (vertex_weight) wt *= vertex_weight[i];
         double d = 0.0;
+        if (lum_weight >= 0.f) {
+            const double st[3] = { sum_rgb_[i*3] / sum_w_[i], sum_rgb_[i*3+1] / sum_w_[i], sum_rgb_[i*3+2] / sum_w_[i] };
+            const double ob[3] = { gain[0] * obs.rgb[i*3], gain[1] * obs.rgb[i*3+1], gain[2] * obs.rgb[i*3+2] };
+            d = opponent_l1(st, ob, lum_weight);
+        } else {
+            for (int c = 0; c < 3; ++c)
+                d += std::fabs(sum_rgb_[i*3+c] / sum_w_[i] - gain[c] * obs.rgb[i*3+c]);
+        }
+        diff += wt * d / 3.0;
+        wsum += wt;
+        ++shared;
+    }
+    if (shared_out) *shared_out = shared;
+    if (shared < MIN_SHARED_VERTICES || wsum <= 0.0) return -1.f;
+    return (float)(diff / wsum);
+}
+
+float SkinColorAccumulator::discrepancy_to(const SkinColorAccumulator& o, float gain_range,
+                                           size_t* shared_out) const
+{
+    if (shared_out) *shared_out = 0;
+    if (o.n_vertices_ != n_vertices_ || !n_vertices_) return -1.f;
+    double gain[3] = {1.0, 1.0, 1.0};
+    if (gain_range > 0.f) {   // as in discrepancy(): this ~ g * other
+        double so[3] = {0, 0, 0}, oo[3] = {0, 0, 0};
+        for (size_t i = 0; i < n_vertices_; ++i) {
+            if (sum_w_[i] <= 0.0 || o.sum_w_[i] <= 0.0) continue;
+            const double wt = std::min(sum_w_[i], o.sum_w_[i]);
+            for (int c = 0; c < 3; ++c) {
+                const double a = sum_rgb_[i*3+c] / sum_w_[i], b = o.sum_rgb_[i*3+c] / o.sum_w_[i];
+                so[c] += wt * a * b;
+                oo[c] += wt * b * b;
+            }
+        }
+        const double lo = 1.0 / (1.0 + gain_range), hi = 1.0 + gain_range;
         for (int c = 0; c < 3; ++c)
-            d += std::fabs(sum_rgb_[i*3+c] / sum_w_[i] - gain[c] * obs.rgb[i*3+c]);
+            if (oo[c] > 1e-9) gain[c] = std::min(hi, std::max(lo, so[c] / oo[c]));
+    }
+    double diff = 0.0, wsum = 0.0;
+    size_t shared = 0;
+    for (size_t i = 0; i < n_vertices_; ++i) {
+        if (sum_w_[i] <= 0.0 || o.sum_w_[i] <= 0.0) continue;
+        const double wt = std::min(sum_w_[i], o.sum_w_[i]);
+        double d = 0.0;
+        for (int c = 0; c < 3; ++c)
+            d += std::fabs(sum_rgb_[i*3+c] / sum_w_[i] - gain[c] * o.sum_rgb_[i*3+c] / o.sum_w_[i]);
         diff += wt * d / 3.0;
         wsum += wt;
         ++shared;
@@ -349,7 +404,10 @@ PersonSlots::Params PersonSlots::Params::from_env()
     p.confirm    = (int)env("FSB_SLOT_CONFIRM", (float)p.confirm);
     p.reid_confirm = env("FSB_SLOT_REID_CONFIRM", p.reid_confirm);
     p.margin     = env("FSB_SLOT_MARGIN", p.margin);
+    p.pos3d      = env("FSB_SLOT_POS3D", p.pos3d);
+    p.vmax       = env("FSB_SLOT_VMAX", p.vmax);
     p.motion     = env("FSB_SLOT_MOTION", p.motion ? 1.f : 0.f) != 0.f;
+    p.stale      = (int)env("FSB_SLOT_STALE", (float)p.stale);
     return p;
 }
 
@@ -364,7 +422,8 @@ std::vector<std::pair<int, std::array<float, 4>>> PersonSlots::recent_boxes(long
 
 std::vector<int> PersonSlots::assign(const std::vector<std::array<float, 4>>& boxes,
                                      const std::vector<float>& discrepancy,
-                                     const std::vector<char>& synthetic)
+                                     const std::vector<char>& synthetic,
+                                     const std::vector<std::array<float, 3>>& pos)
 {
     // A missed slot's box is extrapolated for at most this many frames.
     static constexpr long  MAX_EXTRAPOLATE = 10;
@@ -389,21 +448,57 @@ std::vector<int> PersonSlots::assign(const std::vector<std::array<float, 4>>& bo
         }
     }
 
+    // 3D: where each slot's person should be now, and two helpers.
+    const bool have_pos = pos.size() == boxes.size() && (p_.pos3d > 0.f || p_.vmax > 0.f);
+    static constexpr float DEPTH_TOL = 3.f;   // depth counts 1/3 (monocular depth is noisy)
+    auto slot_pos = [&](size_t s, float out[3]) {
+        const float k = p_.motion ? (float)std::min(frame_ - slots_[s].seen, MAX_EXTRAPOLATE) : 0.f;
+        for (int c = 0; c < 3; ++c) out[c] = slots_[s].pos[c] + k * slots_[s].pvel[c];
+    };
+    auto prox = [&](size_t b, size_t s) {     // 3D closeness 0-1 (-1 = unknown)
+        if (!have_pos || p_.pos3d <= 0.f || !slots_[s].has_pos) return -1.f;
+        float q[3]; slot_pos(s, q);
+        const float dx = pos[b][0] - q[0], dy = pos[b][1] - q[1], dz = (pos[b][2] - q[2]) / DEPTH_TOL;
+        return std::exp(-0.5f * (dx*dx + dy*dy + dz*dz) / (p_.pos3d * p_.pos3d));
+    };
+    auto too_fast = [&](size_t b, size_t s) { // vmax veto
+        if (!have_pos || p_.vmax <= 0.f || !slots_[s].has_pos) return false;
+        const float dt = (float)std::max(1L, frame_ - slots_[s].seen) / p_.fps;
+        const float dx = pos[b][0] - slots_[s].pos[0], dy = pos[b][1] - slots_[s].pos[1];
+        const float dz = (pos[b][2] - slots_[s].pos[2]) / DEPTH_TOL;
+        return std::sqrt(dx*dx + dy*dy + dz*dz) > p_.vmax * dt + 1.0f;   // 1 m for noise
+    };
+    // 3D proximity: blended into the score, admits a pair on its own when close, and
+    // rejects one when the two are clearly in different places (two people whose
+    // boxes overlap in the image but stand metres apart in depth).
+    static constexpr float POS_WEIGHT = 0.3f, POS_ADMIT = 0.6f, POS_REJECT = 0.05f;
+
     struct Pair { float score; int box, slot; };
     std::vector<Pair> pairs;
     for (size_t b = 0; b < boxes.size(); ++b)
         for (size_t s = 0; s < S; ++s) {
-            if (!slots_[s].alive) continue;
+            if (!slots_[s].alive || too_fast(b, s)) continue;
             const float iou = fsb::bbox_iou(boxes[b], pred[s]);
             const float app = app_of(b, s);
-            if (app < 0.f) {
-                if (iou >= p_.min_iou) pairs.push_back({iou, (int)b, (int)s});
+            const float px  = prox(b, s);
+            if (px >= 0.f && px < POS_REJECT) continue;
+            const bool  near3d = px >= POS_ADMIT;
+            // stale: a dormant slot is reclaimed at once only on appearance.
+            if (p_.stale > 0 && frame_ - slots_[s].seen > p_.stale &&
+                app < (p_.reid_confirm >= 0.f ? p_.reid_confirm : p_.reid_sim))
                 continue;
+            float score;
+            if (app < 0.f) {
+                if (iou < p_.min_iou && !near3d) continue;
+                score = iou;
+            } else {
+                // Appearance alone re-identifies only when no confirmation is asked
+                // for; otherwise it has to hold over frames (below).
+                if (!(iou >= p_.min_iou || near3d || (p_.confirm <= 0 && app >= p_.reid_sim))) continue;
+                score = (1.f - p_.app_weight) * iou + p_.app_weight * app;
             }
-            // Appearance alone re-identifies only when no confirmation is asked
-            // for; otherwise it has to hold over frames (below).
-            if (iou >= p_.min_iou || (p_.confirm <= 0 && app >= p_.reid_sim))
-                pairs.push_back({(1.f - p_.app_weight) * iou + p_.app_weight * app, (int)b, (int)s});
+            if (px >= 0.f) score = (1.f - POS_WEIGHT) * score + POS_WEIGHT * px;
+            pairs.push_back({score, (int)b, (int)s});
         }
     std::sort(pairs.begin(), pairs.end(),
               [](const Pair& x, const Pair& y) { return x.score > y.score; });
@@ -424,7 +519,7 @@ std::vector<int> PersonSlots::assign(const std::vector<std::array<float, 4>>& bo
             int best = -1; float best_app = -1.f, second = 0.f;
             for (size_t s = 0; s < S; ++s) {
                 if ((int)s == t || taken[s] || !slots_[s].alive || slots_[s].created >= slots_[t].created ||
-                    slots_[s].seen >= slots_[t].created)
+                    slots_[s].seen >= slots_[t].created || too_fast(b, s))
                     continue;
                 const float a = app_of(b, s);
                 if (a > best_app) { second = std::max(second, best_app); best_app = a; best = (int)s; }
@@ -437,6 +532,7 @@ std::vector<int> PersonSlots::assign(const std::vector<std::array<float, 4>>& bo
             else                        { ts.cand = best; ts.cand_frames = 1; }
             if (ts.cand_frames >= p_.confirm) {
                 ts.alive = false;
+                ts.merged_into = best;
                 taken[best] = 1;
                 slot[b] = best;
             }
@@ -447,6 +543,7 @@ std::vector<int> PersonSlots::assign(const std::vector<std::array<float, 4>>& bo
             Slot ns;
             ns.box = boxes[b];
             ns.seen = ns.created = ns.real_seen = frame_;
+            if (have_pos) { ns.has_pos = true; for (int c = 0; c < 3; ++c) ns.pos[c] = pos[b][c]; }
             slot[b] = (int)slots_.size();
             slots_.push_back(ns);
             continue;
@@ -459,11 +556,97 @@ std::vector<int> PersonSlots::assign(const std::vector<std::array<float, 4>>& bo
             s.vx = age > MAX_EXTRAPOLATE ? 0.f : 0.5f * s.vx + 0.5f * vx;
             s.vy = age > MAX_EXTRAPOLATE ? 0.f : 0.5f * s.vy + 0.5f * vy;
         }
+        if (have_pos) {
+            if (!s.has_pos) { for (int c = 0; c < 3; ++c) s.pos[c] = pos[b][c]; s.has_pos = true; }
+            else {
+                const long  age = std::max(1L, frame_ - s.seen);
+                // lateral follows closely; depth is smoothed harder (monocular noise)
+                const float a[3] = {0.7f, 0.7f, 0.3f};
+                for (int c = 0; c < 3; ++c) {
+                    const float np = (1.f - a[c]) * s.pos[c] + a[c] * pos[b][c];
+                    if (p_.motion && age <= MAX_EXTRAPOLATE)
+                        s.pvel[c] = 0.5f * s.pvel[c] + 0.5f * (np - s.pos[c]) / age;
+                    s.pos[c] = np;
+                }
+            }
+        }
         s.box  = boxes[b];
         s.seen = frame_;
         if (b >= synthetic.size() || !synthetic[b]) s.real_seen = frame_;
     }
     return slot;
+}
+
+std::vector<int> merge_tracklets(const std::vector<SkinColorAccumulator>& acc,
+                                 const std::vector<std::pair<int, int>>& frame_slot,
+                                 float max_disc, float gain_range)
+{
+    int S = (int)acc.size();
+    for (const auto& fs : frame_slot) S = std::max(S, fs.second + 1);
+    // first appearance and co-visibility (slots seen in the same frame)
+    std::vector<int> first(S, INT32_MAX);
+    std::vector<std::vector<char>> cannot(S, std::vector<char>(S, 0));
+    {
+        std::vector<std::pair<int, int>> fsl = frame_slot;
+        std::sort(fsl.begin(), fsl.end());
+        for (size_t a = 0; a < fsl.size(); ) {
+            size_t b = a;
+            while (b < fsl.size() && fsl[b].first == fsl[a].first) ++b;
+            for (size_t i = a; i < b; ++i) {
+                first[fsl[i].second] = std::min(first[fsl[i].second], fsl[i].first);
+                for (size_t j = i + 1; j < b; ++j)
+                    cannot[fsl[i].second][fsl[j].second] = cannot[fsl[j].second][fsl[i].second] = 1;
+            }
+            a = b;
+        }
+    }
+    // pairwise discrepancy between tracklets (-1 = unknown)
+    std::vector<std::vector<float>> D(S, std::vector<float>(S, -1.f));
+    for (int s = 0; s < S; ++s)
+        for (int t = s + 1; t < S; ++t) {
+            if (cannot[s][t] || s >= (int)acc.size() || t >= (int)acc.size() ||
+                !acc[s].initialized() || !acc[t].initialized())
+                continue;
+            D[s][t] = D[t][s] = acc[s].discrepancy_to(acc[t], gain_range);
+        }
+    // average-linkage agglomeration with cannot-link
+    std::vector<std::vector<int>> cl;
+    for (int s = 0; s < S; ++s) cl.push_back({s});
+    while (true) {
+        int ba = -1, bb = -1;
+        float best = max_disc;
+        for (size_t a = 0; a < cl.size(); ++a)
+            for (size_t b = a + 1; b < cl.size(); ++b) {
+                double sum = 0.0;
+                int n = 0;
+                bool blocked = false;
+                for (int s : cl[a]) {
+                    for (int t : cl[b]) {
+                        if (cannot[s][t]) { blocked = true; break; }
+                        if (D[s][t] >= 0.f) { sum += D[s][t]; ++n; }
+                    }
+                    if (blocked) break;
+                }
+                if (blocked || n == 0) continue;
+                const float avg = (float)(sum / n);
+                if (avg <= best) { best = avg; ba = (int)a; bb = (int)b; }
+            }
+        if (ba < 0) break;
+        cl[ba].insert(cl[ba].end(), cl[bb].begin(), cl[bb].end());
+        cl.erase(cl.begin() + bb);
+    }
+    // number the people by first appearance
+    std::vector<std::pair<int, int>> order;   // (first frame, cluster)
+    for (size_t c = 0; c < cl.size(); ++c) {
+        int f = INT32_MAX;
+        for (int s : cl[c]) f = std::min(f, first[s]);
+        order.push_back({f, (int)c});
+    }
+    std::sort(order.begin(), order.end());
+    std::vector<int> id(S, -1);
+    for (size_t k = 0; k < order.size(); ++k)
+        for (int s : cl[order[k].second]) id[s] = (int)k;
+    return id;
 }
 
 } // namespace fsb

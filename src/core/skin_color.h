@@ -119,8 +119,18 @@ public:
     // gain_range > 0 first fits a per-channel illumination gain (clamped to
     // [1/(1+r), 1+r]) between the observation and the stored colours.
     // shared_out, if given, receives the number of vertices compared.
+    // lum_weight >= 0 measures the difference in an orthonormal opponent space
+    // (two chroma axes + luminance), with the luminance axis weighted by it
+    // (1 ~ RGB, smaller = less sensitive to brightness); < 0 = plain RGB.
     float discrepancy(const SkinObservation& obs, const float* vertex_weight = nullptr,
-                      float gain_range = 0.f, size_t* shared_out = nullptr) const;
+                      float gain_range = 0.f, size_t* shared_out = nullptr,
+                      float lum_weight = -1.f) const;
+
+    // Discrepancy between two people's accumulated colours (offline merging of
+    // tracklets): the same measure as discrepancy(), over vertices both have
+    // observed, each weighted by the smaller of the two accumulated weights.
+    float discrepancy_to(const SkinColorAccumulator& other, float gain_range = 0.f,
+                         size_t* shared_out = nullptr) const;
 
     // RGB in [0,1] per vertex [n_vertices x 3], unobserved vertices filled.
     // Valid until the next call.
@@ -134,6 +144,10 @@ public:
     float coverage() const;
 
     bool initialized() const { return n_vertices_ > 0; }
+
+    // Raw weighted sums (--dump-slots: offline merging without re-running inference).
+    const std::vector<double>& sum_rgb() const { return sum_rgb_; }   // [n_vertices x 3]
+    const std::vector<double>& sum_w()   const { return sum_w_; }     // [n_vertices]
 
 private:
     size_t                    n_vertices_ = 0;
@@ -167,6 +181,10 @@ private:
 // `margin`; a slot seen at any time since the tentative one appeared is never
 // a candidate (two people visible at once are two people).  With `motion`, a
 // slot's box is extrapolated with its recent velocity while its person is missed.
+// With pos3d, closeness in 3D (depth weighted down: monocular depth is noisy)
+// joins box overlap and appearance, and a pair clearly apart in 3D is rejected
+// however much the boxes overlap; with vmax, a pair is impossible if the
+// person would have had to move faster than vmax since the slot was last seen.
 class PersonSlots {
 public:
     struct Params {
@@ -178,8 +196,14 @@ public:
         float reid_confirm = -1.f; // similarity a confirmed re-entry needs (< 0: reid_sim)
         float margin     = 0.f;    // ... and by how much it must beat the next absent slot
         bool  motion     = false;  // extrapolate missed slots' boxes with their velocity
+        float pos3d      = 0.f;    // > 0: 3D proximity term, lateral tolerance (m); depth x3
+        float vmax       = 0.f;    // > 0: veto matches needing a speed above this (m/s)
+        float fps        = 30.f;   // frame rate, for vmax
+        int   stale      = 0;      // > 0: a slot missed this many frames is not reclaimed on box
+                                   // overlap / 3D proximity alone; it needs appearance (rc) or the
+                                   // confirmed re-entry (a newcomer at a dormant spot: split, not swap)
         // Defaults, overridden by FSB_SLOT_{MIN_IOU,APP_SCALE,REID_SIM,APP_WEIGHT,
-        // CONFIRM,REID_CONFIRM,MARGIN,MOTION} (parameter sweeps, tools/reid_eval).
+        // CONFIRM,REID_CONFIRM,MARGIN,MOTION,POS3D,VMAX,STALE} (parameter sweeps, tools/reid_eval).
         static Params from_env();
     };
 
@@ -191,16 +215,25 @@ public:
     // synthetic  : optional, per box: true for boxes the caller made up (split
     //              from a merged detection); they move a slot but do not count
     //              as a real sighting (recent_boxes).
+    // pos        : optional, per box: the person's 3D position in camera space
+    //              (metres, MHRResult::pred_cam_t), for pos3d / vmax.
     // Returns the slot of each box.
     std::vector<int> assign(const std::vector<std::array<float, 4>>& boxes,
                             const std::vector<float>& discrepancy = {},
-                            const std::vector<char>& synthetic = {});
+                            const std::vector<char>& synthetic = {},
+                            const std::vector<std::array<float, 3>>& pos = {});
+    void set_fps(float fps) { if (fps > 0.f) p_.fps = fps; }
     size_t size() const { return slots_.size(); }
 
     // Last box of every alive slot really detected within the last max_age
     // assign() calls (the caller's next frame), with its slot index.
     std::vector<std::pair<int, std::array<float, 4>>> recent_boxes(long max_age) const;
     const Params& params() const { return p_; }
+    // The slot a confirmed re-entry merged each slot into (-1 = none, still its own person).
+    // Rows written for a tentative slot before confirmation can be relabelled with
+    // root_of() (output delayed by at most the confirmation window).
+    int merged_into(size_t s) const { return s < slots_.size() ? slots_[s].merged_into : -1; }
+    int root_of(int s) const { while (s >= 0 && merged_into(s) >= 0) s = merged_into(s); return s; }
 
 private:
     struct Slot {
@@ -208,12 +241,27 @@ private:
         float vx = 0.f, vy = 0.f;          // box centre velocity, px per frame
         long  seen = 0, created = 0;       // frame numbers
         long  real_seen = 0;               // last frame matched to a real (not synthetic) box
+        bool  has_pos = false;             // 3D position (pos3d / vmax)
+        float pos[3] = {0, 0, 0};          // smoothed camera-space position, m
+        float pvel[3] = {0, 0, 0};         // its velocity, m per frame (with motion)
         bool  alive = true;                // false once merged into an older slot
+        int   merged_into = -1;            // ... that slot
         int   cand = -1, cand_frames = 0;  // re-entry candidate (older slot) and its streak
     };
     Params            p_;
     std::vector<Slot> slots_;
     long              frame_ = 0;
 };
+
+// Offline, revisable association: group person slots (tracklets) into people
+// once the whole sequence is known.  frame_slot lists every (frame, slot)
+// occurrence.  Slots ever present in the same frame are never merged
+// (cannot-link).  The rest are merged by average linkage over their pairwise
+// accumulated-colour discrepancy (discrepancy_to, with gain_range), most similar
+// first, while the best eligible pair is <= max_disc.  Returns a new id per slot
+// (0-based, numbered by first appearance).
+std::vector<int> merge_tracklets(const std::vector<SkinColorAccumulator>& acc,
+                                 const std::vector<std::pair<int, int>>& frame_slot,
+                                 float max_disc, float gain_range = 0.f);
 
 } // namespace fsb

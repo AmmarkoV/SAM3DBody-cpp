@@ -3703,9 +3703,10 @@ struct Pipeline::Impl
         ctx.mi  = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
 
         set_camera_intrinsics(ctx);
-        if (!detect_people(ctx))
+        const bool detected = detect_people(ctx);
+        if (!detected && !det_filter)
             return {};                       // nobody in frame; nothing to regress
-        if (det_filter)
+        if (det_filter)                      // also on empty frames: it may add boxes
         {
             std::vector<std::array<float, 5>> boxes;
             for (const auto& d : ctx.dets) boxes.push_back({d.x1, d.y1, d.x2, d.y2, d.conf});
@@ -3720,8 +3721,8 @@ struct Pipeline::Impl
                 out.push_back(nd);
             }
             ctx.dets = std::move(out);
-            if (ctx.dets.empty()) return {};
         }
+        if (ctx.dets.empty()) return {};
 
         // --focus: drop the people who have not moved out of this frame's batch
         // and keep the answer we already have for them (see FocusTracker in focus.h).

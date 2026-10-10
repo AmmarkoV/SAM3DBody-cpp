@@ -61,6 +61,9 @@
 //   the body, rising to 1 after about one frontal view; the overlay blends by
 //   it and the PNG keeps it.  --skin-texture-unseen A gives never-seen texels
 //   alpha A instead (e.g. 0.3: semi-transparent).
+// --det-file PATH replaces the detector's boxes with per-frame boxes from a MOT-format
+//   file (frame,id,x,y,w,h,conf,...; 1-based frames, id ignored): "public detections",
+//   e.g. from a detector suited to small people (tools/reid_eval/json_dets_to_mot.py).
 // --split-merged (implies --skin-color): when the detector returns one box over
 //   two or more people the slots saw separately within the last 30 frames
 //   (each of their boxes >= 80% inside it, it >= 1.3x their size, and no other
@@ -74,15 +77,31 @@
 //   focus reason (MHRResult::focus_reason), float focus cue, bbox[4], cam_t[3],
 //   focal, joints[n*3] (LBS space, metres).
 //   tools/reid_eval/focus_eval.py compares a --focus run with a full one.
+// --track-merged PATH [--merge-thr D] also writes the main slots after an offline,
+//   revisable association pass (merge_tracklets, skin_color.h): at exit, slots
+//   (tracklets) that were never visible in the same frame are merged by
+//   average-linkage over their accumulated-colour discrepancy (gain-compensated,
+//   +-33%) while it stays <= D (default 0.10).  Same format as --track-out.
+// --dump-slots PATH writes, at exit, the main slots' accumulated colour sums (binary
+//   "FSBSLOT1": int32 n_slots, n_vertices; per slot int32 initialised, float32
+//   sum_rgb[n*3], sum_w[n]) so tools/reid_eval/merge_offline.py can re-run the
+//   offline merge with any threshold without re-running inference.
 // --track-shadow SPEC PATH (repeatable) runs one more, independent set of person
 //   slots in the same pass and writes it to PATH like --track-out: compares
 //   association variants on one inference run.  SPEC is a --skin-match mode
 //   optionally followed by comma-separated overrides of the PersonSlots
 //   parameters (skin_color.h) and the head weight, e.g.
 //   "gpu,confirm=3,motion=1,face=3" (keys: iou, scale, reid, weight, confirm,
-//   rc = re-entry similarity once confirmed, margin, motion, face; cpu only:
-//   gain = illumination gain range, evid = shared vertices for full trust).  The main slots take the same settings from FSB_SLOT_* and
-//   FSB_SKIN_FACE_WEIGHT.
+//   rc = re-entry similarity once confirmed, margin, motion, pos3d = 3D proximity
+//   tolerance in m, vmax = speed limit in m/s (both from MHRResult::pred_cam_t), stale = frames
+//   after which a missed slot needs appearance to be reclaimed, retro = relabel the rows a
+//   tentative slot wrote before its confirmed re-entry (output lag <= 30 frames), face, merge = D:
+//   write this shadow's ids after the offline merge (as --track-merged); cpu only:
+//   gain = illumination gain range, evid = shared vertices for full trust,
+//   lum = luminance weight in an opponent colour space, 1 ~ RGB).  The main slots take the same settings from FSB_SLOT_* and
+//   FSB_SKIN_FACE_WEIGHT.  Shadows START from those FSB_SLOT_* / FSB_SKIN_FACE_WEIGHT values and SPEC
+//   overrides them (gain, evid, lum, merge, retro do not inherit): with FSB_SLOT_MOTION=1 in the
+//   environment, "none" means none,motion=1.
 // FSB_SKIN_FACE_WEIGHT=W (main slots) / face=W (shadows): the head's vertices
 //   (above the neck in the rest pose: face and hair) count W times as much in
 //   the appearance discrepancy; 1 = uniform.
@@ -855,6 +874,7 @@ int main(int argc, const char** argv) {
     bool   skin_color = false; // --skin-color: colour the mesh from the video (skin_color.h)
     int    skin_texture_size = 0; // --skin-texture [SIZE]: UV-texture appearance, 0 = off
     bool   split_merged = false;      // --split-merged: split detections covering several slots
+    std::string det_file;             // --det-file: per-frame external boxes (MOT format)
     float  skin_texture_unseen = 0.f; // --skin-texture-unseen A: alpha of never-seen texels
     std::string skin_color_save; // --skin-color-save: rest-pose coloured OBJ per person at exit
     bool   skin_default_set = false; // --skin-color-default R G B (0-255): colour of unseen vertices
@@ -865,6 +885,9 @@ int main(int argc, const char** argv) {
     float  skin_hair_cap_deg = 0.f;  // --skin-hair-cap CM DEG: tilt, lower at the back
     std::string skin_match = "gpu"; // --skin-match gpu|cpu|none: appearance check between frames
     std::string track_out;          // --track-out: per-frame person slots, MOT format
+    std::string track_merged;       // --track-merged: main slots after the offline merge
+    float       merge_thr = 0.10f;  // --merge-thr: discrepancy limit of the offline merge
+    std::string dump_slots;         // --dump-slots: main slots' colour sums at exit
     std::string pose_out;           // --pose-out: per-frame skeletons, binary
     std::vector<std::pair<std::string, std::string>> track_shadow;  // --track-shadow MODE PATH
     std::string skin_turntable_prefix; // --skin-turntable: rotating coloured-mesh frames
@@ -892,10 +915,14 @@ int main(int argc, const char** argv) {
         A1("--skin-color-save", skin_color_save,  std::string)
         A1("--skin-match",  skin_match,         std::string)
         A1("--track-out",   track_out,          std::string)
+        A1("--track-merged", track_merged,      std::string)
+        A1("--merge-thr",   merge_thr,          std::stof)
+        A1("--dump-slots",  dump_slots,         std::string)
         A1("--pose-out",    pose_out,           std::string)
         A1("--skin-turntable", skin_turntable_prefix, std::string)
 #undef A1
         if (!strcmp(argv[i], "--split-merged")) { split_merged = true; continue; }
+        if (!strcmp(argv[i], "--det-file") && i+1 < argc) { det_file = argv[++i]; continue; }
         if (!strcmp(argv[i], "--skin-texture")) {
             skin_texture_size = 1024;
             if (i+1 < argc && isdigit((unsigned char)argv[i+1][0])) skin_texture_size = std::stoi(argv[++i]);
@@ -1207,7 +1234,9 @@ int main(int argc, const char** argv) {
     // colour stream on attribute 2 of the mesh VAO (default.vert aColor).
     if (!skin_color_save.empty() || !skin_turntable_prefix.empty() || skin_default_set ||
         skin_default_arms || skin_hair_cap_cm > 0.f || skin_mirror || !track_out.empty() ||
-        !track_shadow.empty() || skin_texture_size > 0 || split_merged) skin_color = true;
+        !track_shadow.empty() || skin_texture_size > 0 || split_merged || !track_merged.empty() ||
+        !dump_slots.empty())
+        skin_color = true;
     if (skin_match == "gpu_tex" && skin_texture_size == 0) skin_texture_size = 1024;
     FILE* track_fp = nullptr;
     if (!track_out.empty() && !(track_fp = fopen(track_out.c_str(), "w"))) {
@@ -1222,6 +1251,14 @@ int main(int argc, const char** argv) {
         }
         fwrite("FSBPOSE2", 1, 8, pose_fp);
     }
+    struct TrackRow { int frame, slot; float x, y, w, h, score; };
+    std::vector<TrackRow> main_rows;   // --track-merged: the main slots' rows, kept for the end
+    auto write_rows = [](FILE* f, const std::vector<TrackRow>& rows, const std::vector<int>* remap) {
+        for (const TrackRow& r : rows)
+            fprintf(f, "%d,%d,%.2f,%.2f,%.2f,%.2f,%.4f,-1,-1,-1\n", r.frame,
+                    (remap && r.slot < (int)remap->size() ? (*remap)[r.slot] : r.slot) + 1,
+                    r.x, r.y, r.w, r.h, r.score);
+    };
     struct ShadowTracker {
         std::string                            mode;
         FILE*                                  fp = nullptr;
@@ -1230,6 +1267,10 @@ int main(int argc, const char** argv) {
         float                                  face_weight = 1.f;
         float                                  gain = 0.f;      // illumination gain range (cpu)
         float                                  evidence = 0.f;  // shared vertices for full trust (cpu)
+        float                                  lum = -1.f;      // opponent-space luminance weight (cpu), <0 = RGB
+        float                                  merge = 0.f;     // >0: write ids after the offline merge
+        bool                                   retro = false;   // relabel tentative slots' rows at exit
+        std::vector<TrackRow>                  rows;            // buffered when merge > 0 or retro
         std::unique_ptr<fsb::SkinTextureGL>    tex;   // mode gpu_tex: this tracker's own textures
     };
     const float main_face_weight = getenv("FSB_SKIN_FACE_WEIGHT")
@@ -1263,6 +1304,12 @@ int main(int argc, const char** argv) {
             else if (key == "face")    shadows[k].face_weight = val;
             else if (key == "gain")    shadows[k].gain = val;
             else if (key == "evid")    shadows[k].evidence = val;
+            else if (key == "lum")     shadows[k].lum = val;
+            else if (key == "merge")   shadows[k].merge = val;
+            else if (key == "pos3d")   sp.pos3d      = val;
+            else if (key == "vmax")    sp.vmax       = val;
+            else if (key == "stale")   sp.stale      = (int)val;
+            else if (key == "retro")   shadows[k].retro = val != 0.f;
             else { fprintf(stderr, "--track-shadow: unknown key '%s'\n", key.c_str()); return 1; }
             comma = next;
         }
@@ -1614,6 +1661,29 @@ int main(int argc, const char** argv) {
     // .obj name reflects the absolute video frame when seeking with --start (the
     // BVH keeps its own 0-based session timeline).  --frames counts from here.
     int       frame_index  = start_frame;
+    // --det-file: per-frame public detections replace the detector's boxes.
+    std::map<int, std::vector<std::array<float, 5>>> det_file_boxes;
+    if (!det_file.empty()) {
+        FILE* df = fopen(det_file.c_str(), "r");
+        if (!df) { fprintf(stderr, "Cannot open --det-file: %s\n", det_file.c_str()); return 1; }
+        char line[512];
+        size_t n = 0;
+        while (fgets(line, sizeof(line), df)) {
+            int fr, id; float x, y, w, h, c = 1.f;
+            if (sscanf(line, "%d,%d,%f,%f,%f,%f,%f", &fr, &id, &x, &y, &w, &h, &c) >= 6) {
+                det_file_boxes[fr].push_back({x, y, x + w, y + h, c});
+                ++n;
+            }
+        }
+        fclose(df);
+        if (split_merged) fprintf(stderr, "[det-file] --split-merged is ignored with --det-file\n");
+        pipeline.set_detection_filter([&](std::vector<std::array<float, 5>>& boxes) {
+            auto it = det_file_boxes.find(frame_index + 1);
+            if (it == det_file_boxes.end()) boxes.clear(); else boxes = it->second;
+            split_flags.assign(boxes.size(), 0);
+        });
+        printf("[det-file] %zu boxes over %zu frames from %s\n", n, det_file_boxes.size(), det_file.c_str());
+    }
     const int frame_stop   = (max_frames > 0) ? start_frame + max_frames : -1;
 
     cv::Mat frame;
@@ -1874,7 +1944,7 @@ int main(int argc, const char** argv) {
             // Appearance discrepancy of every detection vs every stored person.
             auto score_slots = [&](const std::string& mode, std::vector<fsb::SkinColorAccumulator>& accs,
                                    float face_weight, fsb::SkinTextureGL* tex,
-                                   float gain = 0.f, float evidence = 0.f) {
+                                   float gain = 0.f, float evidence = 0.f, float lum = -1.f) {
                 const size_t S = accs.size();
                 std::vector<float> disc;
                 if (D == 0 || S == 0 || mode == "none") return disc;
@@ -1912,7 +1982,7 @@ int main(int argc, const char** argv) {
                     for (size_t d = 0; d < D; ++d)
                         for (size_t s = 0; s < S; ++s) {
                             size_t shared = 0;
-                            float dd = accs[s].discrepancy(skin_obs[d], vw, gain, &shared);
+                            float dd = accs[s].discrepancy(skin_obs[d], vw, gain, &shared, lum);
                             if (dd >= 0.f && evidence > 0.f) {
                                 const float a = std::max(0.f, 1.f - dd / scale);
                                 const float k = std::min(1.f, (float)shared / evidence);
@@ -1932,13 +2002,22 @@ int main(int argc, const char** argv) {
                     fprintf(stderr, " d%zu/s%zu=%.3f", k / S, k % S, discrepancy[k]);
             }
             if (split_flags.size() != D) split_flags.assign(D, 0);   // no filter ran this frame
-            skin_slot_of = skin_slots.assign(boxes, discrepancy, split_flags);
+            std::vector<std::array<float, 3>> pos3(D);   // camera-space positions (pos3d / vmax)
+            for (size_t d = 0; d < D; ++d)
+                pos3[d] = {results[d].pred_cam_t[0], results[d].pred_cam_t[1], results[d].pred_cam_t[2]};
+            skin_slots.set_fps(video_fps);
+            skin_slot_of = skin_slots.assign(boxes, discrepancy, split_flags, pos3);
             if (track_fp)
                 for (size_t d = 0; d < D; ++d)
                     fprintf(track_fp, "%d,%d,%.2f,%.2f,%.2f,%.2f,%.4f,-1,-1,-1\n",
                             frame_index + 1, skin_slot_of[d] + 1, boxes[d][0], boxes[d][1],
                             boxes[d][2] - boxes[d][0], boxes[d][3] - boxes[d][1],
                             results[d].det_score);
+            if (!track_merged.empty())
+                for (size_t d = 0; d < D; ++d)
+                    main_rows.push_back({frame_index + 1, skin_slot_of[d], boxes[d][0], boxes[d][1],
+                                         boxes[d][2] - boxes[d][0], boxes[d][3] - boxes[d][1],
+                                         results[d].det_score});
 
             // --skin-texture: fold every detection's view into its slot's texture.
             if (skin_texture.ready() && bg_ok && bg.ready)
@@ -1950,8 +2029,9 @@ int main(int argc, const char** argv) {
             // --track-shadow: the same detections through independent slots.
             for (ShadowTracker& sh : shadows) {
                 std::vector<float> disc = score_slots(sh.mode, sh.acc, sh.face_weight, sh.tex.get(),
-                                                      sh.gain, sh.evidence);
-                std::vector<int> slot = sh.slots.assign(boxes, disc, split_flags);
+                                                      sh.gain, sh.evidence, sh.lum);
+                sh.slots.set_fps(video_fps);
+                std::vector<int> slot = sh.slots.assign(boxes, disc, split_flags, pos3);
                 if (sh.tex && bg_ok && bg.ready)
                     for (size_t d = 0; d < D; ++d)
                         sh.tex->accumulate(slot[d], bg.id, frame_w, frame_h, skin_verts[d].data(),
@@ -1962,10 +2042,11 @@ int main(int argc, const char** argv) {
                     if (!acc.initialized())
                         acc.init(tri_model->indices, tri_model->header.numberOfIndices, MHR_VERTEX_COUNT);
                     acc.add(skin_obs[d]);
-                    fprintf(sh.fp, "%d,%d,%.2f,%.2f,%.2f,%.2f,%.4f,-1,-1,-1\n",
-                            frame_index + 1, slot[d] + 1, boxes[d][0], boxes[d][1],
-                            boxes[d][2] - boxes[d][0], boxes[d][3] - boxes[d][1],
-                            results[d].det_score);
+                    const TrackRow row{frame_index + 1, slot[d], boxes[d][0], boxes[d][1],
+                                       boxes[d][2] - boxes[d][0], boxes[d][3] - boxes[d][1],
+                                       results[d].det_score};
+                    if (sh.merge > 0.f || sh.retro) sh.rows.push_back(row);
+                    else                write_rows(sh.fp, {row}, nullptr);
                 }
             }
         }
@@ -2551,6 +2632,52 @@ int main(int argc, const char** argv) {
     // ── Cleanup ───────────────────────────────────────────────────────────────
     if (bvh_writer.is_open()) bvh_writer.close();
     if (track_fp) fclose(track_fp);
+    // --track-merged / merge=: the offline, revisable association over whole sequences.
+    auto merged_ids = [](const std::vector<fsb::SkinColorAccumulator>& acc,
+                         const std::vector<TrackRow>& rows, float thr) {
+        std::vector<std::pair<int, int>> fs;
+        fs.reserve(rows.size());
+        for (const TrackRow& r : rows) fs.push_back({r.frame, r.slot});
+        return fsb::merge_tracklets(acc, fs, thr, 0.33f);
+    };
+    if (!track_merged.empty()) {
+        if (FILE* f = fopen(track_merged.c_str(), "w")) {
+            const std::vector<int> id = merged_ids(skin_acc, main_rows, merge_thr);
+            write_rows(f, main_rows, &id);
+            fclose(f);
+            int people = 0;
+            for (int v : id) people = std::max(people, v + 1);
+            printf("[skin-color] --track-merged: %zu slots -> %d people (%s)\n", skin_acc.size(), people,
+                   track_merged.c_str());
+        } else fprintf(stderr, "Cannot open --track-merged file: %s\n", track_merged.c_str());
+    }
+    if (!dump_slots.empty()) {
+        if (FILE* f = fopen(dump_slots.c_str(), "wb")) {
+            fwrite("FSBSLOT1", 1, 8, f);
+            const int32_t ns = (int32_t)skin_acc.size(), nv = (int32_t)MHR_VERTEX_COUNT;
+            fwrite(&ns, 4, 1, f);
+            fwrite(&nv, 4, 1, f);
+            std::vector<float> buf((size_t)nv * 3);
+            for (const fsb::SkinColorAccumulator& a : skin_acc) {
+                const int32_t init = a.initialized() ? 1 : 0;
+                fwrite(&init, 4, 1, f);
+                for (size_t k = 0; k < buf.size(); ++k) buf[k] = init ? (float)a.sum_rgb()[k] : 0.f;
+                fwrite(buf.data(), 4, buf.size(), f);
+                for (int32_t k = 0; k < nv; ++k) buf[k] = init ? (float)a.sum_w()[k] : 0.f;
+                fwrite(buf.data(), 4, (size_t)nv, f);
+            }
+            fclose(f);
+        } else fprintf(stderr, "Cannot open --dump-slots file: %s\n", dump_slots.c_str());
+    }
+    for (ShadowTracker& sh : shadows) {
+        if (sh.retro)   // tentative slots' rows -> the slot their confirmed re-entry merged into
+            for (TrackRow& r : sh.rows) r.slot = sh.slots.root_of(r.slot);
+        if (sh.merge > 0.f) {
+            const std::vector<int> id = merged_ids(sh.acc, sh.rows, sh.merge);
+            write_rows(sh.fp, sh.rows, &id);
+        } else if (sh.retro)
+            write_rows(sh.fp, sh.rows, nullptr);
+    }
     if (pose_fp) fclose(pose_fp);
     for (ShadowTracker& sh : shadows) fclose(sh.fp);
     if (arf_writer.is_open()) {
