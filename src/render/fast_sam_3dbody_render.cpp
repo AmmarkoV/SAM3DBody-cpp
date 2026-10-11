@@ -93,7 +93,8 @@
 //   parameters (skin_color.h) and the head weight, e.g.
 //   "gpu,confirm=3,motion=1,face=3" (keys: iou, scale, reid, weight, confirm,
 //   rc = re-entry similarity once confirmed, margin, motion, pos3d = 3D proximity
-//   tolerance in m, vmax = speed limit in m/s (both from MHRResult::pred_cam_t), stale = frames
+//   tolerance in m, vmax = speed limit in m/s (both from MHRResult::pred_cam_t), zref = depth (m)
+//   beyond which both tolerances scale with depth, stale = frames
 //   after which a missed slot needs appearance to be reclaimed, retro = relabel the rows a
 //   tentative slot wrote before its confirmed re-entry (output lag <= 30 frames), face, merge = D:
 //   write this shadow's ids after the offline merge (as --track-merged); cpu only:
@@ -1044,6 +1045,7 @@ int main(int argc, const char** argv) {
         cfg.use_fp16        = fp16;
         cfg.ort_verbose     = cc.ort_verbose;      // --ort-verbose
         cfg.max_persons     = max_persons;
+        cfg.max_batch       = cc.max_batch;        // --max-batch N
         cfg.focus           = cc.focus;            // --focus [SENSITIVITY]
         cfg.focus_sensitivity = cc.focus_sensitivity;
         cfg.pipeline_depth  = pipeline_depth;      // --pipeline N
@@ -1308,6 +1310,7 @@ int main(int argc, const char** argv) {
             else if (key == "merge")   shadows[k].merge = val;
             else if (key == "pos3d")   sp.pos3d      = val;
             else if (key == "vmax")    sp.vmax       = val;
+            else if (key == "zref")    sp.zref       = val;
             else if (key == "stale")   sp.stale      = (int)val;
             else if (key == "retro")   shadows[k].retro = val != 0.f;
             else { fprintf(stderr, "--track-shadow: unknown key '%s'\n", key.c_str()); return 1; }

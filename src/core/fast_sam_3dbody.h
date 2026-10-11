@@ -142,6 +142,7 @@ struct PipelineConfig {
     float person_nms_iou = 0.45f;  // YOLO NMS IoU threshold
     bool  pose_nms       = false;  // --pose-nms: keypoint-aware NMS (keeps overlapping people)
     int  max_persons     = 0;      // 0 = unlimited; >0 = cap after NMS (top-N by conf)
+    int  max_batch       = 0;      // 0 = every person in one batch; >0 = regress in groups of N
 
     // --focus: spend inference only on the people who are actually moving, and
     // retain the previous solution for the ones who are not.  See focus.h

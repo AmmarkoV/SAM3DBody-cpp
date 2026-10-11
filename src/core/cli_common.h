@@ -96,6 +96,7 @@ struct CommonConfig
     float       person_nms_iou  = 0.45f;
     bool        pose_nms        = false;  // --pose-nms
     int         max_persons     = 0;      // --max-persons N: 0 = unlimited; >0 = top-N by conf
+    int         max_batch       = 0;      // --max-batch N: 0 = one batch; >0 = groups of N people
     bool        focus           = false;  // --focus: regress only the people who moved (F.ECT)
     float       focus_sensitivity = 2.0f; // --focus [F]: mean |dI| over the box that triggers a regress
     // --detector: bbox provider. "auto" (default) prefers a LibreYOLO model when
@@ -210,6 +211,7 @@ inline bool parse_common_arg(int argc, const char* const* argv, int& i,
     CLI_FLT ("--nms",                  person_nms_iou)
     if (std::strcmp(argv[i], "--pose-nms") == 0) { c.pose_nms = true; return true; }
     CLI_INT ("--max-persons",          max_persons)
+    CLI_INT ("--max-batch",            max_batch)
     if (std::strcmp(argv[i], "--focus") == 0)
     {
         c.focus = true;
@@ -717,6 +719,7 @@ inline void apply_common_to_pipeline_cfg(const CommonConfig& c,
     pc.person_nms_iou = c.person_nms_iou;
     pc.pose_nms       = c.pose_nms;
     pc.max_persons    = c.max_persons;
+    pc.max_batch      = c.max_batch;
     pc.focus          = c.focus;
     pc.focus_sensitivity = c.focus_sensitivity;
     pc.detector       = detector_kind_from_string(c.detector);
@@ -771,6 +774,8 @@ inline void print_common_args_help(FILE* fp)
         "  --pose-nms                     Keypoint-aware NMS: overlapping boxes with different\n"
         "                                 skeletons (OKS < 0.5) are both kept (close couples, crowds)\n"
         "  --max-persons N                Cap processing to the top-N most-confident people (0 = unlimited)\n"
+        "  --max-batch N                  Regress at most N people per network call; a crowded frame\n"
+        "                                 runs in several calls (bounded memory, time linear in people)\n"
         "  --focus [SENSITIVITY]          Spend inference only on the people who are moving; people who\n"
         "                                 are static keep their previous solution instead of being\n"
         "                                 regressed again, so a scene where most people hold still costs\n"

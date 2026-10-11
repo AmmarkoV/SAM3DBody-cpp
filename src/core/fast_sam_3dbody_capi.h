@@ -118,6 +118,20 @@ int fsb_process_bgr(FsbHandle        h,
                     FsbResult*       results,
                     int              max_results);
 
+// Process a BGR image with caller-supplied person boxes (x1, y1, x2, y2 per box, original image pixels) on top
+// of the detector's: a caller box is regressed too unless a detector box overlaps it with IoU >= iou_skip
+// (iou_skip > 1: every caller box; iou_skip < 0: the caller's boxes only, no detector boxes). Results of caller
+// boxes have has_yolo_kps = 0 and bbox = the box as given. Same return value as fsb_process_bgr().
+int fsb_process_bgr_boxes(FsbHandle        h,
+                          const uint8_t*   bgr,
+                          int              width,
+                          int              height,
+                          const float*     boxes,
+                          int              n_boxes,
+                          float            iou_skip,
+                          FsbResult*       results,
+                          int              max_results);
+
 #ifdef __cplusplus
 }
 #endif

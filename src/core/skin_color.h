@@ -198,6 +198,7 @@ public:
         bool  motion     = false;  // extrapolate missed slots' boxes with their velocity
         float pos3d      = 0.f;    // > 0: 3D proximity term, lateral tolerance (m); depth x3
         float vmax       = 0.f;    // > 0: veto matches needing a speed above this (m/s)
+        float zref       = 0.f;    // > 0: pos3d/vmax tolerances grow with depth beyond zref (m)
         float fps        = 30.f;   // frame rate, for vmax
         int   stale      = 0;      // > 0: a slot missed this many frames is not reclaimed on box
                                    // overlap / 3D proximity alone; it needs appearance (rc) or the

@@ -67,6 +67,8 @@ extern "C" {
         return (int)sizeof(FsbResult);
     }
 
+    static int copy_results(const std::vector<fsb::MHRResult>& res, FsbResult* results, int max_results);
+
     int fsb_process_bgr(FsbHandle      h,
                         const uint8_t* bgr,
                         int            width,
@@ -87,6 +89,63 @@ extern "C" {
             fprintf(stderr, "[CAPI] fsb_process_bgr failed: %s\n", e.what());
             return 0;
         }
+        return copy_results(res, results, max_results);
+    }
+
+    int fsb_process_bgr_boxes(FsbHandle      h,
+                              const uint8_t* bgr,
+                              int            width,
+                              int            height,
+                              const float*   boxes,
+                              int            n_boxes,
+                              float          iou_skip,
+                              FsbResult*     results,
+                              int            max_results)
+    {
+        if (!h || !bgr || !results || max_results <= 0) return 0;
+        auto* p = static_cast<fsb::Pipeline*>(h);
+
+        // The caller's boxes join the detector's for this one frame (Pipeline::set_detection_filter):
+        // a box goes in unless a detector box overlaps it with IoU >= iou_skip (iou_skip > 1: always;
+        // iou_skip < 0: the detector's boxes are dropped and only the caller's are regressed).
+        std::vector<std::array<float, 4>> extra;
+        for (int i = 0; i < n_boxes; ++i)
+            extra.push_back({boxes[4 * i], boxes[4 * i + 1], boxes[4 * i + 2], boxes[4 * i + 3]});
+        p->set_detection_filter([extra, iou_skip](std::vector<std::array<float, 5>>& dets)
+        {
+            if (iou_skip < 0.f) dets.clear();
+            const size_t n_det = dets.size();
+            for (const auto& e : extra)
+            {
+                float best = 0.f;
+                for (size_t d = 0; d < n_det; ++d)
+                {
+                    const float ix = std::max(0.f, std::min(e[2], dets[d][2]) - std::max(e[0], dets[d][0]));
+                    const float iy = std::max(0.f, std::min(e[3], dets[d][3]) - std::max(e[1], dets[d][1]));
+                    const float inter = ix * iy;
+                    const float uni = (e[2] - e[0]) * (e[3] - e[1]) + (dets[d][2] - dets[d][0]) * (dets[d][3] - dets[d][1]) - inter;
+                    if (uni > 0.f) best = std::max(best, inter / uni);
+                }
+                if (iou_skip < 0.f || best < iou_skip) dets.push_back({e[0], e[1], e[2], e[3], 1.f});
+            }
+        });
+        std::vector<fsb::MHRResult> res;
+        try
+        {
+            res = p->process_bgr(bgr, width, height);
+        }
+        catch (const std::exception& e)
+        {
+            p->set_detection_filter(nullptr);
+            fprintf(stderr, "[CAPI] fsb_process_bgr_boxes failed: %s\n", e.what());
+            return 0;
+        }
+        p->set_detection_filter(nullptr);
+        return copy_results(res, results, max_results);
+    }
+
+    static int copy_results(const std::vector<fsb::MHRResult>& res, FsbResult* results, int max_results)
+    {
         int n = std::min((int)res.size(), max_results);
         printf("[CAPI] process_bgr returned %d results\n", n);
 

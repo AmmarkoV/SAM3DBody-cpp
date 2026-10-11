@@ -406,6 +406,7 @@ PersonSlots::Params PersonSlots::Params::from_env()
     p.margin     = env("FSB_SLOT_MARGIN", p.margin);
     p.pos3d      = env("FSB_SLOT_POS3D", p.pos3d);
     p.vmax       = env("FSB_SLOT_VMAX", p.vmax);
+    p.zref       = env("FSB_SLOT_ZREF", p.zref);
     p.motion     = env("FSB_SLOT_MOTION", p.motion ? 1.f : 0.f) != 0.f;
     p.stale      = (int)env("FSB_SLOT_STALE", (float)p.stale);
     return p;
@@ -455,18 +456,24 @@ std::vector<int> PersonSlots::assign(const std::vector<std::array<float, 4>>& bo
         const float k = p_.motion ? (float)std::min(frame_ - slots_[s].seen, MAX_EXTRAPOLATE) : 0.f;
         for (int c = 0; c < 3; ++c) out[c] = slots_[s].pos[c] + k * slots_[s].pvel[c];
     };
+    // zref: monocular position error grows with depth, so beyond zref metres the
+    // tolerances scale with it (a player 80 m away jitters by metres per frame).
+    auto zscale = [&](size_t s) {
+        return p_.zref > 0.f ? std::max(1.f, slots_[s].pos[2] / p_.zref) : 1.f;
+    };
     auto prox = [&](size_t b, size_t s) {     // 3D closeness 0-1 (-1 = unknown)
         if (!have_pos || p_.pos3d <= 0.f || !slots_[s].has_pos) return -1.f;
         float q[3]; slot_pos(s, q);
         const float dx = pos[b][0] - q[0], dy = pos[b][1] - q[1], dz = (pos[b][2] - q[2]) / DEPTH_TOL;
-        return std::exp(-0.5f * (dx*dx + dy*dy + dz*dz) / (p_.pos3d * p_.pos3d));
+        const float tol = p_.pos3d * zscale(s);
+        return std::exp(-0.5f * (dx*dx + dy*dy + dz*dz) / (tol * tol));
     };
     auto too_fast = [&](size_t b, size_t s) { // vmax veto
         if (!have_pos || p_.vmax <= 0.f || !slots_[s].has_pos) return false;
         const float dt = (float)std::max(1L, frame_ - slots_[s].seen) / p_.fps;
         const float dx = pos[b][0] - slots_[s].pos[0], dy = pos[b][1] - slots_[s].pos[1];
         const float dz = (pos[b][2] - slots_[s].pos[2]) / DEPTH_TOL;
-        return std::sqrt(dx*dx + dy*dy + dz*dz) > p_.vmax * dt + 1.0f;   // 1 m for noise
+        return std::sqrt(dx*dx + dy*dy + dz*dz) > p_.vmax * dt + 1.0f * zscale(s);   // 1 m for noise
     };
     // 3D proximity: blended into the score, admits a pair on its own when close, and
     // rejects one when the two are clearly in different places (two people whose

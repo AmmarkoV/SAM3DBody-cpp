@@ -2004,6 +2004,20 @@ struct Pipeline::Impl
         return true;
     }
 
+    // crops → backbone → decoder → body model → results for every person in
+    // ctx.dets (one network batch)
+    void regress_people(FrameContext& ctx)
+    {
+        build_person_crops(ctx);
+        run_backbone(ctx);
+        run_pass1_decoder(ctx);
+        run_mhr_head(ctx);
+        run_hand_crops(ctx);
+        run_body_model(ctx);
+        assemble_results(ctx);
+        run_refined_pass2(ctx);
+    }
+
     // one normalised crop + conditioning per person
     void build_person_crops(FrameContext& ctx)
     {
@@ -2016,7 +2030,6 @@ struct Pipeline::Impl
 
         // ── per-person crops ──────────────────────────────────────────────────
         const int B = ctx.B = (int)dets.size();
-        add_count(timers.frames, 1);
         add_count(timers.persons, (uint64_t)B);
 
         // Pre-allocate batch buffers
@@ -3751,14 +3764,32 @@ struct Pipeline::Impl
             }
         }
 
-        build_person_crops(ctx);
-        run_backbone(ctx);
-        run_pass1_decoder(ctx);
-        run_mhr_head(ctx);
-        run_hand_crops(ctx);
-        run_body_model(ctx);
-        assemble_results(ctx);
-        run_refined_pass2(ctx);
+        // Every stage below treats each person independently, so --max-batch N
+        // regresses a crowded frame in groups of N: peak memory is bounded by N
+        // people and time grows linearly with the crowd.  0 = one batch.
+        add_count(timers.frames, 1);
+        const int max_batch = cfg.max_batch > 0 ? cfg.max_batch : (int)ctx.dets.size();
+        if ((int)ctx.dets.size() <= max_batch)
+            regress_people(ctx);
+        else
+        {
+            std::vector<PersonDet> all = std::move(ctx.dets);
+            std::vector<MHRResult> results;
+            results.reserve(all.size());
+            for (size_t i0 = 0; i0 < all.size(); i0 += (size_t)max_batch)
+            {
+                ctx.dets.assign(all.begin() + i0,
+                                all.begin() + std::min(all.size(), i0 + (size_t)max_batch));
+                // the stages that may skip their work (no body model, no hands)
+                // must not see the previous group's outputs
+                ctx.all_verts.clear(); ctx.all_skel.clear(); ctx.hand_fk.clear();
+                regress_people(ctx);
+                for (auto& r : ctx.results) results.push_back(std::move(r));
+            }
+            ctx.dets    = std::move(all);
+            ctx.B       = (int)ctx.dets.size();
+            ctx.results = std::move(results);
+        }
 
         if (cfg.focus)
         {
