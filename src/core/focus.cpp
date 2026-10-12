@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 
 namespace fsb {
 
@@ -74,6 +75,27 @@ void FocusTracker::select(const cv::Mat& bgr, float sensitivity, bool debug,
 
         FocusTrack& tr = tracks_[best];
         tr.matched = true;
+
+        // FSB_FOCUS_SKIP_HOLD=1: a person in the hold after motion is regressed whatever the
+        // cue says, and the cue would only restart the hold, so do not measure it there.  The
+        // hold then lasts FOCUS_TIMEOUT frames after the motion that started it, and the cue is
+        // checked again when it ends.  Saves the per-person observation on people who keep
+        // moving (DanceTrack: nearly everyone, nearly always).  Off by default.
+        static const bool skip_hold = [] {
+            const char* e = std::getenv("FSB_FOCUS_SKIP_HOLD");
+            return e && std::atoi(e) != 0;
+        }();
+        if (skip_hold && tr.timeout > 0 && tr.retained < FOCUS_MAX_RETAIN)
+        {
+            --tr.timeout;
+            decisions_[i] = {(uint8_t)3, -1.f};
+            if (debug)
+                printf("[FSB]   focus person %d: hold t_i=%d, cue skipped -> timeout\n", i, tr.timeout);
+            tr.retained = 0;
+            active_slot.push_back(i);
+            active.push_back(d);
+            continue;
+        }
 
         float m_c = -1.f;
         if (motion && !tr.key_bgr.empty() && tr.key_bgr.size() == bgr.size() &&
