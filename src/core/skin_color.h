@@ -203,8 +203,11 @@ public:
         int   stale      = 0;      // > 0: a slot missed this many frames is not reclaimed on box
                                    // overlap / 3D proximity alone; it needs appearance (rc) or the
                                    // confirmed re-entry (a newcomer at a dormant spot: split, not swap)
+        float rc_abs     = 0.f;    // > 0: reclaiming a dormant slot on appearance needs reid_confirm
+                                   // + rc_abs * log2(1 + seconds absent) ...
+        float rc_n       = 0.f;    // ... + rc_n * log2(dormant slots): best-of-N looks alike by chance
         // Defaults, overridden by FSB_SLOT_{MIN_IOU,APP_SCALE,REID_SIM,APP_WEIGHT,
-        // CONFIRM,REID_CONFIRM,MARGIN,MOTION,POS3D,VMAX,STALE} (parameter sweeps, tools/reid_eval).
+        // CONFIRM,REID_CONFIRM,MARGIN,MOTION,POS3D,VMAX,STALE,RC_ABS,RC_N} (parameter sweeps, tools/reid_eval).
         static Params from_env();
     };
 

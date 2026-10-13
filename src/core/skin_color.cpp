@@ -409,6 +409,8 @@ PersonSlots::Params PersonSlots::Params::from_env()
     p.zref       = env("FSB_SLOT_ZREF", p.zref);
     p.motion     = env("FSB_SLOT_MOTION", p.motion ? 1.f : 0.f) != 0.f;
     p.stale      = (int)env("FSB_SLOT_STALE", (float)p.stale);
+    p.rc_abs     = env("FSB_SLOT_RC_ABS", p.rc_abs);
+    p.rc_n       = env("FSB_SLOT_RC_N", p.rc_n);
     return p;
 }
 
@@ -480,6 +482,19 @@ std::vector<int> PersonSlots::assign(const std::vector<std::array<float, 4>>& bo
     // boxes overlap in the image but stand metres apart in depth).
     static constexpr float POS_WEIGHT = 0.3f, POS_ADMIT = 0.6f, POS_REJECT = 0.05f;
 
+    // Reclaim threshold for a dormant slot: the re-identification similarity, raised with how
+    // long the slot has been missed (rc_abs) and with how many dormant slots compete (rc_n).
+    const float rc_base = p_.reid_confirm >= 0.f ? p_.reid_confirm : p_.reid_sim;
+    int n_dormant = 0;
+    for (size_t s = 0; s < S; ++s) n_dormant += slots_[s].alive && frame_ - slots_[s].seen > 1;
+    auto reclaim_need = [&](size_t s) {
+        float need = rc_base;
+        if (p_.rc_abs > 0.f)
+            need += p_.rc_abs * std::log2(1.f + (float)(frame_ - slots_[s].seen) / p_.fps);
+        if (p_.rc_n > 0.f && n_dormant > 1) need += p_.rc_n * std::log2((float)n_dormant);
+        return std::min(need, 0.95f);
+    };
+
     struct Pair { float score; int box, slot; };
     std::vector<Pair> pairs;
     for (size_t b = 0; b < boxes.size(); ++b)
@@ -491,8 +506,7 @@ std::vector<int> PersonSlots::assign(const std::vector<std::array<float, 4>>& bo
             if (px >= 0.f && px < POS_REJECT) continue;
             const bool  near3d = px >= POS_ADMIT;
             // stale: a dormant slot is reclaimed at once only on appearance.
-            if (p_.stale > 0 && frame_ - slots_[s].seen > p_.stale &&
-                app < (p_.reid_confirm >= 0.f ? p_.reid_confirm : p_.reid_sim))
+            if (p_.stale > 0 && frame_ - slots_[s].seen > p_.stale && app < reclaim_need(s))
                 continue;
             float score;
             if (app < 0.f) {
@@ -532,7 +546,7 @@ std::vector<int> PersonSlots::assign(const std::vector<std::array<float, 4>>& bo
                 if (a > best_app) { second = std::max(second, best_app); best_app = a; best = (int)s; }
                 else              second = std::max(second, a);
             }
-            if (best >= 0 && (best_app < need || best_app - second < p_.margin)) best = -1;
+            if (best >= 0 && (best_app < std::max(need, reclaim_need(best)) || best_app - second < p_.margin)) best = -1;
             Slot& ts = slots_[t];
             if (best < 0)               { ts.cand = -1; ts.cand_frames = 0; continue; }
             if (ts.cand == best)        ++ts.cand_frames;

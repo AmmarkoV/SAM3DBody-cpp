@@ -1312,6 +1312,8 @@ int main(int argc, const char** argv) {
             else if (key == "vmax")    sp.vmax       = val;
             else if (key == "zref")    sp.zref       = val;
             else if (key == "stale")   sp.stale      = (int)val;
+            else if (key == "rcabs")   sp.rc_abs     = val;
+            else if (key == "rcn")     sp.rc_n       = val;
             else if (key == "retro")   shadows[k].retro = val != 0.f;
             else { fprintf(stderr, "--track-shadow: unknown key '%s'\n", key.c_str()); return 1; }
             comma = next;
