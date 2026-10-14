@@ -2,8 +2,13 @@
 """Check every ctypes mirror of FsbResult / FsbConfig against the C library.
 
 A mirror shorter than the C struct makes fsb_process_bgr() write past the
-caller's buffer, so each script checks fsb_result_size() at load time too;
-this catches a stale mirror before anyone runs the script.
+caller's buffer, so load_library() checks fsb_result_size() at load time too;
+this catches a stale mirror before anyone runs a script.
+
+The scripts in python/ import the structs from python/fsb_capi.py; the ROS 2
+package keeps its own copy (it is installed on its own). A FsbResult class
+defined anywhere else in python/, tools/ or src/ fails the test: import it
+from fsb_capi instead.
 
 The structs are rebuilt from each file's source with ast, so the scripts
 (and their cv2 / rclpy imports) are never imported.
@@ -17,13 +22,28 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MIRRORS = [
-    "python/fast_sam_3dbody_frontend.py",
-    "python/fast_sam_3dbody_frontend-3D.py",
-    "python/fast_sam_3dbody_dump_csv.py",
-    "python/fast_sam_3dbody_dump_dpose_compat_csv.py",
-    "python/ros_demo_webcam.py",
+    "python/fsb_capi.py",
     "src/ros2/poseEstimation3D/fsb_engine.py",
 ]
+
+
+def stray_mirrors():
+    """python/, tools/ and src/ files that define their own FsbResult but are not in MIRRORS"""
+    out = []
+    for top in ("python", "tools", "src"):
+        for d, _, files in os.walk(os.path.join(ROOT, top)):
+            for f in files:
+                path = os.path.join(d, f)
+                rel = os.path.relpath(path, ROOT)
+                if not f.endswith(".py") or rel in MIRRORS:
+                    continue
+                try:
+                    tree = ast.parse(open(path).read(), path)
+                except (SyntaxError, UnicodeDecodeError):
+                    continue
+                if any(isinstance(n, ast.ClassDef) and n.name == "FsbResult" for n in ast.walk(tree)):
+                    out.append(rel)
+    return out
 
 
 def load_struct(path, name):
@@ -49,6 +69,9 @@ def main():
         ok = got == want
         failed += not ok
         print(f"{'ok  ' if ok else 'FAIL'} {rel}: FsbResult {got} bytes (C: {want})")
+    for rel in stray_mirrors():
+        failed += 1
+        print(f"FAIL {rel}: defines its own FsbResult — import it from python/fsb_capi.py")
     return 1 if failed else 0
 
 

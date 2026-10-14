@@ -5,6 +5,8 @@ This document is a reference for every set of **points** (2D and 3D) and their
 definitions together from:
 
 - `src/core/fast_sam_3dbody.h` / `fast_sam_3dbody_capi.h` — the `MHRResult` / `FsbResult` struct
+- `python/fsb_capi.py` — the ctypes mirror of `FsbResult` / `FsbConfig`, `load_library()`,
+  `COCO_TO_MHR70`, and `FastSAM3DBody` (numpy in, one dict of these fields per person out)
 - `python/fast_sam_3dbody_dump_csv.py` — the canonical **MHR-70** keypoint name list
 - `python/fast_sam_3dbody_frontend.py` — the **COCO-17** keypoint name list
 - `src/core/mhr_joint_table.h` — the **127** MHR LBS skeleton joint names + parents
@@ -14,14 +16,16 @@ definitions together from:
 
 ## 1. Per-person result struct
 
-One of these is produced per detected person per frame (`MHRResult` in C++,
-`FsbResult` in the C/ctypes API — identical layout):
+One of these is produced per detected person per frame: `FsbResult` in the C /
+ctypes API, a fixed-size copy of the C++ `MHRResult` (`fsb_process_bgr()` /
+`fsb_process_bgr_boxes()` fill it from `MHRResult` field by field; `MHRResult` also has
+fields the C API does not copy, e.g. `pred_vertices` and `det_score`):
 
 | Field | Shape | Space / units | Description |
 |-------|-------|---------------|-------------|
 | `bbox` | [4] | image pixels | `x1 y1 x2 y2` in the original image |
-| `focal_length` | scalar | pixels | Estimated focal length |
-| `pred_cam_t` | [3] | — | Raw camera head output `[s, tx, ty]` |
+| `focal_length` | scalar | pixels | Estimated / default focal length |
+| `pred_cam_t` | [3] | metres | Camera translation `tx, ty, tz`: `kps_3d + pred_cam_t` is the camera-space position |
 | `global_rot` | [3] | radians | Global orientation, Euler **ZYX** |
 | `body_pose` | [133] | radians | Body joint Euler angles |
 | `shape` | [45] | — | SMPL-like identity blend-shape betas |
@@ -29,21 +33,30 @@ One of these is produced per detected person per frame (`MHRResult` in C++,
 | `hand_pose` | [108] | radians | Hands: left [54] + right [54] |
 | `face_params` | [72] | — | Facial expression parameters |
 | `yolo_kps` | [51] | image pixels | **COCO-17** × `[x, y, conf]` (see §3) |
-| `has_yolo_kps` | int | — | 1 if `yolo_kps` valid |
-| `kps_3d` | [210] | **metres** | **MHR-70** joints × `[x, y, z]` (see §2) |
-| `kps_2d` | [140] | image pixels | **MHR-70** joints × `[x, y]` projected (see §2) |
+| `has_yolo_kps` | int | — | 1 if the person came from the YOLO detector; 0 for a box given to `fsb_process_bgr_boxes()` (then `yolo_kps` is all 0) |
+| `kps_3d` | [210] | **metres** | **MHR-70** joints × `[x, y, z]`, camera axes, body-relative (see §2, §6) |
+| `kps_2d` | [140] | image pixels | **MHR-70** joints × `[x, y]`: `kps_3d + pred_cam_t` projected with the focal length (see §2) |
 | `has_kps` | int | — | 1 if `kps_2d`/`kps_3d` valid (native LBS ran) |
-| `pred_vertices` | [55317] | metres | 18439 mesh verts × 3 (empty if `--skip-body`) |
+| `pred_pose_raw` | [266] | — | Raw MHR head output: `global_rot_6d[6] + body_cont[260]` (second pass) |
+| `pred_cam_raw` | [3] | — | Raw camera head output `[s, tx, ty]`, before it is decoded to `pred_cam_t` |
+| `mhr_model_params` | [204] | — | Model parameters of the native LBS: `[0:3]` global_trans×10, `[3:6]` global_rot ZYX, `[6:136]` body_pose[:130], `[136:204]` scale |
+| `skel_3d` | [381] | metres | **MHR-127** LBS skeleton joints × `[x, y, z]`, same frame as `kps_3d` (see §4) |
+| `has_skel` | int | — | 1 if `skel_3d` valid |
 
-`kps_2d`, `kps_3d` and `pred_vertices` are only populated when the native C LBS
-body model runs (i.e. **not** `--skip-body`). `yolo_kps` is always available.
+`kps_2d`, `kps_3d` and `skel_3d` are only populated when the native C LBS body
+model runs (i.e. **not** `--skip-body`); in C++, so is `MHRResult::pred_vertices`
+(18439 mesh vertices × 3, metres). `yolo_kps` is there for every person the YOLO
+detector found.
 
 There are therefore **three** independent point sets per person:
 
 1. **COCO-17** — `yolo_kps`, straight from the YOLO pose detector (2D + conf).
 2. **MHR-70** — `kps_2d` (2D) and `kps_3d` (3D), regressed from the body model.
-3. **MHR-127** — the full LBS skeleton joint centres, written by the renderer to
-   `.joints` files (3D only).
+3. **MHR-127** — the full LBS skeleton joint centres: `skel_3d` in the C API, and
+   the renderer's `.joints` files (3D only).
+
+How close the first two are to COCO annotations, and which one to use for which
+joint, is in §7.
 
 ---
 
@@ -91,7 +104,8 @@ same 70 joints projected to `70 × [x, y]` image pixels. Order matches
 ### COCO-17 → MHR-70 index map
 
 The lightweight frontend reconciles the two sets with
-(`_COCO_TO_MHR70` in `python/fast_sam_3dbody_frontend.py`):
+(`_COCO_TO_MHR70` in `python/fast_sam_3dbody_frontend.py`, `COCO_TO_MHR70` in
+`python/fsb_capi.py`):
 
 ```
 COCO idx:   0  1  2  3  4  5  6  7  8   9  10  11 12 13 14 15 16
@@ -99,6 +113,13 @@ MHR70 idx:  0  1  2  3  4  5  6  7  8  62  41   9 10 11 12 13 14
 ```
 
 (COCO wrists 9/10 map to MHR-70 62/41; COCO hips 11/12 map to MHR-70 9/10.)
+
+> The map is exact by name but not by placement at the **hips**: MHR-70 9/10 are
+> the anatomical hip joints, while COCO annotators mark the hips on the body's
+> outline. On COCO val2017 the MHR-70 hips sit a median **0.17 hip widths inward**
+> of COCO's (IQR 0.04–0.32) and 0.04 torso lengths lower. When COCO-compatible hips
+> are needed, take them from `yolo_kps` 11/12 (§7). On the limbs `kps_2d` is as
+> close to COCO as `yolo_kps` or closer, on the face slightly less close (§7).
 
 ---
 
@@ -121,6 +142,10 @@ COCO person keypoint order (labels/colours from `python/fast_sam_3dbody_frontend
 
 **Skeleton edges** (`COCO_EDGES`):
 `(0,1)(0,2)(1,3)(2,4)(0,5)(0,6)(5,6)(5,7)(7,9)(6,8)(8,10)(5,11)(6,12)(11,12)(11,13)(13,15)(12,14)(14,16)`
+
+`conf` is the only per-joint visibility signal in the result: `kps_2d` / `kps_3d`
+place every MHR-70 joint, also the hidden ones. `conf >= 0.5` reproduces COCO's
+labelled / unlabelled split for 86–96 % of the joints (§7).
 
 ---
 
@@ -258,7 +283,91 @@ README **BVH export** section.
 |--------|-----|-------|-------|
 | `yolo_kps` | 2D | pixels | original image |
 | `kps_2d` | 2D | pixels | original image (projected) |
-| `kps_3d` | 3D | metres | camera space (root-translated) |
-| `pred_vertices` | 3D | metres | camera space |
+| `kps_3d` / `skel_3d` | 3D | metres | camera axes (x right, y down, z away from the camera), body-relative: add `pred_cam_t` for camera space |
+| `pred_vertices` (C++ only) | 3D | metres | same as `kps_3d` |
 | `.joints` / `.obj` | 3D | cm | BVH world (pelvis-relative, Y/Z flipped) |
 | `.bvh` root | 3D | cm | BVH world |
+
+---
+
+## 7. Accuracy against COCO annotations (measured)
+
+How close `yolo_kps` and `kps_2d` are to human COCO keypoints, and which to use
+for which joint. Measured on **COCO val2017**: every person annotation with
+`num_keypoints > 0` that is not a crowd, **6352 persons in 2346 images**.
+Setup: a build of 2026-10-11 (C API as in bf1d8d8), `refined_pose = 1`,
+`person_thresh = 0.25`, `fsb_process_bgr_boxes()` with each image's COCO boxes
+and `iou_skip = 1.1` (so every person is also regressed from its own COCO box).
+YOLO persons were matched to the annotations greedily by OKS (> 0.1). OKS uses
+COCO's per-joint sigmas and the annotation's area, averaged over the labelled
+joints of a person — a per-person score, not COCO AP. Later builds may shift the
+numbers slightly.
+
+**Per person (mean OKS)**
+
+| Points | Persons | Mean OKS |
+|--------|--------:|---------:|
+| `yolo_kps` | 5904 found by YOLO (92.9 %) | 0.840 |
+| `kps_2d` → COCO-17 (`COCO_TO_MHR70`) | same 5904 | 0.829 |
+| `kps_2d`, hips 11/12 from `yolo_kps` | same 5904 | 0.836 |
+| `kps_2d` from the COCO box (`fsb_process_bgr_boxes`) | same 5904 / all 6352 | 0.826 / 0.804 |
+
+**Per joint**: % of labelled joints with an OKS term ≥ 0.5, on the 5904 persons
+YOLO found. `v=2` is labelled and visible, `v=1` labelled but occluded; bold where
+one source is ahead by 1.5 points or more.
+
+| Joints | `yolo_kps` v=2 | `kps_2d` v=2 | `yolo_kps` v=1 | `kps_2d` v=1 |
+|--------|------:|------:|------:|------:|
+| nose | **96.2** | 94.6 | **88.5** | 85.9 |
+| eyes | **96.3** | 94.4 | 80.7 | 79.7 |
+| ears | **96.1** | 93.5 | **90.2** | 86.5 |
+| shoulders | 96.9 | 96.3 | 82.1 | **85.1** |
+| elbows | 94.3 | **96.4** | 76.4 | **83.9** |
+| wrists | 90.1 | **94.7** | 64.6 | **79.9** |
+| hips | 97.1 | 96.6 | **88.5** | 81.3 |
+| knees | 92.3 | **96.8** | 73.9 | **83.0** |
+| ankles | 92.6 | **96.8** | 72.8 | **84.7** |
+
+So:
+
+- **Face and hips: `yolo_kps`**. For the hips, mind the placement offset of §2:
+  taking them from `yolo_kps` raises `kps_2d`'s mean OKS from 0.829 to 0.836.
+- **Elbows, wrists, knees, ankles: `kps_2d`**. The gap is largest on occluded
+  joints (wrists 79.9 % vs 64.6 %).
+- A dedicated 2D estimator is closer to COCO than either. On the 5665 persons
+  that all three found: `yolo_kps` 0.846, `kps_2d` 0.837 (0.844 with YOLO hips),
+  MMPose RTMPose-m (body7, on RTMDet-m detections) 0.883, and the per-joint
+  median of the three 0.886.
+
+**Labelled or not.** COCO leaves some joints of an annotated person unlabelled
+(`v=0`), e.g. the far side of the face or joints outside the image. Only
+`yolo_kps` conf carries that information. Per joint, `conf >= t` agrees with
+COCO's labelled / unlabelled split for:
+
+| Joint | Best `t` | Agreement at best `t` | Agreement at 0.5 |
+|-------|--------:|------:|------:|
+| nose | 0.54 | 93.2 % | 93.2 % |
+| eyes (l / r) | 0.54 / 0.57 | 92.6 / 93.0 % | 92.4 / 92.9 % |
+| ears (l / r) | 0.58 / 0.49 | 87.1 / 87.2 % | 86.7 / 87.0 % |
+| shoulders | 0.54 / 0.46 | 95.2 / 95.6 % | 95.1 / 95.6 % |
+| elbows | 0.54 / 0.52 | 88.7 / 89.0 % | 88.3 / 88.7 % |
+| wrists | 0.63 / 0.57 | 86.0 / 86.6 % | 85.7 / 86.4 % |
+| hips | 0.45 / 0.47 | 90.6 / 91.3 % | 90.4 / 91.2 % |
+| knees | 0.57 / 0.57 | 90.9 / 91.2 % | 90.8 / 91.1 % |
+| ankles | 0.55 / 0.51 | 92.5 / 92.0 % | 92.4 / 91.9 % |
+
+A single `conf >= 0.5` is within 0.5 percentage points of the per-joint best
+everywhere.
+
+**Without `yolo_kps`** (a box given to `fsb_process_bgr_boxes()` that no YOLO
+detection overlaps): `kps_3d` still says which way the head faces. With
+`z_rel = (z_joint − z_ear_mid) / |ear_l − ear_r|` (camera axes, +z away from the
+camera), a face joint is on the camera side when `z_rel` is below:
+
+| Joint | Threshold | Agreement with COCO | (`yolo_kps` conf, for comparison) |
+|-------|---------:|------:|------:|
+| nose | +0.42 | 83.8 % | 93.2 % |
+| eyes | −0.11 | 83.0 / 84.2 % | 92.6 / 93.0 % |
+| ears | +0.10 | 79.0 / 79.8 % | 87.1 / 87.2 % |
+
+That is a fallback only: prefer `yolo_kps` conf whenever the person has it.

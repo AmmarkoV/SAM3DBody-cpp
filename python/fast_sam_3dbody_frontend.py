@@ -26,97 +26,11 @@ import numpy as np
 # that this file stays importable without PyTorch installed.  See two_pass.py.
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ctypes structs matching fast_sam_3dbody_capi.h
+# ctypes structs and library loading: python/fsb_capi.py (the one mirror of
+# fast_sam_3dbody_capi.h, checked by python/test_ctypes_layout.py)
 # ──────────────────────────────────────────────────────────────────────────────
 
-class FsbConfig(ctypes.Structure):
-    _fields_ = [
-        ("onnx_dir",       ctypes.c_char_p),
-        ("gguf_path",      ctypes.c_char_p),
-        ("yolo_path",      ctypes.c_char_p),
-        ("cuda_device",    ctypes.c_int),
-        ("skip_body_model",ctypes.c_int),
-        ("person_thresh",  ctypes.c_float),
-        ("person_nms_iou", ctypes.c_float),
-        ("max_persons",    ctypes.c_int),
-        ("focal_x",        ctypes.c_float),
-        ("focal_y",        ctypes.c_float),
-        ("principal_x",    ctypes.c_float),
-        ("principal_y",    ctypes.c_float),
-        ("zero_face_params", ctypes.c_int),  # 0/1 — force face expression to neutral
-        ("detector",         ctypes.c_int),
-        ("refined_pose",     ctypes.c_int),
-    ]
-
-class FsbResult(ctypes.Structure):
-    _fields_ = [
-        ("bbox",         ctypes.c_float * 4),
-        ("focal_length", ctypes.c_float),
-        ("pred_cam_t",   ctypes.c_float * 3),
-        ("global_rot",   ctypes.c_float * 3),
-        ("body_pose",    ctypes.c_float * 133),
-        ("shape",        ctypes.c_float * 45),
-        ("scale",        ctypes.c_float * 28),
-        ("hand_pose",    ctypes.c_float * 108),
-        ("face_params",  ctypes.c_float * 72),
-        ("yolo_kps",     ctypes.c_float * 51),
-        ("has_yolo_kps", ctypes.c_int),
-        ("kps_3d",       ctypes.c_float * 210),
-        ("kps_2d",       ctypes.c_float * 140),
-        ("has_kps",      ctypes.c_int),
-        # ── Second-pass raw fields (must stay at end — appended after v1 ABI) ──
-        # pred_pose_raw[266]: raw MHR FFN output, layout global_rot_6d[6] + body_cont[260].
-        # pred_cam_raw[3]:    raw cam FFN output [s, tx, ty] before nonlinear decode.
-        # Both are consumed by two_pass.py to build prev_estimate for forward_decoder.
-        # HIGH RISK: any offset here shifts ALL ctypes reads for this struct.
-        ("pred_pose_raw", ctypes.c_float * 266),
-        ("pred_cam_raw",  ctypes.c_float * 3),
-        # mhr_model_params[204]: assembled model_params used by native C LBS.
-        # Layout: [0:3]=global_trans*10, [3:6]=global_rot ZYX, [6:136]=body_pose[:130],
-        #         [136:204]=scale_out.  Mirrors Python mhr_forward(return_model_params=True).
-        ("mhr_model_params", ctypes.c_float * 204),
-        ("skel_3d",          ctypes.c_float * 381),   # [127 × 3]
-        ("has_skel",         ctypes.c_int),
-    ]
-
-
-def load_library(lib_dir: str) -> ctypes.CDLL:
-    lib_path = os.path.join(lib_dir, "libfast_sam_3dbody.so")
-    if not os.path.exists(lib_path):
-        sys.exit(f"Library not found: {lib_path}\nBuild the project first.")
-
-    # Add the lib directory to LD_LIBRARY_PATH so transitive .so deps are found
-    prev = os.environ.get("LD_LIBRARY_PATH", "")
-    ort_lib = os.path.join(lib_dir, "onnxruntime_dl", "lib")
-    os.environ["LD_LIBRARY_PATH"] = ":".join(filter(None, [lib_dir, ort_lib, prev]))
-
-    lib = ctypes.CDLL(lib_path)
-    lib.fsb_result_size.restype  = ctypes.c_int
-    lib.fsb_result_size.argtypes = []
-    if lib.fsb_result_size() != ctypes.sizeof(FsbResult):
-        raise RuntimeError(
-            f"FsbResult layout mismatch: C library has {lib.fsb_result_size()} bytes, "
-            f"this script {ctypes.sizeof(FsbResult)} — update the ctypes mirror "
-            f"to match src/core/fast_sam_3dbody_capi.h")
-
-    lib.fsb_create.restype  = ctypes.c_void_p
-    lib.fsb_create.argtypes = []
-
-    lib.fsb_destroy.restype  = None
-    lib.fsb_destroy.argtypes = [ctypes.c_void_p]
-
-    lib.fsb_load.restype  = ctypes.c_int
-    lib.fsb_load.argtypes = [ctypes.c_void_p, ctypes.POINTER(FsbConfig)]
-
-    lib.fsb_process_bgr.restype  = ctypes.c_int
-    lib.fsb_process_bgr.argtypes = [
-        ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_uint8),
-        ctypes.c_int, ctypes.c_int,
-        ctypes.POINTER(FsbResult),
-        ctypes.c_int,
-    ]
-    return lib
+from fsb_capi import FsbConfig, FsbResult, load_library
 
 
 # ──────────────────────────────────────────────────────────────────────────────
