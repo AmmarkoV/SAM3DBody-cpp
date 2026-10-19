@@ -1055,6 +1055,7 @@ Two windows open by default: the input RGB frame with the 2D skeleton overlaid
 | `HEADLESS` | `0` | `1` suppresses the input overlay window (servers / `xvfb`; the robot viewer still opens). |
 | `TRT` | `auto` | TensorRT fp16 fast path (~1.6× the CUDA EP). `auto` enables it when the TRT libs + models + a GPU are present; `0` forces the default backend, `1` forces it on. |
 | `SHM` | `auto` | Transport. `auto` uses zero-copy POSIX shared memory when available, else falls back to a stdout `@F`-line pipe; `0` forces the pipe. |
+| `ARM_ANCHOR` | `1` | `unitree_h1_2` only: use `bvh_lafan1pos_to_h1_2_anchored.json`, which turns on the arm anchor (below). `0` keeps the plain H1-2 config. |
 
 **How it works:** the C++ binary emits one LAFAN BVH frame per tick into
 `tools/gmr_stream.py`, which reassembles + retargets each frame causally (single
@@ -1070,6 +1071,26 @@ the C++ binary** so it picks up the transport).
 has been run, a CUDA GPU, and an X display for the MuJoCo viewer (wrap with
 `xvfb-run` if headless). See **[GMR.md](knowledge/GMR.md)** → "Live webcam → robot (streaming)"
 for the design and the causal despike/safety details.
+
+**H1-2 arm anchor (`--arm-anchor`):** GMR places each target at
+`pelvis + scale·(human point − human pelvis)`, which on the H1-2 puts the person's shoulder
+~17 cm above the robot's. The elbow and hand targets then hang off a shoulder the robot does
+not have, so its arms lift and open (hands that touch on the person stay apart on the robot).
+`tools/gmr_arm_anchor.py` rebuilds them from the robot's own shoulder (taken from the pelvis
+and torso *targets*) with the person's limb directions on the robot's limb lengths.
+`bvh_lafan1pos_to_h1_2_anchored.json` turns it on (`"arm_anchor": true`) and lets position
+lead (elbow/wrist 100, arm orientation 1, torso orientation 100). `gmr_stream.py
+--arm-anchor` / `--no-arm-anchor` overrides the config; other robots are refused. Arm
+direction error relative to the chest, median, live streams through `gmr_stream.py`:
+
+| clip | upper arm: plain → anchored | forearm: plain → anchored |
+|------|------|------|
+| `multi.mp4` (722 frames) | 11.2° → 1.1° | 17.1° → 1.6° |
+| `Buffalo.webm` (78) | 9.5° → 2.5° | 12.6° → 1.8° |
+| `shuffle_lafan_0.bvh` (378, dance) | 33.1° → 15.6° | 62.1° → 22.8° |
+
+The config also carries its own `reset_stuck_err` (5.0): the IK residual scales with the
+weights, so the G1-measured 4.0 does not carry over.
 
 ---
 

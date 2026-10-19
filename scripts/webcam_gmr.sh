@@ -28,6 +28,7 @@
 #       SINK=dds scripts/webcam_gmr.sh 0 unitree_g1 # DDS sink (stub; see gmr_stream.py)
 #       SINK=teleop scripts/webcam_gmr.sh 0 unitree_h1_2  # feed robot/h1_bridge (run it separately)
 #       HEADLESS=1 scripts/webcam_gmr.sh 0          # no input overlay window (robot only)
+#       ARM_ANCHOR=0 scripts/webcam_gmr.sh 0 unitree_h1_2  # H1-2 without the arm anchor (old arms)
 #       scripts/webcam_gmr.sh --refined-pose 0 unitree_h1_2  # refined hands (~8 fps)
 #
 #  --refined-pose / --no-pass2 may appear anywhere before "--"; they are pulled
@@ -94,6 +95,13 @@ TEMPLATE="$REPO/bvh/lafan_mhr.bvh"
 # back to the G1 config: another robot's body names would crash GMR on frame 1.
 POS_CONFIG="$REPO/scripts/gmr_configs/bvh_lafan1pos_to_${ROBOT#unitree_}.json"
 case "$ROBOT" in unitree_g1*) [ -f "$POS_CONFIG" ] || POS_CONFIG="$REPO/scripts/gmr_configs/bvh_lafan1pos_to_g1.json" ;; esac
+# H1-2 only: the anchored config (tools/gmr_arm_anchor.py) builds the elbow/wrist
+# targets on the robot's own shoulder, so the arms follow the person's limb
+# directions.  ARM_ANCHOR=0 keeps the plain config.  Offline video_gmr.sh is unaffected.
+ARM_ANCHOR="${ARM_ANCHOR:-1}"
+if [ "$ROBOT" = "unitree_h1_2" ] && [ "$ARM_ANCHOR" != "0" ]; then
+    POS_CONFIG="$REPO/scripts/gmr_configs/bvh_lafan1pos_to_h1_2_anchored.json"
+fi
 
 # ── TensorRT fast path (auto-detected, graceful fallback) ─────────────────────
 # The webcam is backbone-bound; the TRT EP (fp16) is ~1.6x faster than the CUDA
@@ -161,6 +169,7 @@ if [ -z "$_shm_reason" ]; then
 fi
 
 echo "[webcam_gmr] source=$SOURCE robot=$ROBOT sink=$SINK headless=$HEADLESS"
+echo "[webcam_gmr] IK config: ${POS_CONFIG#$REPO/}"
 [ "${#REFINED_ARG[@]}" -gt 0 ] && echo "[webcam_gmr] refined pose ON (${REFINED_ARG[*]})"
 if [ "${#TRT_ARG[@]}" -gt 0 ]; then
     echo "[webcam_gmr] TensorRT fast path ON (${TRT_ARG[*]})"

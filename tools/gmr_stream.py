@@ -25,7 +25,7 @@
 # Usage (normally via scripts/webcam_gmr.sh):
 #   fast_sam_3dbody_run ... --bvh-template bvh/lafan_mhr.bvh --bvh-stream - \
 #     | gmr_stream.py --robot unitree_g1 --config <pos_config.json> --flip-depth
-import argparse, copy, os, select, sys, time
+import argparse, copy, json, os, select, sys, time
 import numpy as np
 from pathlib import Path
 
@@ -60,6 +60,11 @@ ap.add_argument("--flip-depth", action="store_true",
 ap.add_argument("--no-ground", action="store_true", help="disable per-frame foot grounding")
 ap.add_argument("--human-height", type=float, default=0.0,
                 help="override actual_human_height (m); 0 = auto-scale from the first frame's skeleton")
+ap.add_argument("--arm-anchor", action=argparse.BooleanOptionalAction, default=None,
+                help="rebuild the elbow/wrist IK targets on the robot's own shoulder and limb lengths "
+                     "(tools/gmr_arm_anchor.py), so the arms follow the person's limb directions instead "
+                     "of hanging off a pelvis-scaled shoulder. unitree_h1_2 only. Default: the config's "
+                     "\"arm_anchor\" key (on in bvh_lafan1pos_to_h1_2_anchored.json, off elsewhere).")
 # Causal despike (robot safety) -- same thresholds as gmr_retarget.py, clamped not interpolated.
 ap.add_argument("--no-despike", action="store_true",
                 help="disable the causal step clamp (on by default). The clamp bounds per-frame "
@@ -83,10 +88,12 @@ ap.add_argument("--no-reset-on-stuck", action="store_true",
                      "IK residual triggers a re-solve from the neutral pose, kept only if it is "
                      "actually better than the warm-started one (so a false trigger costs one "
                      "extra IK solve and changes nothing).")
-ap.add_argument("--reset-stuck-err", type=float, default=4.0,
+ap.add_argument("--reset-stuck-err", type=float, default=None,
                 help="IK residual (sum of the two match tables' task-error norms) above which a "
-                     "frame counts as stuck. Measured with the shipped g1 config: healthy tracking "
-                     "sits at 1.6-2.0 and peaks at 3.0, while real stuck episodes read 8-19.")
+                     "frame counts as stuck. Default: the config's \"reset_stuck_err\" key, else 4.0. "
+                     "Measured with the shipped g1 config: healthy tracking sits at 1.6-2.0 and peaks "
+                     "at 3.0, while real stuck episodes read 8-19. The residual scales with the IK "
+                     "weights, so a config that changes them carries its own threshold.")
 ap.add_argument("--reset-stuck-frames", type=int, default=2,
                 help="consecutive over-threshold frames before the escape is attempted")
 ap.add_argument("--reset-idle-s", type=float, default=2.0,
@@ -96,6 +103,17 @@ ap.add_argument("--reset-idle-s", type=float, default=2.0,
                      "in whatever pose the last frame happened to be.")
 a = ap.parse_args()
 
+# Per-config defaults: the anchored H1-2 config switches the arm anchor on and
+# carries the stuck threshold measured with its own weights.
+_cfg = json.loads(Path(a.config).read_text())
+if a.arm_anchor is None:
+    a.arm_anchor = bool(_cfg.get("arm_anchor", False))
+if a.reset_stuck_err is None:
+    a.reset_stuck_err = float(_cfg.get("reset_stuck_err", 4.0))
+if a.arm_anchor and a.robot != "unitree_h1_2":
+    sys.exit(f"[gmr_stream] --arm-anchor uses the H1-2's body names and geometry; "
+             f"refusing robot {a.robot}")
+
 # Point the bvh_lafan1 -> <robot> config at our custom file (in-memory patch;
 # GMR's stock files are never touched).  Same trick as gmr_retarget.py.
 from general_motion_retargeting import params
@@ -104,6 +122,7 @@ params.IK_CONFIG_DICT["bvh_lafan1"][a.robot] = Path(a.config)
 from general_motion_retargeting import GeneralMotionRetargeting as GMR, RobotMotionViewer
 from scipy.spatial.transform import Rotation as R
 from lafan_fk import LafanFK   # disk-free equivalent of load_bvh_file (tools/)
+from gmr_arm_anchor import ArmAnchor   # --arm-anchor (tools/)
 
 
 # ── helpers lifted from tools/gmr_retarget.py (kept identical) ───────────────
@@ -366,6 +385,10 @@ def main():
                     print(f"[gmr_stream] bone-path={H:.3f} m -> actual_human_height={hh:.3f} m",
                           file=sys.stderr)
                 rt = GMR(src_human="bvh_lafan1", tgt_robot=a.robot, actual_human_height=hh)
+                if a.arm_anchor:
+                    ArmAnchor(rt)
+                    print("[gmr_stream] arm anchor on: elbow/wrist targets built on the robot's "
+                          "own shoulder", file=sys.stderr)
                 # mink.Configuration is built from the model's default qpos0, and
                 # nothing has integrated into it yet, so this IS the neutral pose.
                 q_home = rt.configuration.q.copy()
