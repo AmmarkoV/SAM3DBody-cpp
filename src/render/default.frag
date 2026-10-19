@@ -8,6 +8,7 @@ uniform vec2      uResolution;  // viewport size, to map gl_FragCoord -> UV
 uniform float     uShiny;       // 0 = matte (original look), 1 = full chrome
 uniform float     uAlpha;       // mesh opacity (0 = invisible, 1 = opaque)
 uniform float     uVertexColor; // 1 = tint with vColor instead of uColor (--skin-color)
+uniform vec4      uSkinTint;    // rgb 0-1 + blend strength in .a (--skin-tint), 0 = off
 out vec4 fragColor;
 
 void main() {
@@ -32,7 +33,10 @@ void main() {
     // lighting, so shade them only lightly (0.8..1.0) to keep the shape readable
     // without darkening them a second time.
     d = mix(d, mix(1.0, d, 0.3), uVertexColor);
-    vec3  tint = mix(uColor, vColor, uVertexColor);
+    // --skin-tint: pull the sampled colours toward a flat colour so the mesh
+    // still reads as an overlay instead of blending into the person.
+    vec3  skin = mix(vColor, uSkinTint.rgb, uSkinTint.a);
+    vec3  tint = mix(uColor, skin, uVertexColor);
     vec3  base = tint * d;
 
     // ── Screen-space pseudo-reflection ("Silicon Dreams" chrome) ─────────────

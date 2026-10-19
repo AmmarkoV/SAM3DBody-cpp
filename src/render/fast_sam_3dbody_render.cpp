@@ -33,6 +33,10 @@
 // --skin-color-mirror: a vertex the video never shows takes the colour of its
 //   left/right mirror vertex when that one was seen, before
 //   --skin-color-default or the neighbour fill (implies --skin-color).
+// --skin-tint R G B [STRENGTH] (0-255, like --color) blends the drawn
+//   --skin-color colours toward R G B by STRENGTH (0..1, default 0.4) so the
+//   mesh stays distinguishable from the person, e.g. --skin-tint 255 255 0.
+//   Display only: the accumulated / saved / exported colours are untouched.
 // --skin-hair-cap CM [DEG] paints every vertex within CM centimetres of the
 //   top of the head (measured along pelvis -> head on the person's rest pose)
 //   black, over what was observed; DEG tilts the cut plane that many degrees
@@ -881,6 +885,7 @@ int main(int argc, const char** argv) {
     bool   skin_default_set = false; // --skin-color-default R G B (0-255): colour of unseen vertices
     float  skin_default[3] = {0.f, 0.f, 0.f};
     bool   skin_default_arms = false; // --skin-color-default arms: each person's forearm colour
+    float  skin_tint[4] = {0.f, 0.f, 0.f, 0.f};  // --skin-tint R G B [STRENGTH]; .a = 0 is off
     bool   skin_mirror = false;       // --skin-color-mirror: unseen vertices borrow their mirror
     float  skin_hair_cap_cm = 0.f;   // --skin-hair-cap CM: paint the crown, 0 = off
     float  skin_hair_cap_deg = 0.f;  // --skin-hair-cap CM DEG: tilt, lower at the back
@@ -957,6 +962,13 @@ int main(int argc, const char** argv) {
         if (!strcmp(argv[i], "--skin-color-default") && i+3 < argc)
             { for (int c = 0; c < 3; ++c) skin_default[c] = clamp01(std::stof(argv[++i])/255.0f);
               skin_default_set = true; continue; }
+        if (!strcmp(argv[i], "--skin-tint") && i+3 < argc) {
+            for (int c = 0; c < 3; ++c) skin_tint[c] = clamp01(std::stof(argv[++i])/255.0f);
+            skin_tint[3] = 0.4f;
+            if (i+1 < argc && (isdigit((unsigned char)argv[i+1][0]) || argv[i+1][0]=='.'))
+                skin_tint[3] = clamp01(std::stof(argv[++i]));
+            continue;
+        }
         if (!strcmp(argv[i], "--skin-hair-cap") && i+1 < argc) {
             skin_hair_cap_cm = std::stof(argv[++i]);
             if (i+1 < argc && (isdigit((unsigned char)argv[i+1][0]) || argv[i+1][0]=='.' ||
@@ -1209,6 +1221,7 @@ int main(int argc, const char** argv) {
     GLint  shiny_loc = glGetUniformLocation(prog_mesh, "uShiny");
     GLint  alpha_loc = glGetUniformLocation(prog_mesh, "uAlpha");
     GLint  vcolor_loc = glGetUniformLocation(prog_mesh, "uVertexColor");
+    GLint  skintint_loc = glGetUniformLocation(prog_mesh, "uSkinTint");
     GLint  tex_loc   = glGetUniformLocation(prog_quad, "uTex");
 
     // ── Load body mesh from .tri ──────────────────────────────────────────────
@@ -1899,6 +1912,7 @@ int main(int argc, const char** argv) {
         glUniform1f(shiny_loc, shininess);
         glUniform1f(alpha_loc, transparency);
         glUniform1f(vcolor_loc, skin_color ? 1.f : 0.f);
+        glUniform4fv(skintint_loc, 1, skin_tint);
         glUniform2f(res_loc, (float)W, (float)H);
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, bg.id);
